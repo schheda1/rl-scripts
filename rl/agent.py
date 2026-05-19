@@ -1,0 +1,328 @@
+"""
+Clipped Policy Gradient agent for the per-loop UU optimization pipeline.
+
+Two actor networks (UnmergeActor, FactorActor) and one critic network (Critic)
+share one Adam optimizer.  The critic provides a feature-conditioned baseline
+V(state1) for variance reduction — replacing the previous global EMA scalar.
+No-op actions (unmerge=0, factor=1) are handled by the environment returning
+reward=0 directly; the critic learns to predict 0 for those loop feature regions.
+
+Hyperparameters (all tunable via constructor):
+  clip_eps         = 0.2   PPO clip range
+  K                = 4     update epochs per rollout
+  batch_size       = 8
+  lr               = 3e-4
+  value_loss_coef  = 0.5   weight on critic MSE loss
+"""
+
+import logging
+import random
+from dataclasses import dataclass, field
+from typing import Optional
+
+import torch
+
+_agent_log = logging.getLogger("agent")
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Action space for the factor decision
+FACTOR_VALUES: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 32]
+N_FEATURES: int = 16   # must match environment.py FEATURE_COLUMNS length
+N_FACTORS: int = len(FACTOR_VALUES)
+
+# Indices of tripCountKnown and tripCount within the feature vector.
+# Must stay in sync with FEATURE_COLUMNS in hecbench.py.
+_IDX_TRIP_COUNT_KNOWN: int = 10
+_IDX_TRIP_COUNT: int = 11
+
+
+def build_factor_mask(features: torch.Tensor) -> torch.Tensor:
+    """
+    Return a bool mask of shape (N_FACTORS,) over FACTOR_VALUES.
+
+    mask[i] = True  if FACTOR_VALUES[i] is a valid choice for this loop.
+    mask[i] = False if FACTOR_VALUES[i] exceeds the loop's known trip count.
+
+    When the trip count is unknown (tripCountKnown=0) all factors are valid.
+    factor=1 (no-op unroll) is always valid regardless of trip count.
+    """
+    trip_known = features[_IDX_TRIP_COUNT_KNOWN].item() > 0.5
+    trip_count = int(features[_IDX_TRIP_COUNT].item())
+    if trip_known and trip_count > 0:
+        return torch.tensor(
+            [f == 1 or f <= trip_count for f in FACTOR_VALUES], dtype=torch.bool
+        )
+    return torch.ones(N_FACTORS, dtype=torch.bool)
+
+
+# ---------------------------------------------------------------------------
+# Network definitions
+# ---------------------------------------------------------------------------
+
+class _MLP(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class UnmergeActor(_MLP):
+    """Policy 1: pre-unmerge features → P(unmerge ∈ {0, 1})."""
+    def __init__(self) -> None:
+        super().__init__(N_FEATURES, 2)
+
+    def log_prob(self, features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        logits = self.forward(features)
+        return F.log_softmax(logits, dim=-1).gather(1, actions.unsqueeze(1)).squeeze(1)
+
+    def sample(self, features: torch.Tensor) -> tuple[int, torch.Tensor]:
+        with torch.no_grad():
+            logits = self.forward(features.unsqueeze(0))
+            dist = torch.distributions.Categorical(logits=logits)
+            action = dist.sample()
+        log_p = F.log_softmax(logits, dim=-1)[0, action.item()]
+        return int(action.item()), log_p.detach()
+
+
+class FactorActor(_MLP):
+    """Policy 2: features → P(factor_idx ∈ 0..11).
+
+    Supports action masking: pass mask=tensor([True, True, False, ...]) to
+    zero out invalid factor choices (e.g. factors exceeding a known trip count)
+    before sampling.  Invalid actions receive -inf logit and zero probability.
+    """
+    def __init__(self) -> None:
+        super().__init__(N_FEATURES, N_FACTORS)
+
+    def log_prob(self, features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        logits = self.forward(features)
+        return F.log_softmax(logits, dim=-1).gather(1, actions.unsqueeze(1)).squeeze(1)
+
+    def sample(
+        self,
+        features: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> tuple[int, torch.Tensor]:
+        with torch.no_grad():
+            logits = self.forward(features.unsqueeze(0))[0]
+            if mask is not None:
+                logits = logits.masked_fill(~mask.to(logits.device), float("-inf"))
+            dist = torch.distributions.Categorical(logits=logits)
+            action = dist.sample()
+        log_p = F.log_softmax(logits, dim=-1)[action.item()]
+        return int(action.item()), log_p.detach()
+
+
+class Critic(_MLP):
+    """
+    Value network: pre-unmerge features → scalar expected reward V(state1).
+
+    Conditions on the loop's intrinsic structural properties before any
+    transformation decision, learning a separate expected return for each
+    region of feature space.  Replaces the previous global EMA baseline.
+    """
+    def __init__(self) -> None:
+        super().__init__(N_FEATURES, 1)
+
+    def value(self, features: torch.Tensor) -> torch.Tensor:
+        """Return scalar value estimates, shape (batch,)."""
+        return self.forward(features).squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
+# Rollout buffer
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RolloutEntry:
+    state1: torch.Tensor      # pre-unmerge features  → input to UnmergeActor + Critic
+    state2: torch.Tensor      # post-unmerge (or original) features → input to FactorActor
+    action1: int              # unmerge decision (0 or 1)
+    action2: int              # factor_idx (0–11)
+    log_prob1: torch.Tensor   # log prob under policy at collection time
+    log_prob2: torch.Tensor
+    reward: float
+
+
+class RolloutBuffer:
+    def __init__(self, capacity: int = 32) -> None:
+        self.capacity = capacity
+        self._entries: list[RolloutEntry] = []
+
+    def append(self, entry: RolloutEntry) -> None:
+        self._entries.append(entry)
+
+    def full(self) -> bool:
+        return len(self._entries) >= self.capacity
+
+    def clear(self) -> None:
+        self._entries = []
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def sample_batches(self, batch_size: int) -> list[list[RolloutEntry]]:
+        entries = list(self._entries)
+        random.shuffle(entries)
+        return [entries[i:i + batch_size] for i in range(0, len(entries), batch_size)]
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+class Agent:
+    def __init__(
+        self,
+        *,
+        clip_eps: float = 0.2,
+        K: int = 4,
+        batch_size: int = 8,
+        lr: float = 3e-4,
+        value_loss_coef: float = 0.5,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        self.clip_eps = clip_eps
+        self.K = K
+        self.batch_size = batch_size
+        self.value_loss_coef = value_loss_coef
+        self.device = device or torch.device("cpu")
+
+        self.unmerge_actor = UnmergeActor().to(self.device)
+        self.factor_actor = FactorActor().to(self.device)
+        self.critic = Critic().to(self.device)
+        self.optimizer = torch.optim.Adam(
+            list(self.unmerge_actor.parameters())
+            + list(self.factor_actor.parameters())
+            + list(self.critic.parameters()),
+            lr=lr,
+        )
+
+    def predict_value(self, features: torch.Tensor) -> float:
+        """Return the critic's expected reward for a single loop feature vector."""
+        with torch.no_grad():
+            return self.critic.value(features.unsqueeze(0).to(self.device)).item()
+
+    def select_unmerge(self, features: torch.Tensor) -> tuple[int, torch.Tensor]:
+        """Sample unmerge action. Returns (action, log_prob)."""
+        return self.unmerge_actor.sample(features.to(self.device))
+
+    def select_factor(
+        self,
+        features: torch.Tensor,
+        loop_idx: Optional[int] = None,
+    ) -> tuple[int, torch.Tensor]:
+        """Sample factor action with trip-count masking. Returns (factor_idx, log_prob)."""
+        mask = build_factor_mask(features)
+        if not mask.all():
+            masked_out = [FACTOR_VALUES[i] for i, v in enumerate(mask) if not v]
+            trip_count = int(features[_IDX_TRIP_COUNT].item())
+            _agent_log.info(
+                "  trip-count mask applied | loop_idx=%s tripCount=%d "
+                "masked_factors=%s",
+                loop_idx if loop_idx is not None else "?",
+                trip_count,
+                masked_out,
+            )
+        return self.factor_actor.sample(features.to(self.device), mask=mask.to(self.device))
+
+    def ppo_update(self, buffer: RolloutBuffer) -> dict[str, float]:
+        """Run K epochs of clipped mini-batch updates over the rollout buffer."""
+        total_actor_loss = 0.0
+        total_value_loss = 0.0
+        num_updates = 0
+
+        # Pre-compute global advantage statistics for normalisation.
+        # Critic values are computed fresh each K epoch so normalisation
+        # uses the current value estimates rather than stale ones.
+        for k in range(self.K):
+            # Recompute values for the full buffer at the start of each epoch
+            # so normalisation reflects the critic's current predictions.
+            with torch.no_grad():
+                all_s1 = torch.stack([e.state1 for e in buffer._entries]).to(self.device)
+                all_values = self.critic.value(all_s1)
+                all_rewards = torch.tensor(
+                    [e.reward for e in buffer._entries],
+                    dtype=torch.float32, device=self.device
+                )
+                advantages_raw = all_rewards - all_values
+                adv_mean = advantages_raw.mean()
+                adv_std = advantages_raw.std(correction=0) + 1e-8
+
+            for batch in buffer.sample_batches(self.batch_size):
+                if not batch:
+                    continue
+
+                s1 = torch.stack([e.state1 for e in batch]).to(self.device)
+                s2 = torch.stack([e.state2 for e in batch]).to(self.device)
+                a1 = torch.tensor([e.action1 for e in batch], dtype=torch.long, device=self.device)
+                a2 = torch.tensor([e.action2 for e in batch], dtype=torch.long, device=self.device)
+                old_lp1 = torch.stack([e.log_prob1 for e in batch]).to(self.device)
+                old_lp2 = torch.stack([e.log_prob2 for e in batch]).to(self.device)
+                r = torch.tensor([e.reward for e in batch], dtype=torch.float32, device=self.device)
+
+                # Critic forward (not detached — value loss trains the critic)
+                values = self.critic.value(s1)
+
+                # Advantage: use critic baseline, normalised by buffer-level stats
+                adv = ((r - values.detach()) - adv_mean) / adv_std
+
+                # Clipped actor losses
+                new_lp1 = self.unmerge_actor.log_prob(s1, a1)
+                new_lp2 = self.factor_actor.log_prob(s2, a2)
+                actor_loss = _clipped_pg_loss(new_lp1, old_lp1, adv, self.clip_eps)
+                actor_loss = actor_loss + _clipped_pg_loss(new_lp2, old_lp2, adv, self.clip_eps)
+
+                # Critic (value) loss: MSE against actual rewards
+                value_loss = F.mse_loss(values, r)
+
+                loss = actor_loss + self.value_loss_coef * value_loss
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                total_actor_loss += actor_loss.item()
+                total_value_loss += value_loss.item()
+                num_updates += 1
+
+        n = max(num_updates, 1)
+        return {
+            "actor_loss": total_actor_loss / n,
+            "value_loss": total_value_loss / n,
+        }
+
+    def save(self, path: str) -> None:
+        torch.save({
+            "unmerge_actor": self.unmerge_actor.state_dict(),
+            "factor_actor": self.factor_actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+        }, path)
+
+    def load(self, path: str) -> None:
+        ckpt = torch.load(path, map_location=self.device)
+        self.unmerge_actor.load_state_dict(ckpt["unmerge_actor"])
+        self.factor_actor.load_state_dict(ckpt["factor_actor"])
+        self.critic.load_state_dict(ckpt["critic"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+
+
+def _clipped_pg_loss(
+    log_prob_new: torch.Tensor,
+    log_prob_old: torch.Tensor,
+    advantage: torch.Tensor,
+    clip_eps: float,
+) -> torch.Tensor:
+    ratio = (log_prob_new - log_prob_old).exp()
+    clipped = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps)
+    return -torch.min(ratio * advantage, clipped * advantage).mean()
