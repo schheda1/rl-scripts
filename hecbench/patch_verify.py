@@ -118,16 +118,36 @@ def _ifdef_depth_at(lines: list[str], idx: int) -> int:
 
 
 def _is_call(line: str, fn: str) -> bool:
-    """True if `line` contains a call to `fn` (not a definition or comment)."""
+    """True if `line` contains a call to `fn` (not a definition or comment).
+
+    The key distinction:
+      Definition:  void fn(          static float fn(     template<T> void fn(
+      Call:        result = fn(      foo(fn(              fn(          double x = fn(
+
+    The previous approach used re.search with [^;]* which was too greedy — it
+    matched  'double result = fn('  as a definition because 'double' appeared
+    somewhere before 'fn(' on the same line.  The fix uses re.match (anchored
+    at start-of-line) and requires the return type to be directly adjacent to
+    the function name (only optional '*' in between), so assignments and nested
+    calls are correctly treated as calls.
+    """
     s = line.strip()
     if _is_comment_or_blank(s):
         return False
     # Must have fn followed by ( somewhere on the line
     if not re.search(r'\b' + re.escape(fn) + r'\s*\(', line):
         return False
-    # Exclude function definitions:  <type> fn(
-    if re.search(
-        r'(?:void|int|float|double|bool|auto|static|inline|template)\s[^;]*\b'
+    # Exclude function definitions: anchored at line start, return type directly
+    # before fn name (with only optional pointer '*' in between).
+    # e.g.  void fn(       static float fn(      template<T> void fn(
+    # NOT:  double x = fn(   result = fn(    foo(fn(
+    if re.match(
+        r'\s*'
+        r'(?:template\s*<[^>]*>\s*)?'
+        r'(?:(?:static|inline|virtual|explicit|constexpr|extern)\s+)*'
+        r'(?:void|int|float|double|bool|auto|size_t|char|long|short'
+        r'|unsigned(?:\s+\w+)?|[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+'
+        r'(?:\*\s*)*'
         + re.escape(fn) + r'\s*\(',
         line,
     ):
@@ -139,42 +159,41 @@ def _find_block_end(lines: list[str], start: int) -> int:
     """
     Scan forward from `start` to find the last line of the verification block.
 
-    Stops at:
+    The block always includes the reference call itself plus the subsequent
+    comparison loop and PASS/FAIL output.  Blank lines within a verification
+    section are common and must NOT cut the scan short — the block is ended
+    only by a definitive marker:
+
       - A PASS/FAIL printf, validate_result, return-on-failure, fprintf(stderr
-      - Two consecutive blank lines after at least 3 lines scanned
-      - A line containing GPU API calls (indicates we've left the verify section)
-      - Hard limit: 50 lines from start
+        → natural end of verification; absorb any immediately following '}'
+      - A GPU API call (cudaMalloc, cudaMemcpy, <<<...>>>, etc.)
+        → we have left the verification section; end just before this line
+      - Hard limit: 80 lines from start
+
+    Blank lines are intentionally ignored as stopping criteria.  The GPU-API
+    backstop is the primary safety valve for benchmarks that have no explicit
+    PASS/FAIL print.
     """
     n = len(lines)
-    limit = min(start + 50, n)
+    limit = min(start + 80, n)
     end = start
-    blank_run = 0
-    scanned = 0
 
     for i in range(start, limit):
         line = lines[i]
-        s = line.strip()
-        scanned += 1
 
-        # GPU code means we've left the verification section
-        if _GPU_CODE_RE.search(line) and scanned > 1:
-            break
-
-        if not s:
-            blank_run += 1
-            if blank_run >= 2 and scanned > 4:
-                break
-        else:
-            blank_run = 0
+        # GPU code → we have left the verification section
+        if _GPU_CODE_RE.search(line) and i > start:
+            return end  # end is the last good line before this
 
         end = i
 
         if _BLOCK_END_RE.search(line):
-            # Consume one more closing brace if it immediately follows
-            for j in range(i + 1, min(i + 4, n)):
-                if lines[j].strip() == "}":
+            # Absorb any immediately following closing brace(s)
+            for j in range(i + 1, min(i + 5, n)):
+                s = lines[j].strip()
+                if s in ("}", "};"):
                     end = j
-                elif lines[j].strip() and not _is_comment_or_blank(lines[j]):
+                elif s and not _is_comment_or_blank(lines[j]):
                     break
             return end
 
