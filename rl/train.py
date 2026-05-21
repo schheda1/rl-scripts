@@ -968,14 +968,6 @@ def main() -> None:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     log.info("Pipeline tmp directory: %s", tmp_dir)
 
-    env = GpuLoopEnv(
-        arch=args.arch,
-        n_runs=args.n_runs,
-        nsys_timeout=args.nsys_timeout,
-        tmp_dir=tmp_dir,
-        compile_timeout_penalty=args.compile_timeout_penalty,
-        normalizer=normalizer,
-    )
     buffer = RolloutBuffer(capacity=args.buffer_size)
 
     ckpt_dir = Path(args.checkpoint_dir)
@@ -1003,6 +995,16 @@ def main() -> None:
     if not all_benchmarks:
         log.error("No eligible benchmarks found — cannot train. Exiting.")
         return
+
+    # Build env here so normalizer is guaranteed to be bound
+    env = GpuLoopEnv(
+        arch=args.arch,
+        n_runs=args.n_runs,
+        nsys_timeout=args.nsys_timeout,
+        tmp_dir=tmp_dir,
+        compile_timeout_penalty=args.compile_timeout_penalty,
+        normalizer=normalizer,
+    )
 
     # --- Split ---
     train_bmarks, val_bmarks, test_bmarks = split_benchmarks(
