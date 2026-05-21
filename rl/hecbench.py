@@ -43,7 +43,14 @@ ARCH: str = os.environ.get("TARGET_ARCH") or detect_arch()
 # Benchmark discovery
 # ---------------------------------------------------------------------------
 
-HECBENCH_SRC = Path(__file__).parent.parent.parent / "HeCBench" / "src"
+# Default benchmark source directory.
+# og-HecBench: benchmarks live directly at <repo>/*-cuda  (no src/ subdirectory)
+# upstream HeCBench: benchmarks live at <repo>/src/*-cuda
+# Override at runtime via --hecbench-src or the HECBENCH_SRC env variable.
+HECBENCH_SRC = Path(
+    os.environ.get("HECBENCH_SRC", "")
+    or str(Path(__file__).parent.parent.parent / "og-HecBench")
+)
 
 
 def _has_run_target(makefile: Path) -> bool:
