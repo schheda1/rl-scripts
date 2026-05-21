@@ -36,6 +36,8 @@ from hecbench import (
     ARCH,
     DEFAULT_TMP_DIR,
     FEATURE_COLUMNS,
+    FeatureNormalizer,
+    _row_to_tensor,
     compile_loopcount,
     compile_single_loop,
     compile_baseline,
@@ -67,12 +69,16 @@ class GpuLoopEnv:
         nsys_timeout: int = 300,
         tmp_dir: Path = DEFAULT_TMP_DIR,
         compile_timeout_penalty: float = -1.0,
+        gpu_id: int = 0,
+        normalizer: Optional[FeatureNormalizer] = None,
     ) -> None:
         self.arch = arch
         self.n_runs = n_runs
         self.nsys_timeout = nsys_timeout
         self.tmp_dir = tmp_dir
         self.compile_timeout_penalty = compile_timeout_penalty
+        self.gpu_id = gpu_id
+        self.normalizer = normalizer or FeatureNormalizer()  # no-op if not fitted
 
         # State set by reset()
         self._benchmark_dir: Optional[Path] = None
@@ -97,6 +103,10 @@ class GpuLoopEnv:
     def done(self) -> bool:
         return self._loop_cursor >= len(self._eligible_loops)
 
+    def _to_features(self, row: "pd.Series") -> torch.Tensor:
+        """Convert a LoopCount row to a normalized feature tensor."""
+        return self.normalizer.normalize(_row_to_tensor(row))
+
     def reset(self, benchmark_dir: Path) -> Optional[torch.Tensor]:
         """
         Prepare a new episode for *benchmark_dir*.
@@ -115,6 +125,7 @@ class GpuLoopEnv:
         self._baseline_time_ms = measure_kernel_time(
             benchmark_dir, arch=self.arch, n_runs=self.n_runs,
             nsys_timeout=self.nsys_timeout, tmp_dir=self.tmp_dir,
+            gpu_id=self.gpu_id,
         )
 
         file_map, primary_file, triple = get_loop_features(benchmark_dir, arch=self.arch)
@@ -124,13 +135,12 @@ class GpuLoopEnv:
         self._eligible_loops = []
         for filename, df in file_map.items():
             for _, row in df.iterrows():
-                features = _row_to_tensor(row)
                 self._eligible_loops.append(
                     LoopRecord(
                         loop_idx=int(row["loopIdx"]),
                         filename=filename,
                         triple=triple,
-                        pre_features=features,
+                        pre_features=self._to_features(row),
                     )
                 )
 
@@ -183,7 +193,7 @@ class GpuLoopEnv:
             for _fname, df in file_map.items():
                 row = df[df["loopIdx"] == loop_record.loop_idx]
                 if not row.empty:
-                    return _row_to_tensor(row.iloc[0])
+                    return self._to_features(row.iloc[0])
 
         return loop_record.pre_features
 
@@ -243,6 +253,7 @@ class GpuLoopEnv:
                 modified_time_ms = measure_kernel_time(
                     self._benchmark_dir, arch=self.arch, n_runs=self.n_runs,
                     nsys_timeout=self.nsys_timeout, tmp_dir=self.tmp_dir,
+                    gpu_id=self.gpu_id,
                 )
             except RuntimeError:
                 modified_time_ms = self._baseline_time_ms
@@ -259,11 +270,3 @@ class GpuLoopEnv:
         return next_features, reward, False
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _row_to_tensor(row: pd.Series) -> torch.Tensor:
-    """Convert a LoopCount DataFrame row to a (16,) float32 tensor."""
-    values = [float(row.get(col, 0.0)) for col in FEATURE_COLUMNS]
-    return torch.tensor(values, dtype=torch.float32)

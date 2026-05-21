@@ -15,6 +15,8 @@ from io import StringIO
 from pathlib import Path
 from typing import Optional
 
+import torch
+
 # Default per-user temp directory for all pipeline artifacts (nsys reports, etc.)
 DEFAULT_TMP_DIR: Path = Path(f"/tmp/rl_pipeline_{getpass.getuser()}")
 
@@ -49,7 +51,7 @@ ARCH: str = os.environ.get("TARGET_ARCH") or detect_arch()
 # Override at runtime via --hecbench-src or the HECBENCH_SRC env variable.
 HECBENCH_SRC = Path(
     os.environ.get("HECBENCH_SRC", "")
-    or str(Path(__file__).parent.parent.parent / "og-HecBench")
+    or str(Path(__file__).parent.parent.parent / "og-HeCBench")
 )
 
 
@@ -94,20 +96,53 @@ def discover_benchmarks(hecbench_src: Path = HECBENCH_SRC) -> list[Path]:
 
     Benchmarks failing any of these checks are excluded.
     """
+    import logging
+    _log = logging.getLogger("hecbench.discover")
+
+    hecbench_src = Path(hecbench_src)
+    if not hecbench_src.exists():
+        _log.error("discover_benchmarks: path does not exist: %s", hecbench_src.resolve())
+        return []
+
+    candidates = sorted(hecbench_src.glob("*-cuda"))
+    if not candidates:
+        _log.error(
+            "discover_benchmarks: no *-cuda directories found under %s",
+            hecbench_src.resolve(),
+        )
+        return []
+
+    _log.debug("discover_benchmarks: scanning %d candidates under %s",
+               len(candidates), hecbench_src.resolve())
+
     benchmarks = []
-    for d in sorted(hecbench_src.glob("*-cuda")):
+    for d in candidates:
         if not d.is_dir():
             continue
         makefile = d / "Makefile"
         if not makefile.exists():
+            _log.debug("  SKIP %s — no Makefile", d.name)
             continue
         if not _has_run_target(makefile):
+            _log.debug("  SKIP %s — no run: target", d.name)
             continue
         if _uses_external_data(makefile):
+            _log.debug("  SKIP %s — references ../data/", d.name)
             continue
         if _has_dvc_files(d):
+            _log.debug("  SKIP %s — DVC-tracked data", d.name)
             continue
         benchmarks.append(d)
+
+    if not benchmarks:
+        _log.warning(
+            "discover_benchmarks: 0 benchmarks passed all filters under %s "
+            "(run with DEBUG logging to see per-benchmark skip reasons)",
+            hecbench_src.resolve(),
+        )
+    else:
+        _log.debug("discover_benchmarks: %d benchmarks accepted", len(benchmarks))
+
     return benchmarks
 
 
@@ -422,6 +457,7 @@ def measure_kernel_time(
     n_runs: int = 20,
     nsys_timeout: int = 300,
     tmp_dir: Path = DEFAULT_TMP_DIR,
+    gpu_id: int = 0,
 ) -> float:
     """
     Run the benchmark under nsys n_runs times and return the mean total GPU
@@ -432,9 +468,10 @@ def measure_kernel_time(
       2. nsys stats --report=cuda_gpu_kern_sum --format=csv <file>.nsys-rep
 
     nsys report files are written under *tmp_dir*.
+    *gpu_id* controls which physical GPU is used via CUDA_VISIBLE_DEVICES.
     """
     run_cmd = _get_run_command(benchmark_dir, arch)
-    env = {**os.environ, "ARCH": arch}
+    env = {**os.environ, "ARCH": arch, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
     tmp_dir.mkdir(parents=True, exist_ok=True)
     report_path = tempfile.mktemp(prefix="nsys_rl_", dir=str(tmp_dir))
 
@@ -507,3 +544,88 @@ def _parse_nsys_csv_kernel_time_ms(csv_output: str) -> Optional[float]:
         pass
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Feature tensor conversion
+# ---------------------------------------------------------------------------
+
+def _row_to_tensor(row: "pd.Series") -> torch.Tensor:
+    """Convert a LoopCount DataFrame row to a (N_FEATURES,) float32 tensor."""
+    values = [float(row.get(col, 0.0)) for col in FEATURE_COLUMNS]
+    return torch.tensor(values, dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
+# Feature normalizer
+# ---------------------------------------------------------------------------
+
+class FeatureNormalizer:
+    """
+    Per-feature z-score normalizer for LoopCount feature vectors.
+
+    Fitted once on all eligible loop rows collected during the pre-flight
+    precheck, then applied to every feature vector returned by GpuLoopEnv.
+
+    Serialisable to/from a plain dict so it can be:
+      - cached in eligible_benchmarks.json alongside loop_counts
+      - shipped to worker processes through the hparams dict
+
+    If not fitted (e.g. loaded from an old cache that predates normalization),
+    normalize() is a no-op — training still runs, just without normalization.
+    """
+
+    def __init__(self) -> None:
+        self.mean: Optional[torch.Tensor] = None
+        self.std:  Optional[torch.Tensor] = None
+        self._fitted: bool = False
+
+    def fit(self, feature_tensors: list) -> None:
+        """
+        Compute per-feature mean and std from a list of (N_FEATURES,) tensors.
+        Clamps std to ≥ 1e-8 so constant features (all-zero flags, etc.) don't
+        produce NaN after division.
+        """
+        if not feature_tensors:
+            return
+        stacked   = torch.stack(feature_tensors)          # (N, N_FEATURES)
+        self.mean = stacked.mean(dim=0).cpu()
+        self.std  = stacked.std(dim=0, correction=0).clamp(min=1e-8).cpu()
+        self._fitted = True
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply z-score normalization: (x − mean) / std.
+        Moves mean/std to x's device on demand.
+        Returns x unchanged if the normalizer has not been fitted.
+        """
+        if not self._fitted or self.mean is None:
+            return x
+        return (x - self.mean.to(x.device)) / self.std.to(x.device)
+
+    def state_dict(self) -> dict:
+        """Return a JSON-serialisable snapshot."""
+        return {
+            "fitted": self._fitted,
+            "mean":   self.mean.tolist() if self.mean is not None else None,
+            "std":    self.std.tolist()  if self.std  is not None else None,
+        }
+
+    @classmethod
+    def from_state_dict(cls, d: dict) -> "FeatureNormalizer":
+        """Reconstruct from a snapshot (e.g. loaded from JSON or hparams)."""
+        n = cls()
+        if d.get("fitted") and d.get("mean") is not None:
+            n.mean    = torch.tensor(d["mean"], dtype=torch.float32)
+            n.std     = torch.tensor(d["std"],  dtype=torch.float32)
+            n._fitted = True
+        return n
+
+    def __repr__(self) -> str:
+        if not self._fitted:
+            return "FeatureNormalizer(not fitted)"
+        return (
+            f"FeatureNormalizer(fitted, "
+            f"mean={self.mean.tolist()}, "
+            f"std={self.std.tolist()})"
+        )
