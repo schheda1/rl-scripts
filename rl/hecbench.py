@@ -196,7 +196,7 @@ def make_clean(benchmark_dir: Path, arch: str = ARCH) -> None:
     subprocess.run(["make", "clean"], cwd=benchmark_dir, capture_output=True, env=env)
 
 
-def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 600) -> subprocess.CompletedProcess:
+def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300) -> subprocess.CompletedProcess:
     env = {**os.environ, "ARCH": arch}
     cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
     # Override compiler and flags to use clang++ instead of nvcc.
