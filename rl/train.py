@@ -45,11 +45,40 @@ from agent import Agent, RolloutBuffer, RolloutEntry, FACTOR_VALUES
 from environment import GpuLoopEnv
 from hecbench import ARCH, discover_benchmarks
 
+
+class _EpochFilter(logging.Filter):
+    """
+    Injects %(epoch_tag)s into every log record on the main process.
+    Set to "" before training starts so pre-epoch messages are unaffected.
+    During training, tag is "[epoch/total] " (with trailing space).
+    """
+    def __init__(self) -> None:
+        super().__init__()
+        self.tag: str = ""
+
+    def set(self, epoch: int, total: int) -> None:
+        self.tag = f"[{epoch}/{total}] "
+
+    def clear(self) -> None:
+        self.tag = ""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.epoch_tag = self.tag  # type: ignore[attr-defined]
+        return True
+
+
+_epoch_filter = _EpochFilter()
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s %(epoch_tag)s%(message)s",
     datefmt="%H:%M:%S",
 )
+# Attach filter to every handler on the root logger so %(epoch_tag)s
+# is always defined regardless of which logger emits the record.
+for _h in logging.root.handlers:
+    _h.addFilter(_epoch_filter)
+
 log = logging.getLogger("train")
 
 
@@ -512,10 +541,13 @@ def _worker_fn(
     from environment import GpuLoopEnv
     from hecbench import FeatureNormalizer
 
+    _epoch = hparams.get("epoch", 0)
+    _total = hparams.get("total_epochs", 0)
+    _epoch_tag = f"[{_epoch}/{_total}] " if _total > 0 else ""
     _log = logging.getLogger(f"worker.{rank}")
     logging.basicConfig(
         level=logging.INFO,
-        format=f"%(asctime)s [W{rank}] %(levelname)s %(message)s",
+        format=f"%(asctime)s %(levelname)s {_epoch_tag}[W{rank}] %(message)s",
         datefmt="%H:%M:%S",
     )
 
@@ -684,6 +716,8 @@ def run_parallel_epoch(
     buffer: RolloutBuffer,
     device: torch.device,
     args,
+    current_epoch: int = 0,
+    total_epochs: int = 0,
 ) -> tuple[dict, list[Path], list[Path]]:
     """
     Run one complete training + validation epoch across *n_workers* GPU workers.
@@ -712,7 +746,15 @@ def run_parallel_epoch(
         "lr":                      args.lr,
         "value_loss_coef":         args.value_loss_coef,
         "normalizer_state":        normalizer.state_dict(),
+        "epoch":                   current_epoch,
+        "total_epochs":            total_epochs,
     }
+
+    # Maximum time main will wait between consecutive worker messages.
+    # A worker can be silent for up to one full measurement cycle
+    # (n_runs × nsys_timeout) plus a compilation buffer (300 s).
+    # Using a fixed 600 s caused false-alarm warnings on long benchmarks.
+    worker_msg_timeout = args.n_runs * args.nsys_timeout + 300
 
     # ------------------------------------------------------------------ #
     # Phase 1: Training pass                                               #
@@ -763,7 +805,7 @@ def run_parallel_epoch(
 
     while done_count < n_workers:
         try:
-            msg = result_q.get(timeout=600)
+            msg = result_q.get(timeout=worker_msg_timeout)
         except Exception:
             log.warning("result_q timed out waiting for workers — checking alive")
             if not any(p.is_alive() for p in workers):
@@ -877,7 +919,7 @@ def run_parallel_epoch(
 
         while val_done_count < n_workers:
             try:
-                msg = val_result_q.get(timeout=600)
+                msg = val_result_q.get(timeout=worker_msg_timeout)
             except Exception:
                 if not any(p.is_alive() for p in val_workers):
                     log.error("All val workers have died unexpectedly")
@@ -1029,6 +1071,7 @@ def main() -> None:
     total_updates = 0
 
     for epoch in range(1, args.epochs + 1):
+        _epoch_filter.set(epoch, args.epochs)
         log.info("=== Epoch %d / %d ===", epoch, args.epochs)
 
         # ==============================================================
@@ -1045,6 +1088,8 @@ def main() -> None:
                 buffer=buffer,
                 device=device,
                 args=args,
+                current_epoch=epoch,
+                total_epochs=args.epochs,
             )
 
             # Remove persistently failing benchmarks
