@@ -625,6 +625,10 @@ def _worker_fn(
                     continue
 
                 v = agent.predict_value(pre_features)
+                is_timeout = (
+                    reward == hparams["compile_timeout_penalty"]
+                    and reward < 0
+                )
 
                 if mode == "train":
                     entry = RolloutEntry(
@@ -645,6 +649,7 @@ def _worker_fn(
                         "factor": FACTOR_VALUES[factor_idx],
                         "reward": reward,
                         "value": v,
+                        "timeout": is_timeout,
                         "rank": rank,
                     })
                 else:
@@ -654,6 +659,7 @@ def _worker_fn(
                         "loop_idx": loop_record.loop_idx,
                         "reward": reward,
                         "value": v,
+                        "timeout": is_timeout,
                         "rank": rank,
                     })
 
@@ -772,12 +778,13 @@ def run_parallel_epoch(
             train_samples += 1
             train_rewards.append(msg["reward"])
             train_advantages.append(msg["reward"] - msg["value"])
+            timeout_flag = " [compile timeout — penalty]" if msg.get("timeout") else ""
             log.info(
                 "  [W%d] %s loop_idx=%d unmerge=%d factor=%d "
-                "reward=%.4f V(s)=%.4f",
+                "reward=%.4f V(s)=%.4f%s",
                 msg["rank"], msg["benchmark"], msg["loop_idx"],
                 msg["unmerge"], msg["factor"],
-                msg["reward"], msg["value"],
+                msg["reward"], msg["value"], timeout_flag,
             )
             if buffer.full():
                 stats = agent.ppo_update(buffer)
@@ -884,10 +891,11 @@ def run_parallel_epoch(
                 all_val_advantages.append(msg["reward"] - msg["value"])
                 per_bench_data.setdefault(msg["benchmark"], []).append(msg["reward"])
                 val_samples += 1
+                timeout_flag = " [compile timeout — penalty]" if msg.get("timeout") else ""
                 log.info(
-                    "  [val W%d] %s loop_idx=%d reward=%.4f V(s)=%.4f",
+                    "  [val W%d] %s loop_idx=%d reward=%.4f V(s)=%.4f%s",
                     msg["rank"], msg["benchmark"], msg["loop_idx"],
-                    msg["reward"], msg["value"],
+                    msg["reward"], msg["value"], timeout_flag,
                 )
 
             elif mtype == "step_failed":
