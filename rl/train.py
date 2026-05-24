@@ -1069,10 +1069,16 @@ def main() -> None:
     log.info("  test:  %s", [b.name for b in test_bmarks])
 
     total_updates = 0
+    rng = random.Random(args.split_seed)
 
     for epoch in range(1, args.epochs + 1):
         _epoch_filter.set(epoch, args.epochs)
         log.info("=== Epoch %d / %d ===", epoch, args.epochs)
+
+        # Shuffle training benchmarks each epoch so the rollout buffer is
+        # filled in a different order, preventing systematic bias toward
+        # whichever benchmarks happen to be first in the list.
+        rng.shuffle(train_bmarks)
 
         # ==============================================================
         # PARALLEL PATH  (--num-workers > 1)
