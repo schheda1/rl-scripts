@@ -285,6 +285,7 @@ LOOPCOUNT_COLUMNS = [
     "exitBlocksContainPHI", "containsUseOutsideLoop", "containsBarrier",
     "containsChildLoops", "containsBranch", "tripCountKnown", "tripCount",
     "numBasicBlocks", "numMemoryInsts", "numComputeInsts", "numControlFlowInsts",
+    "containsCall", "numExits",
 ]
 
 FEATURE_COLUMNS = [
@@ -292,6 +293,7 @@ FEATURE_COLUMNS = [
     "exitBlocksContainPHI", "containsUseOutsideLoop", "containsBarrier",
     "containsChildLoops", "containsBranch", "tripCountKnown", "tripCount",
     "numBasicBlocks", "numMemoryInsts", "numComputeInsts", "numControlFlowInsts",
+    "containsCall", "numExits",
 ]
 
 

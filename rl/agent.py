@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 # Action space for the factor decision
 FACTOR_VALUES: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 32]
-N_FEATURES: int = 16   # must match environment.py FEATURE_COLUMNS length
+N_FEATURES: int = 18   # must match environment.py FEATURE_COLUMNS length
 N_FACTORS: int = len(FACTOR_VALUES)
 
 # Indices of tripCountKnown and tripCount within the feature vector.
