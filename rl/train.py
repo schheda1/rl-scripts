@@ -145,12 +145,17 @@ def precheck_benchmarks(
     benchmarks: list[Path],
     cache_file: Path,
     skip: bool,
-) -> tuple[list[Path], dict[str, int], "FeatureNormalizer"]:
+) -> tuple[list[Path], dict[str, int], dict[str, list[dict]], "FeatureNormalizer"]:
     """
-    Return (eligible_benchmarks, loop_counts, normalizer).
+    Return (eligible_benchmarks, loop_counts, loop_records_map, normalizer).
 
-    loop_counts  — benchmark name → number of eligible loops (for bin-packing)
-    normalizer   — FeatureNormalizer fitted on all eligible loop rows
+    loop_counts      — benchmark name → number of eligible loops (for logging)
+    loop_records_map — benchmark name → list of per-loop dicts:
+                         {loop_idx, filename, triple, pre_features_raw: list[float]}
+                       pre_features_raw stores un-normalised raw values; workers
+                       apply the normalizer at runtime so the cache stays valid
+                       if the normalizer is ever re-fitted.
+    normalizer       — FeatureNormalizer fitted on all eligible loop rows
 
     If *skip* is True and a valid cache exists, load from cache.
     Otherwise run LoopCount on each benchmark and save results to cache.
@@ -163,6 +168,7 @@ def precheck_benchmarks(
             data = json.loads(cache_file.read_text())
             eligible_names = set(data["eligible"])
             loop_counts: dict[str, int] = data.get("loop_counts", {})
+            loop_records_map: dict[str, list[dict]] = data.get("loop_records", {})
             normalizer = FeatureNormalizer.from_state_dict(data.get("normalizer", {}))
             result = [b for b in benchmarks if b.name in eligible_names]
             log.info(
@@ -171,7 +177,7 @@ def precheck_benchmarks(
                 len(result), cache_file,
                 " [normalizer loaded]" if normalizer._fitted else " [no normalizer in cache — will be identity]",
             )
-            return result, loop_counts, normalizer
+            return result, loop_counts, loop_records_map, normalizer
         except Exception as e:
             log.warning("Could not read precheck cache (%s): %s — running check", cache_file, e)
 
@@ -182,20 +188,31 @@ def precheck_benchmarks(
 
     eligible: list[Path] = []
     loop_counts: dict[str, int] = {}
+    loop_records_map: dict[str, list[dict]] = {}
     excluded: list[tuple[str, str]] = []
     all_feature_tensors = []
 
     for b in benchmarks:
         try:
-            file_map, _, _ = get_loop_features(b)
+            file_map, _, triple = get_loop_features(b)
             n = sum(len(df) for df in file_map.values())
             if n > 0:
                 eligible.append(b)
                 loop_counts[b.name] = n
                 # Collect raw (un-normalised) feature tensors for fitting
-                for df in file_map.values():
+                # and store per-loop records for loop-level worker distribution.
+                records: list[dict] = []
+                for filename, df in file_map.items():
                     for _, row in df.iterrows():
-                        all_feature_tensors.append(_row_to_tensor(row))
+                        raw = _row_to_tensor(row)
+                        all_feature_tensors.append(raw)
+                        records.append({
+                            "loop_idx":        int(row["loopIdx"]),
+                            "filename":        filename,
+                            "triple":          triple,
+                            "pre_features_raw": raw.tolist(),
+                        })
+                loop_records_map[b.name] = records
                 log.info("  PASS  %-35s  eligible_loops=%d", b.name, n)
             else:
                 reason = "0 eligible loops after filtering"
@@ -233,6 +250,7 @@ def precheck_benchmarks(
             "checked_at": datetime.now().isoformat(),
             "eligible": [b.name for b in eligible],
             "loop_counts": loop_counts,
+            "loop_records": loop_records_map,
             "normalizer": normalizer.state_dict(),
             "excluded": [{"name": n, "reason": r} for n, r in excluded],
         }, indent=2))
@@ -240,7 +258,7 @@ def precheck_benchmarks(
     except Exception as e:
         log.warning("Could not save precheck cache: %s", e)
 
-    return eligible, loop_counts, normalizer
+    return eligible, loop_counts, loop_records_map, normalizer
 
 
 # ---------------------------------------------------------------------------
@@ -487,41 +505,65 @@ def plot_training_curves(metrics_file: str, output_dir: str) -> None:
 # Parallel training helpers
 # ---------------------------------------------------------------------------
 
-def assign_benchmarks_to_workers(
+def build_loop_assignments(
     benchmarks: list[Path],
-    loop_counts: dict[str, int],
+    loop_records_map: dict[str, list[dict]],
+) -> list[dict]:
+    """
+    Build a flat list of loop assignment dicts for a set of benchmarks.
+
+    Each dict contains everything a worker needs to process one loop without
+    calling env.reset() or consulting the original source tree:
+        benchmark_name    — for baseline_cache lookup and working-set naming
+        benchmark_path    — original source directory (str, for shutil.copytree)
+        loop_idx          — index passed to compile_single_loop
+        filename          — source file containing the loop
+        triple            — target triple (e.g. "nvptx64-nvidia-cuda")
+        pre_features_raw  — un-normalised feature vector as list[float]
+    """
+    assignments: list[dict] = []
+    for b in benchmarks:
+        for record in loop_records_map.get(b.name, []):
+            assignments.append({
+                "benchmark_name":   b.name,
+                "benchmark_path":   str(b),
+                "loop_idx":         record["loop_idx"],
+                "filename":         record["filename"],
+                "triple":           record["triple"],
+                "pre_features_raw": record["pre_features_raw"],
+            })
+    return assignments
+
+
+def assign_loops_to_workers(
+    loop_assignments: list[dict],
     n_workers: int,
-) -> list[list[Path]]:
+) -> list[list[dict]]:
     """
-    Greedy min-heap bin-packing: assign benchmarks to workers so that
-    each worker's total loop count is as equal as possible.
+    Greedy min-heap bin-packing at loop granularity.
 
-    All loops of a single benchmark always go to the same worker (no splitting)
-    to avoid make/compilation conflicts in shared directories.
-
-    Sort benchmarks descending by loop count first, then greedily assign
-    each to the least-loaded worker.
+    Each loop is one unit of work.  The input list is shuffled before packing
+    so different epochs get different distributions (exploration diversity).
+    Within each worker's share the assignments are sorted by
+    (benchmark_name, loop_idx) so each benchmark's loops are contiguous —
+    the worker copies a benchmark directory once and processes all its assigned
+    loops before moving on.
     """
-    sorted_bmarks = sorted(
-        benchmarks,
-        key=lambda b: loop_counts.get(b.name, 0),
-        reverse=True,
-    )
-    # heap entries: (total_loops_assigned, worker_idx, benchmark_list)
+    # heap entries: (loops_assigned, worker_idx, assignment_list)
     heap: list[tuple[int, int, list]] = [(0, i, []) for i in range(n_workers)]
     heapq.heapify(heap)
 
-    for b in sorted_bmarks:
-        count = loop_counts.get(b.name, 1)  # default 1 if unknown
-        total, idx, blist = heapq.heappop(heap)
-        blist.append(b)
-        heapq.heappush(heap, (total + count, idx, blist))
+    for loop in loop_assignments:
+        total, idx, lst = heapq.heappop(heap)
+        lst.append(loop)
+        heapq.heappush(heap, (total + 1, idx, lst))
 
-    # Re-order by worker index before returning
-    assignments: list[list[Path]] = [[] for _ in range(n_workers)]
-    for total, idx, blist in heap:
-        assignments[idx] = blist
-    return assignments
+    # Sort each worker's share so benchmark groups are contiguous
+    per_worker: list[list[dict]] = [[] for _ in range(n_workers)]
+    for total, idx, lst in heap:
+        lst.sort(key=lambda x: (x["benchmark_name"], x["loop_idx"]))
+        per_worker[idx] = lst
+    return per_worker
 
 
 def _get_weights(agent: Agent) -> dict:
@@ -547,7 +589,7 @@ def _load_weights(agent: Agent, weights: dict) -> None:
 def _worker_fn(
     rank: int,
     gpu_id: int,
-    benchmark_list: list,        # list[Path] — passed as posix strings from main
+    loop_assignments: list,      # list[dict] — flat, sorted by (benchmark_name, loop_idx)
     initial_weights: dict,
     hparams: dict,
     result_q,                    # mp.Queue: worker → main
@@ -555,26 +597,38 @@ def _worker_fn(
     mode: str,                   # "train" or "eval"
 ) -> None:
     """
-    Worker process: iterates over *benchmark_list*, runs episodes, and streams
-    result dicts to *result_q*.
+    Worker process: iterates over *loop_assignments* and streams result dicts
+    to *result_q*.
+
+    Each benchmark is copied once to an isolated working directory:
+        tmp_dir / "working_set" / benchmark_name
+    so compilations for different workers targeting the same benchmark never
+    conflict and the original HeCBench source tree is never modified.
+
+    env.reset() and env.step() are NOT called here.  The worker drives
+    compile_single_loop and measure_kernel_time directly, using pre-measured
+    baseline times from hparams["baseline_cache"] and pre-extracted loop
+    features from the assignment dicts.  GpuLoopEnv is instantiated only to
+    provide get_post_unmerge_features() for the unmerge=1 path.
 
     Message types sent to result_q:
-      {"type": "entry",        "entry": RolloutEntry, "benchmark": str,
+      {"type": "entry",       "entry": RolloutEntry, "benchmark": str,
        "loop_idx": int, "unmerge": int, "factor": int,
-       "reward": float, "value": float}           — training sample
-      {"type": "eval_result",  "benchmark": str, "loop_idx": int,
-       "reward": float, "value": float}           — eval sample (no entry)
-      {"type": "reset_failed", "benchmark": str, "rank": int}
-      {"type": "step_failed",  "loop_idx": int,  "rank": int}
-      {"type": "worker_done",  "rank": int}
+       "reward": float, "value": float, "timeout": bool}  — training sample
+      {"type": "eval_result", "benchmark": str, "loop_idx": int,
+       "reward": float, "value": float, "timeout": bool}  — eval sample
+      {"type": "step_failed", "loop_idx": int, "rank": int}
+      {"type": "worker_done", "rank": int}
 
-    Weight updates (train mode only): main puts a new weight dict into
-    *weight_q* after each PPO update; the worker drains the queue between
-    benchmarks.
+    Weight updates (train mode only): main puts a weight dict into *weight_q*
+    after each PPO update; the worker drains it between benchmark groups.
     """
     import logging
     import os
+    import shutil
+    import subprocess
     import sys
+    from itertools import groupby
     from pathlib import Path as _Path
 
     # Re-insert scripts/rl into sys.path (spawn starts fresh)
@@ -584,8 +638,8 @@ def _worker_fn(
 
     import torch
     from agent import Agent, RolloutEntry, FACTOR_VALUES
-    from environment import GpuLoopEnv
-    from hecbench import FeatureNormalizer
+    from environment import GpuLoopEnv, LoopRecord
+    from hecbench import FeatureNormalizer, compile_single_loop, measure_kernel_time
 
     _epoch = hparams.get("epoch", 0)
     _total = hparams.get("total_epochs", 0)
@@ -604,7 +658,6 @@ def _worker_fn(
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # Build agent with the initial weights from main
     agent = Agent(
         clip_eps=hparams["clip_eps"],
         K=hparams["K"],
@@ -615,13 +668,19 @@ def _worker_fn(
     )
     _load_weights(agent, initial_weights)
 
-    # Per-worker tmp dir to avoid nsys report filename collisions
-    tmp_dir = _Path(hparams["tmp_dir"]) / f"worker_{rank}"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
     worker_normalizer = FeatureNormalizer.from_state_dict(
         hparams.get("normalizer_state", {})
     )
+    baseline_cache: dict = hparams.get("baseline_cache", {})
+
+    # Per-worker directories
+    tmp_dir = _Path(hparams["tmp_dir"]) / f"worker_{rank}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    working_set_dir = tmp_dir / "working_set"
+    working_set_dir.mkdir(parents=True, exist_ok=True)
+
+    # Lightweight env used only for get_post_unmerge_features().
+    # _benchmark_dir is set per benchmark group below.
     env = GpuLoopEnv(
         arch=hparams["arch"],
         n_runs=hparams["n_runs"],
@@ -630,16 +689,19 @@ def _worker_fn(
         compile_timeout_penalty=hparams["compile_timeout_penalty"],
         gpu_id=gpu_id,
         normalizer=worker_normalizer,
-        baseline_cache=hparams.get("baseline_cache", {}),
+        baseline_cache=baseline_cache,
     )
 
-    # benchmark_list may be Path objects or plain strings depending on pickling
-    benchmark_dirs = [_Path(b) for b in benchmark_list]
-
     try:
-        for benchmark_dir in benchmark_dirs:
+        # loop_assignments is sorted by (benchmark_name, loop_idx) so groupby
+        # yields contiguous benchmark groups — one shutil.copytree per benchmark.
+        for bench_name, bench_iter in groupby(
+            loop_assignments, key=lambda x: x["benchmark_name"]
+        ):
+            bench_loops = list(bench_iter)
+
             # ----------------------------------------------------------
-            # Between benchmarks: absorb any weight updates from main
+            # Between benchmark groups: absorb weight updates from main
             # (train mode only — eval uses a frozen policy snapshot)
             # ----------------------------------------------------------
             if mode == "train":
@@ -652,26 +714,56 @@ def _worker_fn(
                     pass  # queue.Empty — no update pending
 
             # ----------------------------------------------------------
-            # Episode
+            # Validate baseline and copy benchmark to isolated working dir
             # ----------------------------------------------------------
+            baseline_ms = baseline_cache.get(bench_name)
+            if baseline_ms is None:
+                _log.warning(
+                    "No baseline cached for %s — skipping %d loops",
+                    bench_name, len(bench_loops),
+                )
+                continue
+
+            original_path = _Path(bench_loops[0]["benchmark_path"])
+            copy_dir = working_set_dir / bench_name
             try:
-                first_features = env.reset(benchmark_dir)
+                if copy_dir.exists():
+                    shutil.rmtree(copy_dir)
+                shutil.copytree(original_path, copy_dir)
             except Exception as e:
-                _log.warning("reset failed for %s: %s", benchmark_dir.name, e)
-                result_q.put({
-                    "type": "reset_failed",
-                    "benchmark": benchmark_dir.name,
-                    "rank": rank,
-                })
+                _log.warning(
+                    "Failed to copy %s to working set: %s — skipping",
+                    bench_name, e,
+                )
                 continue
 
-            if first_features is None:
-                _log.info("%s — no eligible loops", benchmark_dir.name)
-                continue
+            # Point env at the worker's copy so get_post_unmerge_features
+            # compiles inside the isolated directory.
+            env._benchmark_dir = copy_dir
 
-            for loop_record in env.eligible_loops:
-                pre_features = loop_record.pre_features.to(device)
+            _log.info("Processing %s: %d loops", bench_name, len(bench_loops))
 
+            # ----------------------------------------------------------
+            # Per-loop: compile, measure, send result
+            # ----------------------------------------------------------
+            for loop_data in bench_loops:
+                loop_idx = loop_data["loop_idx"]
+                filename  = loop_data["filename"]
+                triple    = loop_data["triple"]
+
+                raw_features = torch.tensor(
+                    loop_data["pre_features_raw"], dtype=torch.float32
+                )
+                pre_features = worker_normalizer.normalize(raw_features).to(device)
+
+                loop_record = LoopRecord(
+                    loop_idx=loop_idx,
+                    filename=filename,
+                    triple=triple,
+                    pre_features=pre_features.cpu(),
+                )
+
+                # --- Agent decisions ---
                 unmerge, log_p1 = agent.select_unmerge(pre_features)
 
                 if unmerge == 1:
@@ -685,68 +777,124 @@ def _worker_fn(
                     step2_features = pre_features
 
                 factor_idx, log_p2 = agent.select_factor(
-                    step2_features, loop_idx=loop_record.loop_idx
+                    step2_features, loop_idx=loop_idx
                 )
+                factor = FACTOR_VALUES[factor_idx]
 
-                try:
-                    _, reward, done = env.step(loop_record, unmerge, factor_idx)
-                except Exception as e:
-                    _log.warning(
-                        "step failed for loop_idx=%d: %s", loop_record.loop_idx, e
-                    )
-                    result_q.put({
-                        "type": "step_failed",
-                        "loop_idx": loop_record.loop_idx,
-                        "rank": rank,
-                    })
-                    if done:
-                        break
-                    continue
+                # --- Compile + measure ---
+                is_timeout = False
+                if unmerge == 0 and factor == 1:
+                    # No-op: reward is exactly 0 by definition; skip
+                    # compilation and measurement entirely.
+                    reward = 0.0
+                else:
+                    try:
+                        ok = compile_single_loop(
+                            copy_dir,
+                            loop_idx=loop_idx,
+                            unmerge=unmerge,
+                            factor=factor,
+                            filename=filename,
+                            triple=triple,
+                            arch=hparams["arch"],
+                        )
+                    except subprocess.TimeoutExpired:
+                        reward    = hparams["compile_timeout_penalty"]
+                        is_timeout = True
+                        _log.warning(
+                            "%s loop_idx=%d compile timeout — penalty=%.2f",
+                            bench_name, loop_idx, reward,
+                        )
+                        v = agent.predict_value(pre_features)
+                        _send_loop_result(
+                            result_q, mode, rank, bench_name, loop_idx,
+                            unmerge, factor, reward, v, is_timeout,
+                            pre_features, step2_features, factor_idx,
+                            log_p1, log_p2,
+                        )
+                        continue
+
+                    if not ok:
+                        # Compile error — treat as no-op (no training signal)
+                        modified_ms = baseline_ms
+                    else:
+                        try:
+                            modified_ms = measure_kernel_time(
+                                copy_dir,
+                                arch=hparams["arch"],
+                                n_runs=hparams["n_runs"],
+                                nsys_timeout=hparams["nsys_timeout"],
+                                tmp_dir=tmp_dir,
+                                gpu_id=gpu_id,
+                            )
+                        except RuntimeError:
+                            modified_ms = baseline_ms
+
+                    reward = (baseline_ms - modified_ms) / max(baseline_ms, 1e-9)
 
                 v = agent.predict_value(pre_features)
-                is_timeout = (
-                    reward == hparams["compile_timeout_penalty"]
-                    and reward < 0
+                _send_loop_result(
+                    result_q, mode, rank, bench_name, loop_idx,
+                    unmerge, factor, reward, v, is_timeout,
+                    pre_features, step2_features, factor_idx,
+                    log_p1, log_p2,
                 )
-
-                if mode == "train":
-                    entry = RolloutEntry(
-                        state1=pre_features.cpu(),
-                        state2=step2_features.cpu(),
-                        action1=unmerge,
-                        action2=factor_idx,
-                        log_prob1=log_p1.cpu(),
-                        log_prob2=log_p2.cpu(),
-                        reward=reward,
-                    )
-                    result_q.put({
-                        "type": "entry",
-                        "entry": entry,
-                        "benchmark": benchmark_dir.name,
-                        "loop_idx": loop_record.loop_idx,
-                        "unmerge": unmerge,
-                        "factor": FACTOR_VALUES[factor_idx],
-                        "reward": reward,
-                        "value": v,
-                        "timeout": is_timeout,
-                        "rank": rank,
-                    })
-                else:
-                    result_q.put({
-                        "type": "eval_result",
-                        "benchmark": benchmark_dir.name,
-                        "loop_idx": loop_record.loop_idx,
-                        "reward": reward,
-                        "value": v,
-                        "timeout": is_timeout,
-                        "rank": rank,
-                    })
-
-                if done:
-                    break
 
     finally:
         result_q.put({"type": "worker_done", "rank": rank})
+
+
+def _send_loop_result(
+    result_q,
+    mode: str,
+    rank: int,
+    bench_name: str,
+    loop_idx: int,
+    unmerge: int,
+    factor: int,
+    reward: float,
+    value: float,
+    is_timeout: bool,
+    pre_features,
+    step2_features,
+    factor_idx: int,
+    log_p1,
+    log_p2,
+) -> None:
+    """Put one loop result onto result_q in the appropriate format."""
+    import torch
+    from agent import RolloutEntry
+    if mode == "train":
+        result_q.put({
+            "type":      "entry",
+            "entry":     RolloutEntry(
+                state1=pre_features.cpu(),
+                state2=step2_features.cpu(),
+                action1=unmerge,
+                action2=factor_idx,
+                log_prob1=log_p1.cpu(),
+                log_prob2=log_p2.cpu(),
+                reward=reward,
+            ),
+            "benchmark": bench_name,
+            "loop_idx":  loop_idx,
+            "unmerge":   unmerge,
+            "factor":    factor,
+            "reward":    reward,
+            "value":     value,
+            "timeout":   is_timeout,
+            "rank":      rank,
+        })
+    else:
+        result_q.put({
+            "type":      "eval_result",
+            "benchmark": bench_name,
+            "loop_idx":  loop_idx,
+            "reward":    reward,
+            "value":     value,
+            "timeout":   is_timeout,
+            "rank":      rank,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -755,9 +903,8 @@ def _worker_fn(
 
 def run_parallel_epoch(
     agent: Agent,
-    train_benchmarks: list[Path],
-    val_benchmarks: list[Path],
-    loop_counts: dict[str, int],
+    train_loop_assignments: list[dict],
+    val_loop_assignments: list[dict],
     normalizer: "FeatureNormalizer",
     baseline_cache: dict,
     n_workers: int,
@@ -771,16 +918,18 @@ def run_parallel_epoch(
     Run one complete training + validation epoch across *n_workers* GPU workers.
 
     Worker k is assigned GPU k (CUDA_VISIBLE_DEVICES=k inside the process).
-    All loops of a benchmark are kept on the same worker to avoid make conflicts.
+    Loops are distributed at loop granularity — different workers may handle
+    different loops of the same benchmark, each in its own isolated copy under
+        tmp_dir / worker_{k} / working_set / benchmark_name /
 
-    Returns:
-        (epoch_stats_dict, failed_train_list, failed_val_list)
+    train_loop_assignments / val_loop_assignments are flat lists of loop dicts
+    as produced by build_loop_assignments(); assign_loops_to_workers() does
+    the bin-packing per call so each epoch gets a fresh distribution after
+    the caller shuffles the flat list.
 
-    epoch_stats_dict keys:
-        train_samples, train_missed, train_rewards (list), train_advantages (list),
-        train_actor_loss, train_value_loss, train_updates,
-        val_avg_reward, val_avg_advantage, val_samples, val_missed,
-        val_per_benchmark (list of dicts)
+    Returns (epoch_stats_dict, [], []) — the empty lists are kept for API
+    compatibility with the sequential path; loop-level failures are handled
+    inline in the worker and do not propagate back to main.
     """
     hparams = {
         "arch":                    args.arch,
@@ -800,21 +949,17 @@ def run_parallel_epoch(
     }
 
     # Maximum time main will wait between consecutive worker messages.
-    # A worker can be silent for up to one full measurement cycle
-    # (n_runs × nsys_timeout) plus a compilation buffer (300 s).
-    # Using a fixed 600 s caused false-alarm warnings on long benchmarks.
     worker_msg_timeout = args.n_runs * args.nsys_timeout + 300
 
     # ------------------------------------------------------------------ #
     # Phase 1: Training pass                                               #
     # ------------------------------------------------------------------ #
-    train_assignments = assign_benchmarks_to_workers(
-        train_benchmarks, loop_counts, n_workers
-    )
-    for w_idx, assignment in enumerate(train_assignments):
+    train_per_worker = assign_loops_to_workers(train_loop_assignments, n_workers)
+    for w_idx, assignment in enumerate(train_per_worker):
+        unique_bmarks = sorted({a["benchmark_name"] for a in assignment})
         log.info(
-            "  Worker %d (GPU %d): %d train benchmarks — %s",
-            w_idx, w_idx, len(assignment), [b.name for b in assignment],
+            "  Worker %d (GPU %d): %d train loops across %s",
+            w_idx, w_idx, len(assignment), unique_bmarks,
         )
 
     initial_weights = _get_weights(agent)
@@ -829,7 +974,7 @@ def run_parallel_epoch(
             args=(
                 rank,
                 rank,                          # gpu_id == rank
-                train_assignments[rank],
+                train_per_worker[rank],
                 initial_weights,
                 hparams,
                 result_q,
@@ -842,14 +987,13 @@ def run_parallel_epoch(
         workers.append(p)
 
     # Collect training results
-    train_samples   = 0
-    train_missed    = 0
+    train_samples    = 0
+    train_missed     = 0
     train_rewards:    list[float] = []
     train_advantages: list[float] = []
     train_actor_loss  = 0.0
     train_value_loss  = 0.0
     train_updates     = 0
-    failed_train:  list[Path] = []
     done_count = 0
 
     while done_count < n_workers:
@@ -898,13 +1042,6 @@ def run_parallel_epoch(
         elif mtype == "step_failed":
             train_missed += 1
 
-        elif mtype == "reset_failed":
-            bench_name = msg["benchmark"]
-            matched = [b for b in train_benchmarks if b.name == bench_name]
-            if matched:
-                failed_train.extend(matched)
-            log.warning("Train reset failed: %s (worker %d)", bench_name, msg["rank"])
-
         elif mtype == "worker_done":
             done_count += 1
             log.info("Worker %d finished training pass", msg["rank"])
@@ -932,12 +1069,9 @@ def run_parallel_epoch(
     val_samples       = 0
     val_missed        = 0
     val_per_benchmark: list[dict] = []
-    failed_val: list[Path] = []
 
-    if val_benchmarks:
-        val_assignments = assign_benchmarks_to_workers(
-            val_benchmarks, loop_counts, n_workers
-        )
+    if val_loop_assignments:
+        val_per_worker = assign_loops_to_workers(val_loop_assignments, n_workers)
         val_weights = _get_weights(agent)
         val_result_q: mp.Queue = mp.Queue()
         val_weight_qs: list[mp.Queue] = [mp.Queue() for _ in range(n_workers)]
@@ -949,7 +1083,7 @@ def run_parallel_epoch(
                 args=(
                     rank,
                     rank,
-                    val_assignments[rank],
+                    val_per_worker[rank],
                     val_weights,
                     hparams,
                     val_result_q,
@@ -992,13 +1126,6 @@ def run_parallel_epoch(
             elif mtype == "step_failed":
                 val_missed += 1
 
-            elif mtype == "reset_failed":
-                bench_name = msg["benchmark"]
-                matched = [b for b in val_benchmarks if b.name == bench_name]
-                if matched:
-                    failed_val.extend(matched)
-                log.warning("Val reset failed: %s (worker %d)", bench_name, msg["rank"])
-
             elif mtype == "worker_done":
                 val_done_count += 1
                 log.info("Worker %d finished val pass", msg["rank"])
@@ -1031,7 +1158,7 @@ def run_parallel_epoch(
         "val_missed":          val_missed,
         "val_per_benchmark":   val_per_benchmark,
     }
-    return epoch_stats, failed_train, failed_val
+    return epoch_stats, [], []
 
 
 # ---------------------------------------------------------------------------
@@ -1087,7 +1214,7 @@ def main() -> None:
 
     # --- Pre-flight eligibility check ---
     cache_file = ckpt_dir / "eligible_benchmarks.json"
-    all_benchmarks, loop_counts, normalizer = precheck_benchmarks(
+    all_benchmarks, loop_counts, loop_records_map, normalizer = precheck_benchmarks(
         all_benchmarks, cache_file, skip=args.skip_precheck
     )
 
@@ -1120,7 +1247,7 @@ def main() -> None:
         gpu_id=0,
     )
 
-    # Update env with the pre-measured cache
+    # Build sequential-path env (also used for test eval at the end)
     env = GpuLoopEnv(
         arch=args.arch,
         n_runs=args.n_runs,
@@ -1131,6 +1258,17 @@ def main() -> None:
         baseline_cache=baseline_cache,
     )
 
+    # --- Build flat loop assignment lists for the parallel path ---
+    # Each epoch the train list is shuffled before bin-packing so workers
+    # get a different loop distribution each time (exploration diversity).
+    # Val assignments are stable (evaluation uses a frozen policy).
+    train_loop_assignments = build_loop_assignments(train_bmarks, loop_records_map)
+    val_loop_assignments   = build_loop_assignments(val_bmarks,   loop_records_map)
+    log.info(
+        "Loop assignments: train=%d loops  val=%d loops",
+        len(train_loop_assignments), len(val_loop_assignments),
+    )
+
     total_updates = 0
     rng = random.Random(args.split_seed)
 
@@ -1138,20 +1276,19 @@ def main() -> None:
         _epoch_filter.set(epoch, args.epochs)
         log.info("=== Epoch %d / %d ===", epoch, args.epochs)
 
-        # Shuffle training benchmarks each epoch so the rollout buffer is
-        # filled in a different order, preventing systematic bias toward
-        # whichever benchmarks happen to be first in the list.
-        rng.shuffle(train_bmarks)
-
         # ==============================================================
         # PARALLEL PATH  (--num-workers > 1)
         # ==============================================================
         if args.num_workers > 1:
-            epoch_stats, failed_train, failed_val = run_parallel_epoch(
+            # Shuffle the flat train assignment list each epoch so workers
+            # receive a different loop distribution — equivalent to shuffling
+            # benchmark order but at loop granularity.
+            rng.shuffle(train_loop_assignments)
+
+            epoch_stats, _, _ = run_parallel_epoch(
                 agent=agent,
-                train_benchmarks=list(train_bmarks),
-                val_benchmarks=list(val_bmarks),
-                loop_counts=loop_counts,
+                train_loop_assignments=train_loop_assignments,
+                val_loop_assignments=val_loop_assignments,
                 normalizer=normalizer,
                 baseline_cache=baseline_cache,
                 n_workers=args.num_workers,
@@ -1161,18 +1298,6 @@ def main() -> None:
                 current_epoch=epoch,
                 total_epochs=args.epochs,
             )
-
-            # Remove persistently failing benchmarks
-            for b in failed_train:
-                if b in train_bmarks:
-                    train_bmarks.remove(b)
-                    log.warning("Removed %s from training set — %d remain",
-                                b.name, len(train_bmarks))
-            for b in failed_val:
-                if b in val_bmarks:
-                    val_bmarks.remove(b)
-                    log.warning("Removed %s from val set — %d remain",
-                                b.name, len(val_bmarks))
 
             total_updates += epoch_stats["train_updates"]
 
@@ -1218,6 +1343,10 @@ def main() -> None:
         # SEQUENTIAL PATH  (--num-workers 1, default — unchanged logic)
         # ==============================================================
         else:
+            # Shuffle benchmark order each epoch so the rollout buffer is
+            # filled in a different order, preventing systematic bias.
+            rng.shuffle(train_bmarks)
+
             epoch_samples    = 0
             epoch_missed     = 0
             epoch_rewards:    list[float] = []
