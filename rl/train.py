@@ -244,6 +244,52 @@ def precheck_benchmarks(
 
 
 # ---------------------------------------------------------------------------
+# One-shot baseline measurement
+# ---------------------------------------------------------------------------
+
+def measure_baselines(
+    benchmarks: list[Path],
+    arch: str,
+    n_runs: int,
+    nsys_timeout: int,
+    tmp_dir: Path,
+    gpu_id: int = 0,
+) -> dict[str, float]:
+    """
+    Compile and measure the unmodified kernel time for each benchmark.
+
+    Called once after the train/val/test split so every epoch's reward is
+    computed against a stable reference rather than a freshly sampled (noisy)
+    baseline.  Results are keyed by benchmark directory name.
+
+    A benchmark is silently skipped if compilation or measurement fails;
+    GpuLoopEnv.reset() will fall back to on-demand measurement for cache misses,
+    so a skip here does not break training — it only loses the caching benefit.
+    """
+    from hecbench import compile_baseline, measure_kernel_time
+
+    cache: dict[str, float] = {}
+    log.info("Measuring baselines for %d benchmarks (once per run)...", len(benchmarks))
+    for b in benchmarks:
+        if not compile_baseline(b, arch=arch):
+            log.warning("  SKIP  %-35s  baseline compile failed", b.name)
+            continue
+        try:
+            t_ms = measure_kernel_time(
+                b, arch=arch, n_runs=n_runs,
+                nsys_timeout=nsys_timeout,
+                tmp_dir=tmp_dir,
+                gpu_id=gpu_id,
+            )
+            cache[b.name] = t_ms
+            log.info("  DONE  %-35s  baseline=%.3f ms", b.name, t_ms)
+        except Exception as e:
+            log.warning("  SKIP  %-35s  measurement failed: %s", b.name, e)
+    log.info("Baseline cache: %d / %d benchmarks measured", len(cache), len(benchmarks))
+    return cache
+
+
+# ---------------------------------------------------------------------------
 # Benchmark split
 # ---------------------------------------------------------------------------
 
@@ -584,6 +630,7 @@ def _worker_fn(
         compile_timeout_penalty=hparams["compile_timeout_penalty"],
         gpu_id=gpu_id,
         normalizer=worker_normalizer,
+        baseline_cache=hparams.get("baseline_cache", {}),
     )
 
     # benchmark_list may be Path objects or plain strings depending on pickling
@@ -712,6 +759,7 @@ def run_parallel_epoch(
     val_benchmarks: list[Path],
     loop_counts: dict[str, int],
     normalizer: "FeatureNormalizer",
+    baseline_cache: dict,
     n_workers: int,
     buffer: RolloutBuffer,
     device: torch.device,
@@ -746,6 +794,7 @@ def run_parallel_epoch(
         "lr":                      args.lr,
         "value_loss_coef":         args.value_loss_coef,
         "normalizer_state":        normalizer.state_dict(),
+        "baseline_cache":          baseline_cache,
         "epoch":                   current_epoch,
         "total_epochs":            total_epochs,
     }
@@ -1046,16 +1095,6 @@ def main() -> None:
         log.error("No eligible benchmarks found — cannot train. Exiting.")
         return
 
-    # Build env here so normalizer is guaranteed to be bound
-    env = GpuLoopEnv(
-        arch=args.arch,
-        n_runs=args.n_runs,
-        nsys_timeout=args.nsys_timeout,
-        tmp_dir=tmp_dir,
-        compile_timeout_penalty=args.compile_timeout_penalty,
-        normalizer=normalizer,
-    )
-
     # --- Split ---
     train_bmarks, val_bmarks, test_bmarks = split_benchmarks(
         all_benchmarks, args.val_ratio, args.test_ratio, args.split_seed
@@ -1067,6 +1106,30 @@ def main() -> None:
     log.info("  train: %s", [b.name for b in train_bmarks])
     log.info("  val:   %s", [b.name for b in val_bmarks])
     log.info("  test:  %s", [b.name for b in test_bmarks])
+
+    # --- Baseline measurement (once per run, after split) ---
+    # Train and val baselines are pre-measured so every epoch's reward uses
+    # the same reference value.  Test baselines are measured lazily on first
+    # access in GpuLoopEnv.reset() (test is only evaluated once at the end).
+    baseline_cache = measure_baselines(
+        train_bmarks + val_bmarks,
+        arch=args.arch,
+        n_runs=args.n_runs,
+        nsys_timeout=args.nsys_timeout,
+        tmp_dir=tmp_dir,
+        gpu_id=0,
+    )
+
+    # Update env with the pre-measured cache
+    env = GpuLoopEnv(
+        arch=args.arch,
+        n_runs=args.n_runs,
+        nsys_timeout=args.nsys_timeout,
+        tmp_dir=tmp_dir,
+        compile_timeout_penalty=args.compile_timeout_penalty,
+        normalizer=normalizer,
+        baseline_cache=baseline_cache,
+    )
 
     total_updates = 0
     rng = random.Random(args.split_seed)
@@ -1090,6 +1153,7 @@ def main() -> None:
                 val_benchmarks=list(val_bmarks),
                 loop_counts=loop_counts,
                 normalizer=normalizer,
+                baseline_cache=baseline_cache,
                 n_workers=args.num_workers,
                 buffer=buffer,
                 device=device,

@@ -71,6 +71,7 @@ class GpuLoopEnv:
         compile_timeout_penalty: float = -1.0,
         gpu_id: int = 0,
         normalizer: Optional[FeatureNormalizer] = None,
+        baseline_cache: Optional[dict] = None,
     ) -> None:
         self.arch = arch
         self.n_runs = n_runs
@@ -79,6 +80,13 @@ class GpuLoopEnv:
         self.compile_timeout_penalty = compile_timeout_penalty
         self.gpu_id = gpu_id
         self.normalizer = normalizer or FeatureNormalizer()  # no-op if not fitted
+
+        # Pre-measured baseline times: {benchmark_dir.name → ms}.
+        # Populated by the training script once per run (after train/val/test split)
+        # and passed in here so reset() skips re-measurement on every epoch.
+        # On a cache miss reset() falls back to on-demand measurement and stores
+        # the result, so held-out (test) benchmarks still work correctly.
+        self._baseline_cache: dict[str, float] = dict(baseline_cache) if baseline_cache else {}
 
         # State set by reset()
         self._benchmark_dir: Optional[Path] = None
@@ -113,20 +121,29 @@ class GpuLoopEnv:
 
         Returns the pre-unmerge feature vector for the first eligible loop,
         or None if the benchmark has no eligible loops.
+
+        Baseline time is read from the cache when available (pre-measured once
+        per training run after the train/val/test split).  On a cache miss the
+        baseline is compiled and measured on-demand and the result is stored so
+        subsequent resets for the same benchmark (e.g. test-set eval) are free.
         """
         self._benchmark_dir = benchmark_dir
         self._loop_cursor = 0
         self._awaiting_factor = False
         self._pending_post_features = None
 
-        if not compile_baseline(benchmark_dir, arch=self.arch):
-            raise RuntimeError(f"Baseline compilation failed: {benchmark_dir.name}")
-
-        self._baseline_time_ms = measure_kernel_time(
-            benchmark_dir, arch=self.arch, n_runs=self.n_runs,
-            nsys_timeout=self.nsys_timeout, tmp_dir=self.tmp_dir,
-            gpu_id=self.gpu_id,
-        )
+        bname = benchmark_dir.name
+        if bname in self._baseline_cache:
+            self._baseline_time_ms = self._baseline_cache[bname]
+        else:
+            if not compile_baseline(benchmark_dir, arch=self.arch):
+                raise RuntimeError(f"Baseline compilation failed: {bname}")
+            self._baseline_time_ms = measure_kernel_time(
+                benchmark_dir, arch=self.arch, n_runs=self.n_runs,
+                nsys_timeout=self.nsys_timeout, tmp_dir=self.tmp_dir,
+                gpu_id=self.gpu_id,
+            )
+            self._baseline_cache[bname] = self._baseline_time_ms
 
         file_map, primary_file, triple = get_loop_features(benchmark_dir, arch=self.arch)
         if not file_map:
