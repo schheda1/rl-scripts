@@ -478,6 +478,25 @@ def demangle(mangled_name: str) -> str:
         return mangled_name
 
 
+def demangled_to_filter(demangled: str) -> str:
+    """
+    Convert a fully-demangled C++ name to a robust nsys substring filter.
+
+    c++filt and nsys format the same symbol differently:
+      c++filt: mandel(int*, MandelParameters const*, int, int)   ← East const, no spaces
+      nsys:    mandel(int *, const MandelParameters *, int, int) ← West const, spaces
+
+    Using the full signature as a filter fails.  Truncating to "funcname(" —
+    everything up to and including the first "(" — is immune to all such
+    formatting differences while remaining specific enough to avoid false matches
+    in practice (kernels share names only when they are the same function).
+    """
+    paren = demangled.find("(")
+    if paren >= 0:
+        return demangled[:paren + 1]   # e.g. "mandel("
+    return demangled                   # no parens (plain C / truncated) — use as-is
+
+
 def _parse_nsys_kernel_times(csv_output: str) -> dict[str, float]:
     """
     Parse `nsys stats --report=cuda_gpu_kern_sum --format=csv` output.

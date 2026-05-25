@@ -299,7 +299,7 @@ def measure_baselines(
     A benchmark is skipped if compilation or nsys measurement fails; workers
     fall back to on-demand measurement via GpuLoopEnv.reset() on a cache miss.
     """
-    from hecbench import compile_baseline, demangle, measure_kernel_time, _parse_nsys_kernel_times, _sum_kernel_times, _get_run_command
+    from hecbench import compile_baseline, demangle, demangled_to_filter, measure_kernel_time, _parse_nsys_kernel_times, _sum_kernel_times, _get_run_command
     import tempfile as _tempfile
 
     cache: dict[str, dict] = {}
@@ -347,26 +347,28 @@ def measure_baselines(
             sum(kt.values()) for kt in run_times_raw
         )
 
-        # Per-kernel averages: for each unique parent, average the filtered time
+        # Per-kernel averages: for each unique parent, average the filtered time.
+        # Key in per_kernel_ms is "funcname(" (via demangled_to_filter) so it
+        # matches regardless of how c++filt vs nsys format pointer/const tokens.
         per_kernel_ms: dict[str, float] = {}
         for mangled in unique_parents:
-            demangled = demangle(mangled)
+            nsys_filter = demangled_to_filter(demangle(mangled))
             run_vals = [
-                _sum_kernel_times(kt, demangled)
+                _sum_kernel_times(kt, nsys_filter)
                 for kt in run_times_raw
             ]
             valid = [v for v in run_vals if v is not None]
             if valid:
-                per_kernel_ms[demangled] = statistics.mean(valid)
+                per_kernel_ms[nsys_filter] = statistics.mean(valid)
                 log.info(
                     "  DONE  %-35s  kernel=%-50s  %.3f ms",
-                    b.name, demangled[:50], per_kernel_ms[demangled],
+                    b.name, nsys_filter, per_kernel_ms[nsys_filter],
                 )
             else:
                 log.warning(
-                    "  WARN  %-35s  kernel %r not found in nsys output "
-                    "(demangled from %r) — B2 fallback will apply",
-                    b.name, demangled, mangled,
+                    "  WARN  %-35s  kernel filter %r not found in nsys output "
+                    "(mangled: %r) — B2 fallback will apply",
+                    b.name, nsys_filter, mangled,
                 )
 
         cache[b.name] = {"total_ms": total_ms, "per_kernel_ms": per_kernel_ms}
@@ -713,7 +715,7 @@ def _worker_fn(
     import torch
     from agent import Agent, RolloutEntry, FACTOR_VALUES
     from environment import GpuLoopEnv, LoopRecord
-    from hecbench import FeatureNormalizer, compile_single_loop, demangle, measure_kernel_time
+    from hecbench import FeatureNormalizer, compile_single_loop, demangle, demangled_to_filter, measure_kernel_time
 
     _epoch = hparams.get("epoch", 0)
     _total = hparams.get("total_epochs", 0)
@@ -843,7 +845,7 @@ def _worker_fn(
                 # Cases A / B1: single parent → filter nsys to that kernel.
                 # Case B2 / no parents: no filter → total benchmark time.
                 if len(kernel_parents) == 1:
-                    kernel_filter = demangle(kernel_parents[0])
+                    kernel_filter = demangled_to_filter(demangle(kernel_parents[0]))
                     baseline_ms = (
                         baseline_cache.get(bench_name, {})
                         .get("per_kernel_ms", {})

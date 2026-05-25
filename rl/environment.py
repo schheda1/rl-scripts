@@ -236,16 +236,19 @@ class GpuLoopEnv:
 
     def _kernel_filter_for(self, loop_record: LoopRecord) -> Optional[str]:
         """
-        Return the demangled kernel name to use as an nsys filter for this loop,
-        or None if total-benchmark time should be used (Case B2 / no parents).
+        Return an nsys substring filter for this loop, or None (Case B2 / no parents).
 
-        Cases A and B1: exactly one kernel parent → filter to that kernel.
+        Cases A and B1: exactly one kernel parent → return "funcname(" extracted
+        from the demangled symbol.  Using only the function name up to the opening
+        paren avoids c++filt vs nsys formatting differences (pointer spacing,
+        East/West const placement, return-type prefix).
+
         Case B2: multiple parents → return None (total-benchmark fallback).
         """
-        from hecbench import demangle as _demangle
+        from hecbench import demangle as _demangle, demangled_to_filter as _to_filter
         parents = loop_record.kernel_parents or []
         if len(parents) == 1:
-            return _demangle(parents[0])
+            return _to_filter(_demangle(parents[0]))
         return None
 
     def _baseline_for(self, loop_record: LoopRecord) -> float:
