@@ -286,6 +286,8 @@ LOOPCOUNT_COLUMNS = [
     "containsChildLoops", "containsBranch", "tripCountKnown", "tripCount",
     "numBasicBlocks", "numMemoryInsts", "numComputeInsts", "numControlFlowInsts",
     "containsCall", "numExits",
+    # metadata columns — not ML features, used for per-kernel measurement
+    "isKernelFunction", "kernelParents",
 ]
 
 FEATURE_COLUMNS = [
@@ -453,6 +455,97 @@ def _get_run_command(benchmark_dir: Path, arch: str) -> str:
     raise RuntimeError(f"Could not extract run command from {benchmark_dir}/Makefile")
 
 
+import functools
+
+
+@functools.lru_cache(maxsize=512)
+def demangle(mangled_name: str) -> str:
+    """
+    Demangle a C++ mangled symbol name using c++filt.
+
+    Results are cached with lru_cache since demangling is deterministic and
+    called O(unique kernel parents) times — typically single digits per run.
+    Returns the mangled name unchanged if c++filt is unavailable or fails.
+    """
+    try:
+        result = subprocess.run(
+            ["c++filt", mangled_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        demangled = result.stdout.strip()
+        return demangled if demangled else mangled_name
+    except Exception:
+        return mangled_name
+
+
+def _parse_nsys_kernel_times(csv_output: str) -> dict[str, float]:
+    """
+    Parse `nsys stats --report=cuda_gpu_kern_sum --format=csv` output.
+
+    Returns {kernel_name: total_time_ms} for every kernel row found.
+    Skips preamble lines (e.g. 'Generating SQLite...', 'Processing...') and
+    locates the CSV block starting at the 'Time (%)' header line.
+    Total Time values are converted from nanoseconds to milliseconds.
+    Returns an empty dict if parsing fails.
+    """
+    csv_lines = []
+    in_csv = False
+    for line in csv_output.splitlines():
+        if not in_csv and line.startswith("Time (%)"):
+            in_csv = True
+        if in_csv and line.strip():
+            csv_lines.append(line)
+
+    if not csv_lines:
+        return {}
+
+    try:
+        df = pd.read_csv(StringIO("\n".join(csv_lines)))
+        time_col = next(
+            (c for c in df.columns if "time" in c.lower() and "total" in c.lower()),
+            None,
+        )
+        if time_col is None:
+            numeric_cols = df.select_dtypes("number").columns
+            time_col = numeric_cols[1] if len(numeric_cols) > 1 else None
+        name_col = next(
+            (c for c in df.columns if c.strip().lower() == "name"),
+            None,
+        )
+        if time_col is None or name_col is None or df.empty:
+            return {}
+        return {
+            str(row[name_col]).strip(): float(row[time_col]) / 1_000_000.0
+            for _, row in df.iterrows()
+            if pd.notna(row[name_col]) and pd.notna(row[time_col])
+        }
+    except Exception:
+        return {}
+
+
+def _sum_kernel_times(
+    kernel_times: dict[str, float],
+    kernel_filter: Optional[str] = None,
+) -> Optional[float]:
+    """
+    Sum kernel times from a {name: ms} dict.
+
+    If *kernel_filter* is given, only sum rows whose name contains the filter
+    string (case-sensitive substring match).  The filter is the demangled kernel
+    name produced by demangle() so it matches nsys demangled output directly.
+    Returns None if the dict is empty or no rows match the filter.
+    """
+    if not kernel_times:
+        return None
+    if kernel_filter is None:
+        total = sum(kernel_times.values())
+        return total if total > 0 else None
+    matched = sum(
+        ms for name, ms in kernel_times.items() if kernel_filter in name
+    )
+    return matched if matched > 0 else None
+
+
 def measure_kernel_time(
     benchmark_dir: Path,
     arch: str = ARCH,
@@ -460,10 +553,16 @@ def measure_kernel_time(
     nsys_timeout: int = 300,
     tmp_dir: Path = DEFAULT_TMP_DIR,
     gpu_id: int = 0,
+    kernel_filter: Optional[str] = None,
 ) -> float:
     """
-    Run the benchmark under nsys n_runs times and return the mean total GPU
-    kernel time in ms.  The binary must already be compiled.
+    Run the benchmark under nsys *n_runs* times and return the mean GPU kernel
+    time in ms.  The binary must already be compiled.
+
+    *kernel_filter*: if set (demangled kernel name), only the time of matching
+    kernel rows is summed per run.  Use this to isolate the specific kernel
+    containing the loop being optimised.  If None, all kernels are summed
+    (original behaviour — used for total-benchmark baseline and B2 fallback).
 
     Uses a two-step approach compatible with newer nsys versions:
       1. nsys profile --output=<file> <binary> <args>
@@ -500,52 +599,18 @@ def measure_kernel_time(
             env=env,
         )
         combined = stats_result.stdout + stats_result.stderr
-        t = _parse_nsys_csv_kernel_time_ms(combined)
+        kernel_times = _parse_nsys_kernel_times(combined)
+        t = _sum_kernel_times(kernel_times, kernel_filter)
         if t is not None:
             times.append(t)
 
     if not times:
+        filter_msg = f" (filter={kernel_filter!r})" if kernel_filter else ""
         raise RuntimeError(
-            f"nsys produced no parseable kernel times for {benchmark_dir.name}"
+            f"nsys produced no parseable kernel times for "
+            f"{benchmark_dir.name}{filter_msg}"
         )
     return statistics.mean(times)
-
-
-def _parse_nsys_csv_kernel_time_ms(csv_output: str) -> Optional[float]:
-    """
-    Parse `nsys stats --format=csv` output for cuda_gpu_kern_sum.
-
-    Skips preamble lines (e.g. 'Generating SQLite...', 'Processing...') and
-    finds the CSV block starting at the 'Time (%)' header line.
-    Sums 'Total Time (ns)' across all kernel rows and converts to ms.
-    """
-    # Find the line where the CSV header starts
-    csv_lines = []
-    in_csv = False
-    for line in csv_output.splitlines():
-        if not in_csv and line.startswith("Time (%)"):
-            in_csv = True
-        if in_csv and line.strip():
-            csv_lines.append(line)
-
-    if not csv_lines:
-        return None
-
-    try:
-        df = pd.read_csv(StringIO("\n".join(csv_lines)))
-        time_col = next(
-            (c for c in df.columns if "time" in c.lower() and "total" in c.lower()),
-            None,
-        )
-        if time_col is None:
-            numeric_cols = df.select_dtypes("number").columns
-            time_col = numeric_cols[1] if len(numeric_cols) > 1 else None
-        if time_col is not None and not df.empty:
-            return df[time_col].sum() / 1_000_000.0  # ns → ms
-    except Exception:
-        pass
-
-    return None
 
 
 # ---------------------------------------------------------------------------

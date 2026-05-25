@@ -53,7 +53,12 @@ class LoopRecord:
     loop_idx: int
     filename: str
     triple: str
-    pre_features: torch.Tensor   # shape (16,)
+    pre_features: torch.Tensor   # shape (N_FEATURES,)
+    kernel_parents: list = None  # mangled parent kernel names from LoopCount BFS
+
+    def __post_init__(self):
+        if self.kernel_parents is None:
+            self.kernel_parents = []
 
 
 class GpuLoopEnv:
@@ -91,6 +96,7 @@ class GpuLoopEnv:
         # State set by reset()
         self._benchmark_dir: Optional[Path] = None
         self._baseline_time_ms: float = 0.0
+        self._kernel_baselines: dict[str, float] = {}  # demangled name → ms
         self._eligible_loops: list[LoopRecord] = []
         self._loop_cursor: int = 0
 
@@ -132,10 +138,20 @@ class GpuLoopEnv:
         self._awaiting_factor = False
         self._pending_post_features = None
 
+        from hecbench import demangle as _demangle
+
         bname = benchmark_dir.name
-        if bname in self._baseline_cache:
-            self._baseline_time_ms = self._baseline_cache[bname]
+        entry = self._baseline_cache.get(bname)
+        if isinstance(entry, dict):
+            # New-style cache entry from measure_baselines()
+            self._baseline_time_ms = entry["total_ms"]
+            self._kernel_baselines  = dict(entry.get("per_kernel_ms", {}))
+        elif isinstance(entry, float):
+            # Legacy scalar entry (old cache format or on-demand measurement)
+            self._baseline_time_ms = entry
+            self._kernel_baselines  = {}
         else:
+            # Cache miss — compile and measure on demand (test set, etc.)
             if not compile_baseline(benchmark_dir, arch=self.arch):
                 raise RuntimeError(f"Baseline compilation failed: {bname}")
             self._baseline_time_ms = measure_kernel_time(
@@ -144,6 +160,7 @@ class GpuLoopEnv:
                 gpu_id=self.gpu_id,
             )
             self._baseline_cache[bname] = self._baseline_time_ms
+            self._kernel_baselines = {}
 
         file_map, primary_file, triple = get_loop_features(benchmark_dir, arch=self.arch)
         if not file_map:
@@ -152,12 +169,15 @@ class GpuLoopEnv:
         self._eligible_loops = []
         for filename, df in file_map.items():
             for _, row in df.iterrows():
+                kp_raw = str(row.get("kernelParents", "")).strip()
+                kernel_parents = [p for p in kp_raw.split("|") if p]
                 self._eligible_loops.append(
                     LoopRecord(
                         loop_idx=int(row["loopIdx"]),
                         filename=filename,
                         triple=triple,
                         pre_features=self._to_features(row),
+                        kernel_parents=kernel_parents,
                     )
                 )
 
@@ -214,6 +234,32 @@ class GpuLoopEnv:
 
         return loop_record.pre_features
 
+    def _kernel_filter_for(self, loop_record: LoopRecord) -> Optional[str]:
+        """
+        Return the demangled kernel name to use as an nsys filter for this loop,
+        or None if total-benchmark time should be used (Case B2 / no parents).
+
+        Cases A and B1: exactly one kernel parent → filter to that kernel.
+        Case B2: multiple parents → return None (total-benchmark fallback).
+        """
+        from hecbench import demangle as _demangle
+        parents = loop_record.kernel_parents or []
+        if len(parents) == 1:
+            return _demangle(parents[0])
+        return None
+
+    def _baseline_for(self, loop_record: LoopRecord) -> float:
+        """
+        Return the appropriate baseline time (ms) for reward normalisation.
+
+        Cases A / B1: per-kernel baseline from _kernel_baselines dict.
+        Case B2 / miss: total benchmark baseline.
+        """
+        kf = self._kernel_filter_for(loop_record)
+        if kf is not None:
+            return self._kernel_baselines.get(kf, self._baseline_time_ms)
+        return self._baseline_time_ms
+
     def step(
         self,
         loop_record: LoopRecord,
@@ -225,7 +271,9 @@ class GpuLoopEnv:
 
         Returns (next_features, reward, done).
           next_features: feature vector for the next loop, or None if done.
-          reward:        (baseline_time - modified_time) / baseline_time
+          reward:        (kernel_baseline - kernel_modified) / kernel_baseline
+                         where kernel_baseline is the per-kernel time for cases
+                         A and B1, or total benchmark time for case B2.
           done:          True when all eligible loops in the episode are exhausted.
         """
         factor = FACTOR_VALUES[factor_idx]
@@ -238,6 +286,9 @@ class GpuLoopEnv:
             if self.done:
                 return None, 0.0, True
             return self._eligible_loops[self._loop_cursor].pre_features, 0.0, False
+
+        kernel_filter  = self._kernel_filter_for(loop_record)
+        baseline_ms    = self._baseline_for(loop_record)
 
         try:
             ok = compile_single_loop(
@@ -264,19 +315,20 @@ class GpuLoopEnv:
         if not ok:
             # Compile error (bad flags, source issue) — treat as no-op,
             # no signal to the agent.
-            modified_time_ms = self._baseline_time_ms
+            modified_time_ms = baseline_ms
         else:
             try:
                 modified_time_ms = measure_kernel_time(
                     self._benchmark_dir, arch=self.arch, n_runs=self.n_runs,
                     nsys_timeout=self.nsys_timeout, tmp_dir=self.tmp_dir,
                     gpu_id=self.gpu_id,
+                    kernel_filter=kernel_filter,
                 )
             except RuntimeError:
-                modified_time_ms = self._baseline_time_ms
+                modified_time_ms = baseline_ms
 
-        reward = (self._baseline_time_ms - modified_time_ms) / max(
-            self._baseline_time_ms, 1e-9
+        reward = (baseline_ms - modified_time_ms) / max(
+            baseline_ms, 1e-9
         )
 
         self._loop_cursor += 1

@@ -206,11 +206,17 @@ def precheck_benchmarks(
                     for _, row in df.iterrows():
                         raw = _row_to_tensor(row)
                         all_feature_tensors.append(raw)
+                        # kernelParents is a '|'-separated string of mangled names;
+                        # split into a list (empty string → empty list).
+                        kp_raw = str(row.get("kernelParents", "")).strip()
+                        kernel_parents = [p for p in kp_raw.split("|") if p]
                         records.append({
-                            "loop_idx":        int(row["loopIdx"]),
-                            "filename":        filename,
-                            "triple":          triple,
-                            "pre_features_raw": raw.tolist(),
+                            "loop_idx":           int(row["loopIdx"]),
+                            "filename":           filename,
+                            "triple":             triple,
+                            "pre_features_raw":   raw.tolist(),
+                            "is_kernel_function": bool(int(row.get("isKernelFunction", 0))),
+                            "kernel_parents":     kernel_parents,
                         })
                 loop_records_map[b.name] = records
                 log.info("  PASS  %-35s  eligible_loops=%d", b.name, n)
@@ -267,42 +273,108 @@ def precheck_benchmarks(
 
 def measure_baselines(
     benchmarks: list[Path],
+    loop_records_map: dict[str, list[dict]],
     arch: str,
     n_runs: int,
     nsys_timeout: int,
     tmp_dir: Path,
     gpu_id: int = 0,
-) -> dict[str, float]:
+) -> dict[str, dict]:
     """
-    Compile and measure the unmodified kernel time for each benchmark.
+    Compile and measure baseline kernel times for each benchmark once.
 
-    Called once after the train/val/test split so every epoch's reward is
-    computed against a stable reference rather than a freshly sampled (noisy)
-    baseline.  Results are keyed by benchmark directory name.
+    Returns a cache dict keyed by benchmark name:
+        {
+          "total_ms":      float,           # sum of all kernels (B2 / fallback)
+          "per_kernel_ms": {                # demangled parent kernel → ms
+              "mandel(int *, ...)": 5995.4,
+          }
+        }
 
-    A benchmark is silently skipped if compilation or measurement fails;
-    GpuLoopEnv.reset() will fall back to on-demand measurement for cache misses,
-    so a skip here does not break training — it only loses the caching benefit.
+    per_kernel_ms is built by collecting all unique kernelParents values from
+    the benchmark's loop records, demangling each, and filtering the nsys output
+    to isolate that kernel's time.  Cases A and B1 (single kernel parent) use
+    per_kernel_ms; Case B2 (multiple parents) falls back to total_ms.
+
+    A benchmark is skipped if compilation or nsys measurement fails; workers
+    fall back to on-demand measurement via GpuLoopEnv.reset() on a cache miss.
     """
-    from hecbench import compile_baseline, measure_kernel_time
+    from hecbench import compile_baseline, demangle, measure_kernel_time, _parse_nsys_kernel_times, _sum_kernel_times, _get_run_command
+    import tempfile as _tempfile
 
-    cache: dict[str, float] = {}
+    cache: dict[str, dict] = {}
     log.info("Measuring baselines for %d benchmarks (once per run)...", len(benchmarks))
+
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    env_base = {**__import__("os").environ, "ARCH": arch, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
+
     for b in benchmarks:
         if not compile_baseline(b, arch=arch):
             log.warning("  SKIP  %-35s  baseline compile failed", b.name)
             continue
-        try:
-            t_ms = measure_kernel_time(
-                b, arch=arch, n_runs=n_runs,
-                nsys_timeout=nsys_timeout,
-                tmp_dir=tmp_dir,
-                gpu_id=gpu_id,
+
+        # Collect unique mangled kernel parent names for this benchmark's loops
+        unique_parents: set[str] = set()
+        for rec in loop_records_map.get(b.name, []):
+            for p in rec.get("kernel_parents", []):
+                if p:
+                    unique_parents.add(p)
+
+        # Run nsys once, parse the full kernel-time dict
+        run_cmd = _get_run_command(b, arch)
+        report_path = _tempfile.mktemp(prefix="nsys_bl_", dir=str(tmp_dir))
+        run_times_raw: list[dict] = []
+        for _ in range(n_runs):
+            __import__("subprocess").run(
+                f"nsys profile --output={report_path} --force-overwrite=true {run_cmd}",
+                cwd=b, shell=True, capture_output=True, text=True,
+                timeout=nsys_timeout, env=env_base,
             )
-            cache[b.name] = t_ms
-            log.info("  DONE  %-35s  baseline=%.3f ms", b.name, t_ms)
-        except Exception as e:
-            log.warning("  SKIP  %-35s  measurement failed: %s", b.name, e)
+            stats = __import__("subprocess").run(
+                f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
+                shell=True, capture_output=True, text=True, timeout=30, env=env_base,
+            )
+            kt = _parse_nsys_kernel_times(stats.stdout + stats.stderr)
+            if kt:
+                run_times_raw.append(kt)
+
+        if not run_times_raw:
+            log.warning("  SKIP  %-35s  nsys produced no output", b.name)
+            continue
+
+        # Average total time across runs
+        total_ms = statistics.mean(
+            sum(kt.values()) for kt in run_times_raw
+        )
+
+        # Per-kernel averages: for each unique parent, average the filtered time
+        per_kernel_ms: dict[str, float] = {}
+        for mangled in unique_parents:
+            demangled = demangle(mangled)
+            run_vals = [
+                _sum_kernel_times(kt, demangled)
+                for kt in run_times_raw
+            ]
+            valid = [v for v in run_vals if v is not None]
+            if valid:
+                per_kernel_ms[demangled] = statistics.mean(valid)
+                log.info(
+                    "  DONE  %-35s  kernel=%-50s  %.3f ms",
+                    b.name, demangled[:50], per_kernel_ms[demangled],
+                )
+            else:
+                log.warning(
+                    "  WARN  %-35s  kernel %r not found in nsys output "
+                    "(demangled from %r) — B2 fallback will apply",
+                    b.name, demangled, mangled,
+                )
+
+        cache[b.name] = {"total_ms": total_ms, "per_kernel_ms": per_kernel_ms}
+        log.info(
+            "  DONE  %-35s  total=%.3f ms  kernels_cached=%d",
+            b.name, total_ms, len(per_kernel_ms),
+        )
+
     log.info("Baseline cache: %d / %d benchmarks measured", len(cache), len(benchmarks))
     return cache
 
@@ -525,12 +597,14 @@ def build_loop_assignments(
     for b in benchmarks:
         for record in loop_records_map.get(b.name, []):
             assignments.append({
-                "benchmark_name":   b.name,
-                "benchmark_path":   str(b),
-                "loop_idx":         record["loop_idx"],
-                "filename":         record["filename"],
-                "triple":           record["triple"],
-                "pre_features_raw": record["pre_features_raw"],
+                "benchmark_name":    b.name,
+                "benchmark_path":    str(b),
+                "loop_idx":          record["loop_idx"],
+                "filename":          record["filename"],
+                "triple":            record["triple"],
+                "pre_features_raw":  record["pre_features_raw"],
+                "is_kernel_function": record.get("is_kernel_function", True),
+                "kernel_parents":    record.get("kernel_parents", []),
             })
     return assignments
 
@@ -639,7 +713,7 @@ def _worker_fn(
     import torch
     from agent import Agent, RolloutEntry, FACTOR_VALUES
     from environment import GpuLoopEnv, LoopRecord
-    from hecbench import FeatureNormalizer, compile_single_loop, measure_kernel_time
+    from hecbench import FeatureNormalizer, compile_single_loop, demangle, measure_kernel_time
 
     _epoch = hparams.get("epoch", 0)
     _total = hparams.get("total_epochs", 0)
@@ -755,13 +829,30 @@ def _worker_fn(
                     loop_data["pre_features_raw"], dtype=torch.float32
                 )
                 pre_features = worker_normalizer.normalize(raw_features).to(device)
+                kernel_parents = loop_data.get("kernel_parents", [])
 
                 loop_record = LoopRecord(
                     loop_idx=loop_idx,
                     filename=filename,
                     triple=triple,
                     pre_features=pre_features.cpu(),
+                    kernel_parents=kernel_parents,
                 )
+
+                # Resolve kernel filter and baseline for this loop.
+                # Cases A / B1: single parent → filter nsys to that kernel.
+                # Case B2 / no parents: no filter → total benchmark time.
+                if len(kernel_parents) == 1:
+                    kernel_filter = demangle(kernel_parents[0])
+                    baseline_ms = (
+                        baseline_cache.get(bench_name, {})
+                        .get("per_kernel_ms", {})
+                        .get(kernel_filter)
+                        or baseline_cache.get(bench_name, {}).get("total_ms", 0.0)
+                    )
+                else:
+                    kernel_filter = None
+                    baseline_ms = baseline_cache.get(bench_name, {}).get("total_ms", 0.0)
 
                 # --- Agent decisions ---
                 unmerge, log_p1 = agent.select_unmerge(pre_features)
@@ -826,6 +917,7 @@ def _worker_fn(
                                 nsys_timeout=hparams["nsys_timeout"],
                                 tmp_dir=tmp_dir,
                                 gpu_id=gpu_id,
+                                kernel_filter=kernel_filter,
                             )
                         except RuntimeError:
                             modified_ms = baseline_ms
@@ -1240,6 +1332,7 @@ def main() -> None:
     # access in GpuLoopEnv.reset() (test is only evaluated once at the end).
     baseline_cache = measure_baselines(
         train_bmarks + val_bmarks,
+        loop_records_map=loop_records_map,
         arch=args.arch,
         n_runs=args.n_runs,
         nsys_timeout=args.nsys_timeout,
