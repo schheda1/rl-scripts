@@ -575,7 +575,7 @@ def measure_kernel_time(
     kernel_filter: Optional[str] = None,
 ) -> float:
     """
-    Run the benchmark under nsys *n_runs* times and return the mean GPU kernel
+    Run the benchmark under nsys *n_runs* times and return the median GPU kernel
     time in ms.  The binary must already be compiled.
 
     *kernel_filter*: if set (demangled kernel name), only the time of matching
@@ -629,7 +629,7 @@ def measure_kernel_time(
             f"nsys produced no parseable kernel times for "
             f"{benchmark_dir.name}{filter_msg}"
         )
-    return statistics.mean(times)
+    return statistics.median(times)
 
 
 # ---------------------------------------------------------------------------

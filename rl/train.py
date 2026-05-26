@@ -342,12 +342,14 @@ def measure_baselines(
             log.warning("  SKIP  %-35s  nsys produced no output", b.name)
             continue
 
-        # Average total time across runs
-        total_ms = statistics.mean(
+        # Median total time across runs — more robust than mean against
+        # scheduling outliers and nsys warm-up effects.
+        total_ms = statistics.median(
             sum(kt.values()) for kt in run_times_raw
         )
 
-        # Per-kernel averages: for each unique parent, average the filtered time.
+        # Per-kernel medians: for each unique parent, take the median of the
+        # filtered time across runs.  Median is more robust than mean here.
         # Key in per_kernel_ms is "funcname(" (via demangled_to_filter) so it
         # matches regardless of how c++filt vs nsys format pointer/const tokens.
         per_kernel_ms: dict[str, float] = {}
@@ -359,7 +361,7 @@ def measure_baselines(
             ]
             valid = [v for v in run_vals if v is not None]
             if valid:
-                per_kernel_ms[nsys_filter] = statistics.mean(valid)
+                per_kernel_ms[nsys_filter] = statistics.median(valid)
                 log.info(
                     "  DONE  %-35s  kernel=%-50s  %.3f ms",
                     b.name, nsys_filter, per_kernel_ms[nsys_filter],
@@ -844,13 +846,22 @@ def _worker_fn(
                 # Resolve kernel filter and baseline for this loop.
                 # Cases A / B1: single parent → filter nsys to that kernel.
                 # Case B2 / no parents: no filter → total benchmark time.
+                #
+                # Use explicit `is not None` rather than `or` to avoid the
+                # Python falsy-0.0 trap: a per-kernel time of 0.0 (however
+                # unlikely) would incorrectly fall through to total_ms with `or`,
+                # giving an asymmetric comparison (baseline=total, modified=per-kernel)
+                # that inflates rewards up to ~0.9 on an unchanged binary.
                 if len(kernel_parents) == 1:
                     kernel_filter = demangled_to_filter(demangle(kernel_parents[0]))
-                    baseline_ms = (
+                    _per_kern = (
                         baseline_cache.get(bench_name, {})
                         .get("per_kernel_ms", {})
                         .get(kernel_filter)
-                        or baseline_cache.get(bench_name, {}).get("total_ms", 0.0)
+                    )
+                    baseline_ms = (
+                        _per_kern if _per_kern is not None
+                        else baseline_cache.get(bench_name, {}).get("total_ms", 0.0)
                     )
                 else:
                     kernel_filter = None
