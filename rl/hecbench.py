@@ -341,15 +341,30 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
     Compile with LoopCount and return (loop_df_by_file, primary_filename, triple).
 
     The returned dict maps filename → DataFrame of eligible loops with FEATURE_COLUMNS.
-    Loops that are non-duplicatable, contain barriers, or have empty function names
-    are filtered out.
+
+    Filters applied (same as UU eligibility):
+      - duplicatable == 1
+      - containsBarrier == 0
+      - containsBranch == 1
+      - non-empty function name
+      - device loop: isKernelFunction == 1  OR  kernelParents non-empty
+
+    The last condition is the critical one for excluding CPU host loops.
+    LoopCount emits a single METADATA header (on seenLoops == 0) that captures
+    the first module's triple — typically the x86 host module in a CUDA clang++
+    compilation.  As a result the triple filter ("nvptx" in triple) is unreliable:
+    all loops, host and device alike, end up under the host triple.  The
+    isKernelFunction / kernelParents columns are the only reliable signal that a
+    loop actually runs on the GPU.
     """
     result = compile_loopcount(benchmark_dir, arch=arch)
     parsed = parse_loopcount_output(result.stderr)
     if not parsed:
         raise RuntimeError(f"No LoopCount output from {benchmark_dir.name}")
 
-    # Prefer the CUDA device triple; fall back to first if not found.
+    # Prefer the CUDA device triple when available; fall back to first triple.
+    # NOTE: this triple may be the x86 host triple (see docstring).  The device
+    # loop filter below is the authoritative guard, not the triple.
     triple = next(
         (t for t in parsed if "nvptx" in t or "cuda" in t.lower()),
         next(iter(parsed)),
@@ -358,12 +373,21 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
 
     eligible: dict[str, pd.DataFrame] = {}
     for filename, df in file_map.items():
+        # Device-loop guard: isKernelFunction==1 (loop in a __global__ kernel)
+        # OR kernelParents non-empty (loop in a __device__ function with kernel callers).
+        # CPU host loops have both set to 0 / empty.
+        is_kernel   = df["isKernelFunction"].astype(float) == 1.0
+        has_parents = (
+            df["kernelParents"].notna()
+            & (df["kernelParents"].astype(str).str.strip() != "")
+        )
         mask = (
             (df["duplicatable"] == 1.0)
             & (df["containsBarrier"] == 0.0)
             & (df["containsBranch"] == 1.0)
             & df["function"].notna()
             & (df["function"] != "")
+            & (is_kernel | has_parents)
         )
         df_ok = df[mask].reset_index(drop=True)
         if len(df_ok) > 0:
