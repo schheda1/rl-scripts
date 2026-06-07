@@ -110,6 +110,9 @@ def parse_args() -> argparse.Namespace:
                    help="PPO epochs per rollout update")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--value-loss-coef", type=float, default=0.5)
+    p.add_argument("--entropy-coef", type=float, default=0.01,
+                   help="Entropy bonus coefficient (encourages exploration). "
+                        "Increase if no-op rate stays >80%% early in training.")
     p.add_argument("--val-ratio", type=float, default=0.15,
                    help="Fraction of benchmarks held out for validation")
     p.add_argument("--test-ratio", type=float, default=0.15,
@@ -547,7 +550,7 @@ def plot_training_curves(metrics_file: str, output_dir: str) -> None:
         log.warning("Could not generate plots: %s", e)
         return
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
 
     ax = axes[0]
     ax.plot(df["epoch"], df["train_actor_loss"], label="actor_loss")
@@ -556,6 +559,13 @@ def plot_training_curves(metrics_file: str, output_dir: str) -> None:
     ax.set_title("Training Loss"); ax.legend(); ax.grid(True, alpha=0.3)
 
     ax = axes[1]
+    if "train_entropy" in df.columns:
+        ax.plot(df["epoch"], df["train_entropy"], label="entropy", color="purple")
+    ax.set_xlabel("Epoch"); ax.set_ylabel("Entropy")
+    ax.set_title("Policy Entropy (higher = more exploratory)")
+    ax.legend(); ax.grid(True, alpha=0.3)
+
+    ax = axes[2]
     ax.plot(df["epoch"], df["train_avg_reward"], label="train")
     if "val_avg_reward" in df.columns:
         ax.plot(df["epoch"], df["val_avg_reward"], label="val", linestyle="--")
@@ -563,7 +573,7 @@ def plot_training_curves(metrics_file: str, output_dir: str) -> None:
     ax.set_xlabel("Epoch"); ax.set_ylabel("Avg Reward")
     ax.set_title("Average Reward (higher = better)"); ax.legend(); ax.grid(True, alpha=0.3)
 
-    ax = axes[2]
+    ax = axes[3]
     ax.plot(df["epoch"], df["train_avg_advantage"], label="train")
     if "val_avg_advantage" in df.columns:
         ax.plot(df["epoch"], df["val_avg_advantage"], label="val", linestyle="--")
@@ -743,6 +753,7 @@ def _worker_fn(
         batch_size=hparams["batch_size"],
         lr=hparams["lr"],
         value_loss_coef=hparams["value_loss_coef"],
+        entropy_coef=hparams["entropy_coef"],
         device=device,
     )
     _load_weights(agent, initial_weights)
@@ -1056,6 +1067,7 @@ def run_parallel_epoch(
         "batch_size":              args.batch_size,
         "lr":                      args.lr,
         "value_loss_coef":         args.value_loss_coef,
+        "entropy_coef":            args.entropy_coef,
         "normalizer_state":        normalizer.state_dict(),
         "baseline_cache":          baseline_cache,
         "epoch":                   current_epoch,
@@ -1107,6 +1119,7 @@ def run_parallel_epoch(
     train_advantages: list[float] = []
     train_actor_loss  = 0.0
     train_value_loss  = 0.0
+    train_entropy     = 0.0
     train_updates     = 0
     done_count = 0
 
@@ -1141,9 +1154,10 @@ def run_parallel_epoch(
                 train_updates += 1
                 train_actor_loss += stats["actor_loss"]
                 train_value_loss += stats["value_loss"]
+                train_entropy    += stats["entropy"]
                 log.info(
-                    "  PPO update #%d | actor_loss=%.4f | value_loss=%.4f",
-                    train_updates, stats["actor_loss"], stats["value_loss"],
+                    "  PPO update #%d | actor_loss=%.4f | value_loss=%.4f | entropy=%.4f",
+                    train_updates, stats["actor_loss"], stats["value_loss"], stats["entropy"],
                 )
                 # Broadcast updated weights to all workers
                 new_weights = _get_weights(agent)
@@ -1170,9 +1184,10 @@ def run_parallel_epoch(
         train_updates += 1
         train_actor_loss += stats["actor_loss"]
         train_value_loss += stats["value_loss"]
+        train_entropy    += stats["entropy"]
         log.info(
-            "Epoch-end PPO flush | actor_loss=%.4f | value_loss=%.4f",
-            stats["actor_loss"], stats["value_loss"],
+            "Epoch-end PPO flush | actor_loss=%.4f | value_loss=%.4f | entropy=%.4f",
+            stats["actor_loss"], stats["value_loss"], stats["entropy"],
         )
 
     # ------------------------------------------------------------------ #
@@ -1265,6 +1280,7 @@ def run_parallel_epoch(
         "train_advantages":    train_advantages,
         "train_actor_loss":    train_actor_loss / n_upd,
         "train_value_loss":    train_value_loss / n_upd,
+        "train_entropy":       train_entropy / n_upd,
         "train_updates":       train_updates,
         "val_avg_reward":      val_avg_reward,
         "val_avg_advantage":   val_avg_advantage,
@@ -1298,6 +1314,7 @@ def main() -> None:
         batch_size=args.batch_size,
         lr=args.lr,
         value_loss_coef=args.value_loss_coef,
+        entropy_coef=args.entropy_coef,
         device=device,
     )
     if args.resume:
@@ -1444,6 +1461,7 @@ def main() -> None:
                 "train_avg_advantage": round(train_avg_adv, 6),
                 "train_actor_loss":    round(epoch_stats["train_actor_loss"], 6),
                 "train_value_loss":    round(epoch_stats["train_value_loss"], 6),
+                "train_entropy":       round(epoch_stats["train_entropy"], 6),
                 "val_avg_reward":      round(epoch_stats["val_avg_reward"]
                                             if epoch_stats["val_avg_reward"] == epoch_stats["val_avg_reward"]
                                             else float("nan"), 6),
@@ -1468,6 +1486,7 @@ def main() -> None:
             epoch_advantages: list[float] = []
             epoch_actor_loss  = 0.0
             epoch_value_loss  = 0.0
+            epoch_entropy     = 0.0
             epoch_updates     = 0
 
             # Iterate over a snapshot; failed benchmarks are removed after the loop
@@ -1551,9 +1570,10 @@ def main() -> None:
                         epoch_updates += 1
                         epoch_actor_loss += stats["actor_loss"]
                         epoch_value_loss += stats["value_loss"]
+                        epoch_entropy    += stats["entropy"]
                         log.info(
-                            "  PPO update #%d | actor_loss=%.4f | value_loss=%.4f",
-                            total_updates, stats["actor_loss"], stats["value_loss"],
+                            "  PPO update #%d | actor_loss=%.4f | value_loss=%.4f | entropy=%.4f",
+                            total_updates, stats["actor_loss"], stats["value_loss"], stats["entropy"],
                         )
 
                     if done:
@@ -1573,9 +1593,10 @@ def main() -> None:
                 epoch_updates += 1
                 epoch_actor_loss += stats["actor_loss"]
                 epoch_value_loss += stats["value_loss"]
+                epoch_entropy    += stats["entropy"]
                 log.info(
-                    "Epoch-end PPO update #%d | actor_loss=%.4f | value_loss=%.4f",
-                    total_updates, stats["actor_loss"], stats["value_loss"],
+                    "Epoch-end PPO update #%d | actor_loss=%.4f | value_loss=%.4f | entropy=%.4f",
+                    total_updates, stats["actor_loss"], stats["value_loss"], stats["entropy"],
                 )
 
             # --- Validation ---
@@ -1614,6 +1635,7 @@ def main() -> None:
                 "train_avg_advantage": round(train_avg_adv, 6),
                 "train_actor_loss":    round(epoch_actor_loss / n_upd, 6),
                 "train_value_loss":    round(epoch_value_loss / n_upd, 6),
+                "train_entropy":       round(epoch_entropy / n_upd, 6),
                 "val_avg_reward":      round(val_metrics.get("val_avg_reward", float("nan")), 6),
                 "val_avg_advantage":   round(val_metrics.get("val_avg_advantage", float("nan")), 6),
                 "val_samples":         val_metrics.get("val_samples", 0),

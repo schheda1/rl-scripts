@@ -13,6 +13,18 @@ Hyperparameters (all tunable via constructor):
   batch_size       = 8
   lr               = 3e-4
   value_loss_coef  = 0.5   weight on critic MSE loss
+  entropy_coef     = 0.01  weight on entropy bonus (encourages exploration)
+
+Entropy regularization:
+  Both actors have an entropy bonus subtracted from the total loss, weighted by
+  entropy_coef.  This prevents premature policy collapse to a deterministic
+  choice (e.g. always unmerge=0, or always factor=2) before the agent has seen
+  enough loops to know when each action is profitable.  The unmerge actor (binary)
+  is especially prone to early collapse given the small action space.
+  Entropy is computed from the CURRENT policy logits each batch, not the old
+  log-probs used in the clipped ratio — this is the standard PPO formulation.
+  Start with entropy_coef=0.01; increase if the no-op rate stays >80% early in
+  training, decrease if rewards plateau without improvement.
 """
 
 import logging
@@ -189,12 +201,14 @@ class Agent:
         batch_size: int = 8,
         lr: float = 3e-4,
         value_loss_coef: float = 0.5,
+        entropy_coef: float = 0.01,
         device: Optional[torch.device] = None,
     ) -> None:
         self.clip_eps = clip_eps
         self.K = K
         self.batch_size = batch_size
         self.value_loss_coef = value_loss_coef
+        self.entropy_coef = entropy_coef
         self.device = device or torch.device("cpu")
 
         self.unmerge_actor = UnmergeActor().to(self.device)
@@ -239,6 +253,7 @@ class Agent:
         """Run K epochs of clipped mini-batch updates over the rollout buffer."""
         total_actor_loss = 0.0
         total_value_loss = 0.0
+        total_entropy = 0.0
         num_updates = 0
 
         # Pre-compute global advantage statistics for normalisation.
@@ -282,10 +297,23 @@ class Agent:
                 actor_loss = _clipped_pg_loss(new_lp1, old_lp1, adv, self.clip_eps)
                 actor_loss = actor_loss + _clipped_pg_loss(new_lp2, old_lp2, adv, self.clip_eps)
 
+                # Entropy bonus — computed from CURRENT policy logits (not old
+                # log-probs) so it reflects the policy being updated this step.
+                # Subtracted from total loss to maximise entropy (encourage
+                # exploration).  Tracked separately so training logs can show
+                # whether the policy is collapsing prematurely.
+                entropy1 = _policy_entropy(self.unmerge_actor.forward(s1))
+                entropy2 = _policy_entropy(self.factor_actor.forward(s2))
+                entropy = entropy1 + entropy2
+
                 # Critic (value) loss: MSE against actual rewards
                 value_loss = F.mse_loss(values, r)
 
-                loss = actor_loss + self.value_loss_coef * value_loss
+                loss = (
+                    actor_loss
+                    + self.value_loss_coef * value_loss
+                    - self.entropy_coef * entropy
+                )
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -293,12 +321,14 @@ class Agent:
 
                 total_actor_loss += actor_loss.item()
                 total_value_loss += value_loss.item()
+                total_entropy += entropy.item()
                 num_updates += 1
 
         n = max(num_updates, 1)
         return {
             "actor_loss": total_actor_loss / n,
             "value_loss": total_value_loss / n,
+            "entropy": total_entropy / n,
         }
 
     def save(self, path: str) -> None:
@@ -315,6 +345,18 @@ class Agent:
         self.factor_actor.load_state_dict(ckpt["factor_actor"])
         self.critic.load_state_dict(ckpt["critic"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
+
+
+def _policy_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Mean entropy of a categorical distribution over a batch of logits.
+
+    H = -sum(p * log p), averaged over the batch.  Used as the entropy bonus
+    term in the PPO loss.  Computed from the CURRENT policy logits so it
+    reflects the distribution being trained, not the behaviour policy at
+    collection time.
+    """
+    return torch.distributions.Categorical(logits=logits).entropy().mean()
 
 
 def _clipped_pg_loss(
