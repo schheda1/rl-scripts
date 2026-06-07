@@ -223,12 +223,38 @@ class GpuLoopEnv:
         # Unmerge restructures the loop body but does not create new loops.
         # The total loop count and RPO-based index assignment should be stable,
         # so look up the loop by its original loopIdx.  Fall back to
-        # pre-unmerge features if the index is not found in the output.
+        # pre-unmerge features if the loop is not found in the output.
+        #
+        # Host/device disambiguation — DO NOT use the triple.  A CUDA clang++
+        # build runs two cc1 subprocesses (device nvptx + host x86) sharing one
+        # stderr.  LoopCount has no accelerator gate, so BOTH emit rows; seenLoops
+        # is a per-process static that resets to 0 in each cc1, so a host loop and
+        # a device loop can share the SAME loopIdx AND the SAME filename (both
+        # compile the same .cu), differing only by the unreliable triple.  Keying
+        # on (filename, loopIdx) alone could therefore return the host row.
+        #
+        # Apply the same per-row device guard as get_loop_features instead:
+        # isKernelFunction==1 (loop in a __global__/kernel function) OR
+        # kernelParents non-empty (loop in a device function with kernel callers).
+        # Host rows can never satisfy this — the host module has no kernel-calling-
+        # convention function, so isKernelFunction=0 and kernelParents="" there.
+        # This is triple-independent and works for any accelerator target whose
+        # kernels LoopCount attributes (NVPTX today; AMDGPU once isKernelFunction
+        # / kernelParents recognise the AMDGPU_KERNEL calling convention).
+        #
+        # filename still narrows file-vs-file in multi-.cu benchmarks (each device
+        # cc1 restarts the counter); the device guard narrows host-vs-device.
         for _triple, file_map in parsed.items():
-            if "nvptx" not in _triple and "cuda" not in _triple.lower():
-                continue
-            for _fname, df in file_map.items():
-                row = df[df["loopIdx"] == loop_record.loop_idx]
+            for fname, df in file_map.items():
+                if loop_record.filename and fname != loop_record.filename:
+                    continue
+                is_kernel = df["isKernelFunction"].astype(float) == 1.0
+                has_parents = (
+                    df["kernelParents"].notna()
+                    & (df["kernelParents"].astype(str).str.strip() != "")
+                )
+                df_dev = df[is_kernel | has_parents]
+                row = df_dev[df_dev["loopIdx"] == loop_record.loop_idx]
                 if not row.empty:
                     return self._to_features(row.iloc[0])
 
