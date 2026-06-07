@@ -844,29 +844,37 @@ def _worker_fn(
                     kernel_parents=kernel_parents,
                 )
 
-                # Resolve kernel filter and baseline for this loop.
-                # Cases A / B1: single parent → filter nsys to that kernel.
-                # Case B2 / no parents: no filter → total benchmark time.
+                # Resolve kernel filter and baseline for this loop as a COUPLED
+                # pair whose measurement scope is guaranteed symmetric — both
+                # per-kernel, or both total.  Mirrors GpuLoopEnv._resolve_measurement.
                 #
-                # Use explicit `is not None` rather than `or` to avoid the
-                # Python falsy-0.0 trap: a per-kernel time of 0.0 (however
-                # unlikely) would incorrectly fall through to total_ms with `or`,
-                # giving an asymmetric comparison (baseline=total, modified=per-kernel)
-                # that inflates rewards up to ~0.9 on an unchanged binary.
+                # Cases A / B1: single parent → filter nsys to that kernel + use
+                # per-kernel baseline.
+                # Case B2 / no parents / per-kernel cache MISS: no filter → total
+                # benchmark time on BOTH sides.
+                #
+                # Two traps avoided here:
+                #   1. Python falsy-0.0: a per-kernel time of 0.0 must not fall
+                #      through to total — hence `is not None`, not `or`.
+                #   2. Cache-miss asymmetry: if the per-kernel baseline is absent,
+                #      baseline would be total while modified still measured with
+                #      the per-kernel filter → asymmetric (baseline=total,
+                #      modified=per-kernel) comparison that corrupts the reward.
+                #      Fix: on a miss force kernel_filter=None too, so the modified
+                #      measurement also falls back to total.
+                kernel_filter = None
+                baseline_ms = baseline_cache.get(bench_name, {}).get("total_ms", 0.0)
                 if len(kernel_parents) == 1:
-                    kernel_filter = demangled_to_filter(demangle(kernel_parents[0]))
+                    _kf = demangled_to_filter(demangle(kernel_parents[0]))
                     _per_kern = (
                         baseline_cache.get(bench_name, {})
                         .get("per_kernel_ms", {})
-                        .get(kernel_filter)
+                        .get(_kf)
                     )
-                    baseline_ms = (
-                        _per_kern if _per_kern is not None
-                        else baseline_cache.get(bench_name, {}).get("total_ms", 0.0)
-                    )
-                else:
-                    kernel_filter = None
-                    baseline_ms = baseline_cache.get(bench_name, {}).get("total_ms", 0.0)
+                    if _per_kern is not None:
+                        kernel_filter = _kf
+                        baseline_ms = _per_kern
+                    # else: leave (None, total_ms) — both sides total.
 
                 # --- Agent decisions ---
                 unmerge, log_p1 = agent.select_unmerge(pre_features)

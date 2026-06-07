@@ -260,34 +260,37 @@ class GpuLoopEnv:
 
         return loop_record.pre_features
 
-    def _kernel_filter_for(self, loop_record: LoopRecord) -> Optional[str]:
+    def _resolve_measurement(
+        self, loop_record: LoopRecord
+    ) -> tuple[Optional[str], float]:
         """
-        Return an nsys substring filter for this loop, or None (Case B2 / no parents).
+        Return (kernel_filter, baseline_ms) as a COUPLED pair whose measurement
+        scope is guaranteed symmetric — both per-kernel, or both total.
 
-        Cases A and B1: exactly one kernel parent → return "funcname(" extracted
-        from the demangled symbol.  Using only the function name up to the opening
-        paren avoids c++filt vs nsys formatting differences (pointer spacing,
-        East/West const placement, return-type prefix).
+        Cases A / B1 (exactly one kernel parent): use the per-kernel nsys filter
+        ("funcname(" from the demangled symbol — avoids c++filt vs nsys formatting
+        differences) AND the matching per-kernel baseline.
 
-        Case B2: multiple parents → return None (total-benchmark fallback).
+        Case B2 (multiple parents) / no parents / per-kernel cache MISS: fall back
+        to (None, total_benchmark_ms).
+
+        Why coupled: if the filter and baseline were resolved independently, a
+        per-kernel cache miss would give baseline=total while modified still
+        measured per-kernel — an asymmetric (baseline=total / modified=per-kernel)
+        comparison that corrupts the reward.  Resolving them together makes that
+        impossible: a missing per-kernel baseline forces the filter to None too,
+        so the modified measurement also falls back to total.
         """
         from hecbench import demangle as _demangle, demangled_to_filter as _to_filter
         parents = loop_record.kernel_parents or []
         if len(parents) == 1:
-            return _to_filter(_demangle(parents[0]))
-        return None
-
-    def _baseline_for(self, loop_record: LoopRecord) -> float:
-        """
-        Return the appropriate baseline time (ms) for reward normalisation.
-
-        Cases A / B1: per-kernel baseline from _kernel_baselines dict.
-        Case B2 / miss: total benchmark baseline.
-        """
-        kf = self._kernel_filter_for(loop_record)
-        if kf is not None:
-            return self._kernel_baselines.get(kf, self._baseline_time_ms)
-        return self._baseline_time_ms
+            kf = _to_filter(_demangle(parents[0]))
+            per_kernel = self._kernel_baselines.get(kf)
+            if per_kernel is not None:
+                return kf, per_kernel
+            # Per-kernel baseline missing → force BOTH sides to total.
+            return None, self._baseline_time_ms
+        return None, self._baseline_time_ms
 
     def step(
         self,
@@ -316,8 +319,7 @@ class GpuLoopEnv:
                 return None, 0.0, True
             return self._eligible_loops[self._loop_cursor].pre_features, 0.0, False
 
-        kernel_filter  = self._kernel_filter_for(loop_record)
-        baseline_ms    = self._baseline_for(loop_record)
+        kernel_filter, baseline_ms = self._resolve_measurement(loop_record)
 
         try:
             ok = compile_single_loop(
