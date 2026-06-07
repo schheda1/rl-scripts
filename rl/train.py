@@ -90,7 +90,11 @@ log = logging.getLogger("train")
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--buffer-size", type=int, default=32)
+    p.add_argument("--buffer-size", type=int, default=128,
+                   help="Rollout buffer capacity before a PPO update is triggered. "
+                        "Larger buffers reduce overfit risk per update and improve "
+                        "sample diversity — important when benchmarks vary from 1-2 "
+                        "to ~40 eligible loops. (default: 128)")
     p.add_argument("--n-runs", type=int, default=20,
                    help="nsys measurement repetitions per kernel-time estimate")
     p.add_argument("--nsys-timeout", type=int, default=300,
@@ -106,8 +110,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--clip-eps", type=float, default=0.2)
-    p.add_argument("--K", type=int, default=4, dest="K",
-                   help="PPO epochs per rollout update")
+    p.add_argument("--K", type=int, default=2, dest="K",
+                   help="PPO epochs per rollout update. K=2 with buffer=128 gives "
+                        "~32 gradient steps per 128 samples (0.25 updates/sample), "
+                        "reducing overfit risk vs the previous K=4/buffer=32 ratio. "
+                        "Increase if rewards plateau; decrease if loss oscillates.")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--value-loss-coef", type=float, default=0.5)
     p.add_argument("--entropy-coef", type=float, default=0.01,

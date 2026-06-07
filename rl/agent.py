@@ -166,7 +166,7 @@ class RolloutEntry:
 
 
 class RolloutBuffer:
-    def __init__(self, capacity: int = 32) -> None:
+    def __init__(self, capacity: int = 128) -> None:
         self.capacity = capacity
         self._entries: list[RolloutEntry] = []
 
@@ -197,7 +197,7 @@ class Agent:
         self,
         *,
         clip_eps: float = 0.2,
-        K: int = 4,
+        K: int = 2,
         batch_size: int = 8,
         lr: float = 3e-4,
         value_loss_coef: float = 0.5,
