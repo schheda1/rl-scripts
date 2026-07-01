@@ -53,8 +53,14 @@ class LoopRecord:
     loop_idx: int
     filename: str
     triple: str
-    pre_features: torch.Tensor   # shape (N_FEATURES,)
+    pre_features: torch.Tensor   # shape (N_FEATURES,), z-score NORMALISED
     kernel_parents: list = None  # mangled parent kernel names from LoopCount BFS
+    # RAW trip-count values for factor masking.  pre_features is normalised,
+    # so the trip count cannot be recovered from it — the mask must be built
+    # from these.  Trip count is invariant under unmerge, so they are valid
+    # for the factor decision on both branches.
+    trip_count_known: bool = False
+    trip_count: int = 0
 
     def __post_init__(self):
         if self.kernel_parents is None:
@@ -178,6 +184,8 @@ class GpuLoopEnv:
                         triple=triple,
                         pre_features=self._to_features(row),
                         kernel_parents=kernel_parents,
+                        trip_count_known=bool(int(row.get("tripCountKnown", 0))),
+                        trip_count=int(row.get("tripCount", 0)),
                     )
                 )
 

@@ -476,8 +476,11 @@ def evaluate(
             else:
                 step2_features = pre_features
 
-            factor_idx, _ = agent.select_factor(
-                step2_features, loop_idx=loop_record.loop_idx
+            factor_idx, _, _ = agent.select_factor(
+                step2_features,
+                trip_known=loop_record.trip_count_known,
+                trip_count=loop_record.trip_count,
+                loop_idx=loop_record.loop_idx,
             )
 
             try:
@@ -733,7 +736,10 @@ def _worker_fn(
         sys.path.insert(0, str(_here))
 
     import torch
-    from agent import Agent, RolloutEntry, FACTOR_VALUES
+    from agent import (
+        Agent, RolloutEntry, FACTOR_VALUES,
+        _IDX_TRIP_COUNT_KNOWN, _IDX_TRIP_COUNT,
+    )
     from environment import GpuLoopEnv, LoopRecord
     from hecbench import FeatureNormalizer, compile_single_loop, demangle, demangled_to_filter, measure_kernel_time
 
@@ -854,12 +860,20 @@ def _worker_fn(
                 pre_features = worker_normalizer.normalize(raw_features).to(device)
                 kernel_parents = loop_data.get("kernel_parents", [])
 
+                # RAW trip-count values for factor masking — must come from the
+                # un-normalised tensor; pre_features is z-scored and the trip
+                # count cannot be recovered from it.
+                trip_known = raw_features[_IDX_TRIP_COUNT_KNOWN].item() > 0.5
+                trip_count = int(raw_features[_IDX_TRIP_COUNT].item())
+
                 loop_record = LoopRecord(
                     loop_idx=loop_idx,
                     filename=filename,
                     triple=triple,
                     pre_features=pre_features.cpu(),
                     kernel_parents=kernel_parents,
+                    trip_count_known=trip_known,
+                    trip_count=trip_count,
                 )
 
                 # Resolve kernel filter and baseline for this loop as a COUPLED
@@ -907,8 +921,11 @@ def _worker_fn(
                 else:
                     step2_features = pre_features
 
-                factor_idx, log_p2 = agent.select_factor(
-                    step2_features, loop_idx=loop_idx
+                factor_idx, log_p2, mask2 = agent.select_factor(
+                    step2_features,
+                    trip_known=trip_known,
+                    trip_count=trip_count,
+                    loop_idx=loop_idx,
                 )
                 factor = FACTOR_VALUES[factor_idx]
 
@@ -941,7 +958,7 @@ def _worker_fn(
                             result_q, mode, rank, bench_name, loop_idx,
                             unmerge, factor, reward, v, is_timeout,
                             pre_features, step2_features, factor_idx,
-                            log_p1, log_p2,
+                            log_p1, log_p2, mask2,
                         )
                         continue
 
@@ -969,7 +986,7 @@ def _worker_fn(
                     result_q, mode, rank, bench_name, loop_idx,
                     unmerge, factor, reward, v, is_timeout,
                     pre_features, step2_features, factor_idx,
-                    log_p1, log_p2,
+                    log_p1, log_p2, mask2,
                 )
 
     finally:
@@ -992,6 +1009,7 @@ def _send_loop_result(
     factor_idx: int,
     log_p1,
     log_p2,
+    mask2=None,
 ) -> None:
     """Put one loop result onto result_q in the appropriate format."""
     import torch
@@ -1007,6 +1025,7 @@ def _send_loop_result(
                 log_prob1=log_p1.cpu(),
                 log_prob2=log_p2.cpu(),
                 reward=reward,
+                mask2=mask2.cpu() if mask2 is not None else None,
             ),
             "benchmark": bench_name,
             "loop_idx":  loop_idx,
@@ -1530,8 +1549,11 @@ def main() -> None:
                     else:
                         step2_features = pre_features
 
-                    factor_idx, log_p2 = agent.select_factor(
-                        step2_features, loop_idx=loop_record.loop_idx
+                    factor_idx, log_p2, mask2 = agent.select_factor(
+                        step2_features,
+                        trip_known=loop_record.trip_count_known,
+                        trip_count=loop_record.trip_count,
+                        loop_idx=loop_record.loop_idx,
                     )
 
                     try:
@@ -1568,6 +1590,7 @@ def main() -> None:
                         log_prob1=log_p1.cpu(),
                         log_prob2=log_p2.cpu(),
                         reward=reward,
+                        mask2=mask2.cpu(),
                     ))
 
                     if buffer.full():

@@ -43,24 +43,34 @@ FACTOR_VALUES: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 32]
 N_FEATURES: int = 18   # must match environment.py FEATURE_COLUMNS length
 N_FACTORS: int = len(FACTOR_VALUES)
 
-# Indices of tripCountKnown and tripCount within the feature vector.
+# Indices of tripCountKnown and tripCount within the RAW feature vector.
 # Must stay in sync with FEATURE_COLUMNS in hecbench.py.
+# NOTE: these indices are only meaningful on UN-normalised tensors.  The
+# tensors fed to the networks are z-scored by FeatureNormalizer, so the mask
+# must never be derived from them — build_factor_mask takes raw scalars instead.
 _IDX_TRIP_COUNT_KNOWN: int = 10
 _IDX_TRIP_COUNT: int = 11
 
 
-def build_factor_mask(features: torch.Tensor) -> torch.Tensor:
+def build_factor_mask(trip_known: bool, trip_count: int) -> torch.Tensor:
     """
     Return a bool mask of shape (N_FACTORS,) over FACTOR_VALUES.
 
     mask[i] = True  if FACTOR_VALUES[i] is a valid choice for this loop.
     mask[i] = False if FACTOR_VALUES[i] exceeds the loop's known trip count.
 
-    When the trip count is unknown (tripCountKnown=0) all factors are valid.
+    Takes RAW (un-normalised) trip-count scalars.  Deriving these from the
+    z-scored feature tensor is incorrect: a normalised tripCount of e.g. -0.27
+    truncates to 0 and the mask silently never applies, while LLVM still caps
+    the factor — mislabelling the recorded action against the observed reward.
+
+    Trip count is invariant under unmerge (path specialisation does not change
+    the iteration count), so the pre-unmerge raw values are valid for the
+    factor decision on both the unmerge=0 and unmerge=1 branches.
+
+    When the trip count is unknown all factors are valid.
     factor=1 (no-op unroll) is always valid regardless of trip count.
     """
-    trip_known = features[_IDX_TRIP_COUNT_KNOWN].item() > 0.5
-    trip_count = int(features[_IDX_TRIP_COUNT].item())
     if trip_known and trip_count > 0:
         return torch.tensor(
             [f == 1 or f <= trip_count for f in FACTOR_VALUES], dtype=torch.bool
@@ -115,8 +125,22 @@ class FactorActor(_MLP):
     def __init__(self) -> None:
         super().__init__(N_FEATURES, N_FACTORS)
 
-    def log_prob(self, features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def log_prob(
+        self,
+        features: torch.Tensor,
+        actions: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Log prob of *actions* under the current policy, optionally under the
+        same action mask used at collection time.  The mask MUST match the one
+        applied when the action was sampled — otherwise the PPO ratio compares
+        a masked old-policy log-prob against an unmasked new-policy log-prob,
+        biasing the update for every loop with a known trip count.
+        """
         logits = self.forward(features)
+        if mask is not None:
+            logits = logits.masked_fill(~mask.to(logits.device), float("-inf"))
         return F.log_softmax(logits, dim=-1).gather(1, actions.unsqueeze(1)).squeeze(1)
 
     def sample(
@@ -163,6 +187,8 @@ class RolloutEntry:
     log_prob1: torch.Tensor   # log prob under policy at collection time
     log_prob2: torch.Tensor
     reward: float
+    mask2: Optional[torch.Tensor] = None  # factor mask at collection time
+                                          # (bool, (N_FACTORS,)); None = all valid
 
 
 class RolloutBuffer:
@@ -233,13 +259,22 @@ class Agent:
     def select_factor(
         self,
         features: torch.Tensor,
+        trip_known: bool = False,
+        trip_count: int = 0,
         loop_idx: Optional[int] = None,
-    ) -> tuple[int, torch.Tensor]:
-        """Sample factor action with trip-count masking. Returns (factor_idx, log_prob)."""
-        mask = build_factor_mask(features)
+    ) -> tuple[int, torch.Tensor, torch.Tensor]:
+        """
+        Sample factor action with trip-count masking.
+        Returns (factor_idx, log_prob, mask).
+
+        *trip_known* / *trip_count* must be the RAW (un-normalised) values —
+        *features* is the z-scored tensor fed to the network and cannot be
+        used to recover the trip count.  The returned mask must be stored in
+        the RolloutEntry so ppo_update reapplies it when recomputing log-probs.
+        """
+        mask = build_factor_mask(trip_known, trip_count)
         if not mask.all():
             masked_out = [FACTOR_VALUES[i] for i, v in enumerate(mask) if not v]
-            trip_count = int(features[_IDX_TRIP_COUNT].item())
             _agent_log.info(
                 "  trip-count mask applied | loop_idx=%s tripCount=%d "
                 "masked_factors=%s",
@@ -247,7 +282,10 @@ class Agent:
                 trip_count,
                 masked_out,
             )
-        return self.factor_actor.sample(features.to(self.device), mask=mask.to(self.device))
+        factor_idx, log_p = self.factor_actor.sample(
+            features.to(self.device), mask=mask.to(self.device)
+        )
+        return factor_idx, log_p, mask
 
     def ppo_update(self, buffer: RolloutBuffer) -> dict[str, float]:
         """Run K epochs of clipped mini-batch updates over the rollout buffer."""
@@ -284,6 +322,12 @@ class Agent:
                 old_lp1 = torch.stack([e.log_prob1 for e in batch]).to(self.device)
                 old_lp2 = torch.stack([e.log_prob2 for e in batch]).to(self.device)
                 r = torch.tensor([e.reward for e in batch], dtype=torch.float32, device=self.device)
+                # Collection-time factor masks (all-valid for entries without one)
+                m2 = torch.stack([
+                    e.mask2 if e.mask2 is not None
+                    else torch.ones(N_FACTORS, dtype=torch.bool)
+                    for e in batch
+                ]).to(self.device)
 
                 # Critic forward (not detached — value loss trains the critic)
                 values = self.critic.value(s1)
@@ -291,9 +335,11 @@ class Agent:
                 # Advantage: use critic baseline, normalised by buffer-level stats
                 adv = ((r - values.detach()) - adv_mean) / adv_std
 
-                # Clipped actor losses
+                # Clipped actor losses.  The factor actor's new log-probs are
+                # computed under the SAME mask used at collection time so the
+                # PPO ratio compares like-for-like distributions.
                 new_lp1 = self.unmerge_actor.log_prob(s1, a1)
-                new_lp2 = self.factor_actor.log_prob(s2, a2)
+                new_lp2 = self.factor_actor.log_prob(s2, a2, mask=m2)
                 actor_loss = _clipped_pg_loss(new_lp1, old_lp1, adv, self.clip_eps)
                 actor_loss = actor_loss + _clipped_pg_loss(new_lp2, old_lp2, adv, self.clip_eps)
 
@@ -302,8 +348,14 @@ class Agent:
                 # Subtracted from total loss to maximise entropy (encourage
                 # exploration).  Tracked separately so training logs can show
                 # whether the policy is collapsing prematurely.
+                # Factor entropy respects the collection-time mask: invalid
+                # factors carry zero probability, so pushing entropy toward
+                # them would be pushing probability mass onto unreachable actions.
+                factor_logits = self.factor_actor.forward(s2).masked_fill(
+                    ~m2, float("-inf")
+                )
                 entropy1 = _policy_entropy(self.unmerge_actor.forward(s1))
-                entropy2 = _policy_entropy(self.factor_actor.forward(s2))
+                entropy2 = _policy_entropy(factor_logits)
                 entropy = entropy1 + entropy2
 
                 # Critic (value) loss: MSE against actual rewards
