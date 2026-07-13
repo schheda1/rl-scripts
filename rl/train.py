@@ -331,23 +331,40 @@ def measure_baselines(
                 if p:
                     unique_parents.add(p)
 
-        # Run nsys once, parse the full kernel-time dict
+        # Run nsys once, parse the full kernel-time dict.
+        # A per-run TimeoutExpired must not propagate: one slow benchmark
+        # would otherwise abort the entire baseline pass (and the job) —
+        # skip the run, and skip the benchmark if no run succeeds.  Workers
+        # already skip benchmarks that have no baseline cache entry.
+        _subprocess = __import__("subprocess")
         run_cmd = _get_run_command(b, arch)
         report_path = _tempfile.mktemp(prefix="nsys_bl_", dir=str(tmp_dir))
         run_times_raw: list[dict] = []
+        timed_out = 0
         for _ in range(n_runs):
-            __import__("subprocess").run(
-                f"nsys profile --output={report_path} --force-overwrite=true {run_cmd}",
-                cwd=b, shell=True, capture_output=True, text=True,
-                timeout=nsys_timeout, env=env_base,
-            )
-            stats = __import__("subprocess").run(
-                f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
-                shell=True, capture_output=True, text=True, timeout=30, env=env_base,
-            )
+            try:
+                _subprocess.run(
+                    f"nsys profile --output={report_path} --force-overwrite=true {run_cmd}",
+                    cwd=b, shell=True, capture_output=True, text=True,
+                    timeout=nsys_timeout, env=env_base,
+                )
+                stats = _subprocess.run(
+                    f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
+                    shell=True, capture_output=True, text=True, timeout=30, env=env_base,
+                )
+            except _subprocess.TimeoutExpired:
+                timed_out += 1
+                continue
             kt = _parse_nsys_kernel_times(stats.stdout + stats.stderr)
             if kt:
                 run_times_raw.append(kt)
+
+        if timed_out:
+            log.warning(
+                "  WARN  %-35s  %d/%d baseline nsys runs timed out (>%ds) — "
+                "raise --nsys-timeout to include this benchmark reliably",
+                b.name, timed_out, n_runs, nsys_timeout,
+            )
 
         if not run_times_raw:
             log.warning("  SKIP  %-35s  nsys produced no output", b.name)

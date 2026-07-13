@@ -621,26 +621,36 @@ def measure_kernel_time(
 
     times: list[float] = []
     for _ in range(n_runs):
-        # Step 1: profile
-        subprocess.run(
-            f"nsys profile --output={report_path} --force-overwrite=true {run_cmd}",
-            cwd=benchmark_dir,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=nsys_timeout,
-            env=env,
-        )
+        # A per-run TimeoutExpired is treated as a failed run rather than
+        # propagated: call sites guard this function with `except RuntimeError`
+        # (worker: modified_ms = baseline_ms fallback), so an uncaught
+        # TimeoutExpired here would kill the whole worker process and silently
+        # drop every remaining loop assigned to it.  If all runs time out,
+        # the empty `times` list raises RuntimeError below — the contract the
+        # callers already handle.
+        try:
+            # Step 1: profile
+            subprocess.run(
+                f"nsys profile --output={report_path} --force-overwrite=true {run_cmd}",
+                cwd=benchmark_dir,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=nsys_timeout,
+                env=env,
+            )
 
-        # Step 2: extract kernel stats as CSV
-        stats_result = subprocess.run(
-            f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=env,
-        )
+            # Step 2: extract kernel stats as CSV
+            stats_result = subprocess.run(
+                f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         combined = stats_result.stdout + stats_result.stderr
         kernel_times = _parse_nsys_kernel_times(combined)
         t = _sum_kernel_times(kernel_times, kernel_filter)
