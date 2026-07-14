@@ -38,8 +38,11 @@ _agent_log = logging.getLogger("agent")
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Action space for the factor decision
-FACTOR_VALUES: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 32]
+# Action space for the factor decision.
+# Factors 16/32 removed: measured 57-59% compile-failure rate and most compile
+# timeouts in the first full run, for negligible policy value.  Reinstating
+# them changes the FactorActor output dim — old checkpoints become incompatible.
+FACTOR_VALUES: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 N_FEATURES: int = 18   # must match environment.py FEATURE_COLUMNS length
 N_FACTORS: int = len(FACTOR_VALUES)
 

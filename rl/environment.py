@@ -366,8 +366,14 @@ class GpuLoopEnv:
             except RuntimeError:
                 modified_time_ms = baseline_ms
 
-        reward = (baseline_ms - modified_time_ms) / max(
-            baseline_ms, 1e-9
+        # Clip at -1.0 (the timeout-penalty scale).  A pathological slowdown
+        # (observed: -52 on wlcpow) would otherwise dominate the normalised
+        # advantages of its entire PPO buffer.  The upside is already bounded
+        # at 1.0 by construction.  Signal stays monotone: worse is still worse,
+        # just capped in magnitude.
+        reward = max(
+            (baseline_ms - modified_time_ms) / max(baseline_ms, 1e-9),
+            -1.0,
         )
 
         self._loop_cursor += 1

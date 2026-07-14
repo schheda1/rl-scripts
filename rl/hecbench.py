@@ -629,9 +629,12 @@ def measure_kernel_time(
         # the empty `times` list raises RuntimeError below — the contract the
         # callers already handle.
         try:
-            # Step 1: profile
+            # Step 1: profile.  Minimal tracing — we only ever read the
+            # cuda_gpu_kern_sum report, so CPU sampling / context-switch
+            # tracing is pure overhead.
             subprocess.run(
-                f"nsys profile --output={report_path} --force-overwrite=true {run_cmd}",
+                f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
+                f"--output={report_path} --force-overwrite=true {run_cmd}",
                 cwd=benchmark_dir,
                 shell=True,
                 capture_output=True,

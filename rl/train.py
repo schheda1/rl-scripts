@@ -23,6 +23,7 @@ Dynamic benchmark removal:
 import argparse
 import csv
 import getpass
+import hashlib
 import heapq
 import json
 import logging
@@ -152,6 +153,41 @@ def parse_args() -> argparse.Namespace:
 # Pre-flight eligibility check
 # ---------------------------------------------------------------------------
 
+def _dedup_loop_records(
+    loop_records_map: dict[str, list[dict]],
+) -> tuple[dict[str, list[dict]], int]:
+    """
+    Drop within-benchmark loops whose raw feature vector duplicates an earlier
+    loop's — overwhelmingly sibling template instantiations of the same source
+    loop (observed: sortKV-cuda with 182 eligible loops, mostly identical
+    features, consuming 67% of epoch-1 wall clock).  Feature-identical loops
+    are the same sample to the policy; keeping one representative per unique
+    vector loses nothing statistically and removes contradictory duplicate
+    signals within a benchmark.
+
+    Deliberately does NOT dedup across benchmarks: identical features from
+    different applications may carry genuinely different rewards (known
+    feature-aliasing limitation) and are kept as real environment signal.
+
+    Returns (deduped_map, n_dropped).  Keeps the first (lowest loop_idx)
+    representative.
+    """
+    deduped: dict[str, list[dict]] = {}
+    dropped = 0
+    for bname, records in loop_records_map.items():
+        seen: set[tuple] = set()
+        keep: list[dict] = []
+        for rec in records:
+            key = tuple(rec.get("pre_features_raw", []))
+            if key in seen:
+                dropped += 1
+                continue
+            seen.add(key)
+            keep.append(rec)
+        deduped[bname] = keep
+    return deduped, dropped
+
+
 def precheck_benchmarks(
     benchmarks: list[Path],
     cache_file: Path,
@@ -188,6 +224,14 @@ def precheck_benchmarks(
                 len(result), cache_file,
                 " [normalizer loaded]" if normalizer._fitted else " [no normalizer in cache — will be identity]",
             )
+            # Dedup applies at load time too, so pre-dedup caches keep working.
+            loop_records_map, dropped = _dedup_loop_records(loop_records_map)
+            loop_counts = {k: len(v) for k, v in loop_records_map.items()}
+            if dropped:
+                log.info(
+                    "Feature dedup: dropped %d duplicate loops, %d remain",
+                    dropped, sum(loop_counts.values()),
+                )
             return result, loop_counts, loop_records_map, normalizer
         except Exception as e:
             log.warning("Could not read precheck cache (%s): %s — running check", cache_file, e)
@@ -249,7 +293,22 @@ def precheck_benchmarks(
         for name, reason in excluded:
             log.info("  %-35s  %s", name, reason)
 
-    # Fit normalizer on all collected loop feature vectors
+    # Dedup BEFORE fitting the normalizer so a benchmark with 180 identical
+    # template-instantiation loops doesn't skew the feature statistics.
+    loop_records_map, dropped = _dedup_loop_records(loop_records_map)
+    loop_counts = {k: len(v) for k, v in loop_records_map.items()}
+    if dropped:
+        log.info(
+            "Feature dedup: dropped %d duplicate loops, %d remain",
+            dropped, sum(loop_counts.values()),
+        )
+    all_feature_tensors = [
+        torch.tensor(rec["pre_features_raw"], dtype=torch.float32)
+        for records in loop_records_map.values()
+        for rec in records
+    ]
+
+    # Fit normalizer on the deduped loop feature vectors
     normalizer = FeatureNormalizer()
     normalizer.fit(all_feature_tensors)
     log.info(
@@ -290,6 +349,7 @@ def measure_baselines(
     nsys_timeout: int,
     tmp_dir: Path,
     gpu_id: int = 0,
+    cache_file: "Path | None" = None,
 ) -> dict[str, dict]:
     """
     Compile and measure baseline kernel times for each benchmark once.
@@ -309,11 +369,36 @@ def measure_baselines(
 
     A benchmark is skipped if compilation or nsys measurement fails; workers
     fall back to on-demand measurement via GpuLoopEnv.reset() on a cache miss.
+
+    If *cache_file* is given, previously measured baselines are loaded from it
+    (skipping re-measurement — ~3h for the full HeCBench set) and the merged
+    result is saved back.  The file is arch-tagged; a mismatched arch ignores
+    the cache.  Baseline stability across restarts also keeps the cross-epoch
+    reward cache consistent: cached rewards were computed against these
+    exact baseline values.
     """
     from hecbench import compile_baseline, demangle, demangled_to_filter, measure_kernel_time, _parse_nsys_kernel_times, _sum_kernel_times, _get_run_command
     import tempfile as _tempfile
 
     cache: dict[str, dict] = {}
+    if cache_file is not None and Path(cache_file).exists():
+        try:
+            saved = json.loads(Path(cache_file).read_text())
+            if saved.get("arch") == arch:
+                cache.update(saved.get("baselines", {}))
+                log.info(
+                    "Loaded %d baselines from cache (%s) — measuring only the rest",
+                    len(cache), cache_file,
+                )
+            else:
+                log.warning(
+                    "Baseline cache arch mismatch (%s != %s) — re-measuring all",
+                    saved.get("arch"), arch,
+                )
+        except Exception as e:
+            log.warning("Could not read baseline cache (%s): %s", cache_file, e)
+
+    benchmarks = [b for b in benchmarks if b.name not in cache]
     log.info("Measuring baselines for %d benchmarks (once per run)...", len(benchmarks))
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -344,7 +429,8 @@ def measure_baselines(
         for _ in range(n_runs):
             try:
                 _subprocess.run(
-                    f"nsys profile --output={report_path} --force-overwrite=true {run_cmd}",
+                    f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
+                    f"--output={report_path} --force-overwrite=true {run_cmd}",
                     cwd=b, shell=True, capture_output=True, text=True,
                     timeout=nsys_timeout, env=env_base,
                 )
@@ -407,7 +493,18 @@ def measure_baselines(
             b.name, total_ms, len(per_kernel_ms),
         )
 
-    log.info("Baseline cache: %d / %d benchmarks measured", len(cache), len(benchmarks))
+    log.info("Baseline cache: %d benchmarks total (%d newly measured)",
+             len(cache), len(benchmarks))
+
+    if cache_file is not None:
+        try:
+            Path(cache_file).write_text(json.dumps(
+                {"arch": arch, "n_runs": n_runs, "baselines": cache}, indent=2,
+            ))
+            log.info("Baseline cache saved: %s", cache_file)
+        except Exception as e:
+            log.warning("Could not save baseline cache: %s", e)
+
     return cache
 
 
@@ -792,6 +889,11 @@ def _worker_fn(
         hparams.get("normalizer_state", {})
     )
     baseline_cache: dict = hparams.get("baseline_cache", {})
+    # Cross-epoch caches (read-only snapshots; main merges new results and
+    # persists them).  The environment is deterministic — same (loop, action)
+    # → same binary → same reward — so a hit replaces compile + measure.
+    reward_cache: dict = hparams.get("reward_cache", {})
+    postf_cache: dict = hparams.get("postf_cache", {})
 
     # Per-worker directories
     tmp_dir = _Path(hparams["tmp_dir"]) / f"worker_{rank}"
@@ -929,12 +1031,20 @@ def _worker_fn(
                 unmerge, log_p1 = agent.select_unmerge(pre_features)
 
                 if unmerge == 1:
-                    try:
-                        step2_features = env.get_post_unmerge_features(
-                            loop_record
+                    # Post-unmerge features are deterministic per loop —
+                    # cache hits skip the 2-compile feature extraction.
+                    _pf = postf_cache.get(f"{bench_name}|{loop_idx}")
+                    if _pf is not None:
+                        step2_features = torch.tensor(
+                            _pf, dtype=torch.float32
                         ).to(device)
-                    except Exception:
-                        step2_features = pre_features
+                    else:
+                        try:
+                            step2_features = env.get_post_unmerge_features(
+                                loop_record
+                            ).to(device)
+                        except Exception:
+                            step2_features = pre_features
                 else:
                     step2_features = pre_features
 
@@ -948,10 +1058,21 @@ def _worker_fn(
 
                 # --- Compile + measure ---
                 is_timeout = False
+                from_cache = False
+                _rc_key = f"{bench_name}|{loop_idx}|{unmerge}|{factor}"
+                _rc_hit = reward_cache.get(_rc_key)
                 if unmerge == 0 and factor == 1:
                     # No-op: reward is exactly 0 by definition; skip
                     # compilation and measurement entirely.
                     reward = 0.0
+                elif _rc_hit is not None:
+                    # Cross-epoch cache hit: the action is still sampled fresh
+                    # from the current policy (on-policy log-probs above);
+                    # only the deterministic compile+measure is memoized.
+                    # Cached failures (0.0) and timeout penalties (-1.0) are
+                    # also hits — known-bad compiles are never re-paid.
+                    reward = float(_rc_hit)
+                    from_cache = True
                 else:
                     try:
                         ok = compile_single_loop(
@@ -996,14 +1117,24 @@ def _worker_fn(
                         except RuntimeError:
                             modified_ms = baseline_ms
 
-                    reward = (baseline_ms - modified_ms) / max(baseline_ms, 1e-9)
+                    # Clip at -1.0 (the timeout-penalty scale): a pathological
+                    # slowdown (observed: -52 on wlcpow) would otherwise
+                    # dominate the normalised advantages of its whole PPO
+                    # buffer.  Upside is bounded at 1.0 by construction.
+                    reward_raw = (baseline_ms - modified_ms) / max(baseline_ms, 1e-9)
+                    reward = max(reward_raw, -1.0)
+                    if reward_raw < -1.0:
+                        _log.warning(
+                            "%s loop_idx=%d reward %.2f clipped to -1.0",
+                            bench_name, loop_idx, reward_raw,
+                        )
 
                 v = agent.predict_value(pre_features)
                 _send_loop_result(
                     result_q, mode, rank, bench_name, loop_idx,
                     unmerge, factor, reward, v, is_timeout,
                     pre_features, step2_features, factor_idx,
-                    log_p1, log_p2, mask2,
+                    log_p1, log_p2, mask2, cached=from_cache,
                 )
 
     finally:
@@ -1027,6 +1158,7 @@ def _send_loop_result(
     log_p1,
     log_p2,
     mask2=None,
+    cached: bool = False,
 ) -> None:
     """Put one loop result onto result_q in the appropriate format."""
     import torch
@@ -1051,6 +1183,7 @@ def _send_loop_result(
             "reward":    reward,
             "value":     value,
             "timeout":   is_timeout,
+            "cached":    cached,
             "rank":      rank,
         })
     else:
@@ -1058,9 +1191,12 @@ def _send_loop_result(
             "type":      "eval_result",
             "benchmark": bench_name,
             "loop_idx":  loop_idx,
+            "unmerge":   unmerge,
+            "factor":    factor,
             "reward":    reward,
             "value":     value,
             "timeout":   is_timeout,
+            "cached":    cached,
             "rank":      rank,
         })
 
@@ -1081,6 +1217,8 @@ def run_parallel_epoch(
     args,
     current_epoch: int = 0,
     total_epochs: int = 0,
+    reward_cache: "dict | None" = None,
+    postf_cache: "dict | None" = None,
 ) -> tuple[dict, list[Path], list[Path]]:
     """
     Run one complete training + validation epoch across *n_workers* GPU workers.
@@ -1099,6 +1237,9 @@ def run_parallel_epoch(
     compatibility with the sequential path; loop-level failures are handled
     inline in the worker and do not propagate back to main.
     """
+    reward_cache = reward_cache if reward_cache is not None else {}
+    postf_cache  = postf_cache  if postf_cache  is not None else {}
+
     hparams = {
         "arch":                    args.arch,
         "n_runs":                  args.n_runs,
@@ -1113,6 +1254,10 @@ def run_parallel_epoch(
         "entropy_coef":            args.entropy_coef,
         "normalizer_state":        normalizer.state_dict(),
         "baseline_cache":          baseline_cache,
+        # Read-only snapshots for the workers; main merges new results into
+        # the live dicts as messages arrive and persists them per epoch.
+        "reward_cache":            dict(reward_cache),
+        "postf_cache":             dict(postf_cache),
         "epoch":                   current_epoch,
         "total_epochs":            total_epochs,
     }
@@ -1164,6 +1309,9 @@ def run_parallel_epoch(
     train_value_loss  = 0.0
     train_entropy     = 0.0
     train_updates     = 0
+    train_cache_hits  = 0
+    train_noops       = 0
+    train_unmerges    = 0
     done_count = 0
 
     while done_count < n_workers:
@@ -1183,13 +1331,36 @@ def run_parallel_epoch(
             train_samples += 1
             train_rewards.append(msg["reward"])
             train_advantages.append(msg["reward"] - msg["value"])
+
+            # Harvest into cross-epoch caches (skip no-ops — always free).
+            _is_noop = msg["unmerge"] == 0 and msg["factor"] == 1
+            if _is_noop:
+                train_noops += 1
+            else:
+                reward_cache[
+                    f"{msg['benchmark']}|{msg['loop_idx']}|{msg['unmerge']}|{msg['factor']}"
+                ] = msg["reward"]
+            if msg["unmerge"] == 1:
+                train_unmerges += 1
+                _pf_key = f"{msg['benchmark']}|{msg['loop_idx']}"
+                # Don't cache the pre-features fallback (extraction failure
+                # sets state2 = state1); a genuine post-unmerge vector that
+                # happens to equal state1 just gets re-extracted — harmless.
+                if _pf_key not in postf_cache and not torch.equal(
+                    msg["entry"].state2, msg["entry"].state1
+                ):
+                    postf_cache[_pf_key] = msg["entry"].state2.tolist()
+            if msg.get("cached"):
+                train_cache_hits += 1
+
             timeout_flag = " [compile timeout — penalty]" if msg.get("timeout") else ""
+            cached_flag  = " [cached]" if msg.get("cached") else ""
             log.info(
                 "  [W%d] %s loop_idx=%d unmerge=%d factor=%d "
-                "reward=%.4f V(s)=%.4f%s",
+                "reward=%.4f V(s)=%.4f%s%s",
                 msg["rank"], msg["benchmark"], msg["loop_idx"],
                 msg["unmerge"], msg["factor"],
-                msg["reward"], msg["value"], timeout_flag,
+                msg["reward"], msg["value"], timeout_flag, cached_flag,
             )
             if buffer.full():
                 stats = agent.ppo_update(buffer)
@@ -1242,9 +1413,14 @@ def run_parallel_epoch(
     val_missed        = 0
     val_per_benchmark: list[dict] = []
 
+    val_cache_hits = 0
     if val_loop_assignments:
         val_per_worker = assign_loops_to_workers(val_loop_assignments, n_workers)
         val_weights = _get_weights(agent)
+        # Refresh the cache snapshots so the val pass benefits from rewards
+        # measured during this epoch's training pass.
+        hparams["reward_cache"] = dict(reward_cache)
+        hparams["postf_cache"]  = dict(postf_cache)
         val_result_q: mp.Queue = mp.Queue()
         val_weight_qs: list[mp.Queue] = [mp.Queue() for _ in range(n_workers)]
 
@@ -1288,11 +1464,19 @@ def run_parallel_epoch(
                 all_val_advantages.append(msg["reward"] - msg["value"])
                 per_bench_data.setdefault(msg["benchmark"], []).append(msg["reward"])
                 val_samples += 1
+                # Val measurements are just as deterministic — harvest them too.
+                if not (msg.get("unmerge") == 0 and msg.get("factor") == 1):
+                    reward_cache[
+                        f"{msg['benchmark']}|{msg['loop_idx']}|{msg['unmerge']}|{msg['factor']}"
+                    ] = msg["reward"]
+                if msg.get("cached"):
+                    val_cache_hits += 1
                 timeout_flag = " [compile timeout — penalty]" if msg.get("timeout") else ""
+                cached_flag  = " [cached]" if msg.get("cached") else ""
                 log.info(
-                    "  [val W%d] %s loop_idx=%d reward=%.4f V(s)=%.4f%s",
+                    "  [val W%d] %s loop_idx=%d reward=%.4f V(s)=%.4f%s%s",
                     msg["rank"], msg["benchmark"], msg["loop_idx"],
-                    msg["reward"], msg["value"], timeout_flag,
+                    msg["reward"], msg["value"], timeout_flag, cached_flag,
                 )
 
             elif mtype == "step_failed":
@@ -1315,7 +1499,28 @@ def run_parallel_epoch(
                 "avg_reward": sum(rs) / len(rs),
             })
 
+    # Persist the cross-epoch caches.  Tagged with a normalizer fingerprint:
+    # postf_cache stores NORMALISED feature vectors, so a refitted normalizer
+    # (e.g. precheck re-run with different eligible loops) invalidates them.
+    try:
+        _sig = hashlib.md5(
+            json.dumps(normalizer.state_dict(), sort_keys=True).encode()
+        ).hexdigest()[:12]
+        cache_path = Path(args.checkpoint_dir) / "reward_cache.json"
+        cache_path.write_text(json.dumps({
+            "normalizer_sig": _sig,
+            "rewards":        reward_cache,
+            "post_features":  postf_cache,
+        }))
+        log.info(
+            "Caches saved: %d rewards, %d post-unmerge feature vectors (%s)",
+            len(reward_cache), len(postf_cache), cache_path,
+        )
+    except Exception as e:
+        log.warning("Could not save reward cache: %s", e)
+
     n_upd = max(train_updates, 1)
+    _n_s = max(train_samples, 1)
     epoch_stats = {
         "train_samples":       train_samples,
         "train_missed":        train_missed,
@@ -1325,10 +1530,14 @@ def run_parallel_epoch(
         "train_value_loss":    train_value_loss / n_upd,
         "train_entropy":       train_entropy / n_upd,
         "train_updates":       train_updates,
+        "train_noop_rate":     train_noops / _n_s,
+        "train_unmerge_rate":  train_unmerges / _n_s,
+        "train_cache_hit_rate": train_cache_hits / _n_s,
         "val_avg_reward":      val_avg_reward,
         "val_avg_advantage":   val_avg_advantage,
         "val_samples":         val_samples,
         "val_missed":          val_missed,
+        "val_cache_hit_rate":  val_cache_hits / max(val_samples, 1),
         "val_per_benchmark":   val_per_benchmark,
     }
     return epoch_stats, [], []
@@ -1420,7 +1629,39 @@ def main() -> None:
         nsys_timeout=args.nsys_timeout,
         tmp_dir=tmp_dir,
         gpu_id=0,
+        cache_file=ckpt_dir / "baseline_cache.json",
     )
+
+    # --- Cross-epoch reward / post-unmerge-feature caches ---
+    # Deterministic environment: same (loop, action) → same reward.  Persisted
+    # per epoch by run_parallel_epoch; a restarted run never re-pays compiles
+    # or measurements it has already done.  postf_cache stores NORMALISED
+    # vectors, so it is only valid under the same fitted normalizer — checked
+    # via fingerprint.
+    reward_cache: dict[str, float] = {}
+    postf_cache: dict[str, list] = {}
+    _rc_file = ckpt_dir / "reward_cache.json"
+    if _rc_file.exists():
+        try:
+            _rc_data = json.loads(_rc_file.read_text())
+            _sig = hashlib.md5(
+                json.dumps(normalizer.state_dict(), sort_keys=True).encode()
+            ).hexdigest()[:12]
+            reward_cache = _rc_data.get("rewards", {})
+            if _rc_data.get("normalizer_sig") == _sig:
+                postf_cache = _rc_data.get("post_features", {})
+                log.info(
+                    "Loaded caches: %d rewards, %d post-unmerge feature vectors",
+                    len(reward_cache), len(postf_cache),
+                )
+            else:
+                log.warning(
+                    "Normalizer changed since cache was written — keeping %d "
+                    "rewards, discarding post-unmerge features",
+                    len(reward_cache),
+                )
+        except Exception as e:
+            log.warning("Could not read reward cache (%s): %s", _rc_file, e)
 
     # Build sequential-path env (also used for test eval at the end)
     env = GpuLoopEnv(
@@ -1472,6 +1713,8 @@ def main() -> None:
                 args=args,
                 current_epoch=epoch,
                 total_epochs=args.epochs,
+                reward_cache=reward_cache,
+                postf_cache=postf_cache,
             )
 
             total_updates += epoch_stats["train_updates"]
@@ -1505,6 +1748,9 @@ def main() -> None:
                 "train_actor_loss":    round(epoch_stats["train_actor_loss"], 6),
                 "train_value_loss":    round(epoch_stats["train_value_loss"], 6),
                 "train_entropy":       round(epoch_stats["train_entropy"], 6),
+                "train_noop_rate":     round(epoch_stats["train_noop_rate"], 6),
+                "train_unmerge_rate":  round(epoch_stats["train_unmerge_rate"], 6),
+                "train_cache_hit_rate": round(epoch_stats["train_cache_hit_rate"], 6),
                 "val_avg_reward":      round(epoch_stats["val_avg_reward"]
                                             if epoch_stats["val_avg_reward"] == epoch_stats["val_avg_reward"]
                                             else float("nan"), 6),
@@ -1513,6 +1759,7 @@ def main() -> None:
                                             else float("nan"), 6),
                 "val_samples":         epoch_stats["val_samples"],
                 "val_missed":          epoch_stats["val_missed"],
+                "val_cache_hit_rate":  round(epoch_stats["val_cache_hit_rate"], 6),
             })
 
         # ==============================================================
