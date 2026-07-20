@@ -121,6 +121,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--entropy-coef", type=float, default=0.01,
                    help="Entropy bonus coefficient (encourages exploration). "
                         "Increase if no-op rate stays >80%% early in training.")
+    p.add_argument("--entropy-coef-final", type=float, default=0.001,
+                   help="Entropy coefficient at the LAST epoch: the coefficient "
+                        "decays linearly from --entropy-coef to this value over "
+                        "the run, so the policy explores early and commits late. "
+                        "Set equal to --entropy-coef to disable the decay.")
     p.add_argument("--val-ratio", type=float, default=0.15,
                    help="Fraction of benchmarks held out for validation")
     p.add_argument("--test-ratio", type=float, default=0.15,
@@ -580,7 +585,9 @@ def evaluate(
         for loop_record in env.eligible_loops:
             pre_features = loop_record.pre_features.to(device)
 
-            unmerge, _ = agent.select_unmerge(pre_features)
+            # Greedy (argmax) policy: evaluation reports the deployment-mode
+            # decision, not a sample from the exploration distribution.
+            unmerge, _ = agent.select_unmerge(pre_features, greedy=True)
 
             if unmerge == 1:
                 try:
@@ -595,6 +602,7 @@ def evaluate(
                 trip_known=loop_record.trip_count_known,
                 trip_count=loop_record.trip_count,
                 loop_idx=loop_record.loop_idx,
+                greedy=True,
             )
 
             try:
@@ -625,9 +633,14 @@ def evaluate(
 
         if bmark_rewards:
             per_benchmark.append({
-                "benchmark": benchmark_dir.name,
-                "loops": len(bmark_rewards),
-                "avg_reward": sum(bmark_rewards) / len(bmark_rewards),
+                "benchmark":   benchmark_dir.name,
+                "loops":       len(bmark_rewards),
+                "avg_reward":  sum(bmark_rewards) / len(bmark_rewards),
+                "min_reward":  min(bmark_rewards),
+                "max_reward":  max(bmark_rewards),
+                # ±1% classification thresholds — below that is measurement noise
+                "loops_win":        sum(1 for r in bmark_rewards if r > 0.01),
+                "loops_regression": sum(1 for r in bmark_rewards if r < -0.01),
             })
 
     avg_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
@@ -1028,7 +1041,10 @@ def _worker_fn(
                     # else: leave (None, total_ms) — both sides total.
 
                 # --- Agent decisions ---
-                unmerge, log_p1 = agent.select_unmerge(pre_features)
+                # Eval mode uses the greedy (argmax) policy: this is the
+                # deployment-mode measurement, free of sampling noise.
+                greedy = (mode == "eval")
+                unmerge, log_p1 = agent.select_unmerge(pre_features, greedy=greedy)
 
                 if unmerge == 1:
                     # Post-unmerge features are deterministic per loop —
@@ -1053,6 +1069,7 @@ def _worker_fn(
                     trip_known=trip_known,
                     trip_count=trip_count,
                     loop_idx=loop_idx,
+                    greedy=greedy,
                 )
                 factor = FACTOR_VALUES[factor_idx]
 
@@ -1414,6 +1431,8 @@ def run_parallel_epoch(
     val_per_benchmark: list[dict] = []
 
     val_cache_hits = 0
+    val_noops      = 0
+    val_unmerges   = 0
     if val_loop_assignments:
         val_per_worker = assign_loops_to_workers(val_loop_assignments, n_workers)
         val_weights = _get_weights(agent)
@@ -1465,10 +1484,14 @@ def run_parallel_epoch(
                 per_bench_data.setdefault(msg["benchmark"], []).append(msg["reward"])
                 val_samples += 1
                 # Val measurements are just as deterministic — harvest them too.
-                if not (msg.get("unmerge") == 0 and msg.get("factor") == 1):
+                if msg.get("unmerge") == 0 and msg.get("factor") == 1:
+                    val_noops += 1
+                else:
                     reward_cache[
                         f"{msg['benchmark']}|{msg['loop_idx']}|{msg['unmerge']}|{msg['factor']}"
                     ] = msg["reward"]
+                if msg.get("unmerge") == 1:
+                    val_unmerges += 1
                 if msg.get("cached"):
                     val_cache_hits += 1
                 timeout_flag = " [compile timeout — penalty]" if msg.get("timeout") else ""
@@ -1538,6 +1561,8 @@ def run_parallel_epoch(
         "val_samples":         val_samples,
         "val_missed":          val_missed,
         "val_cache_hit_rate":  val_cache_hits / max(val_samples, 1),
+        "val_noop_rate":       val_noops / max(val_samples, 1),
+        "val_unmerge_rate":    val_unmerges / max(val_samples, 1),
         "val_per_benchmark":   val_per_benchmark,
     }
     return epoch_stats, [], []
@@ -1688,9 +1713,24 @@ def main() -> None:
     total_updates = 0
     rng = random.Random(args.split_seed)
 
+    # Best-checkpoint tracking: the final policy is not necessarily the best
+    # one over a long run.  Track greedy val reward and keep best.pt; the test
+    # evaluation at the end uses it instead of the last epoch's weights.
+    best_val_reward = float("-inf")
+    best_val_epoch: "int | None" = None
+
     for epoch in range(1, args.epochs + 1):
         _epoch_filter.set(epoch, args.epochs)
         log.info("=== Epoch %d / %d ===", epoch, args.epochs)
+
+        # Entropy-coefficient decay: linear from --entropy-coef (epoch 1) to
+        # --entropy-coef-final (last epoch).  PPO updates run on this (main)
+        # agent in both paths, so setting it here is sufficient.
+        frac = (epoch - 1) / (args.epochs - 1) if args.epochs > 1 else 0.0
+        agent.entropy_coef = (
+            args.entropy_coef + frac * (args.entropy_coef_final - args.entropy_coef)
+        )
+        log.info("Entropy coefficient this epoch: %.5f", agent.entropy_coef)
 
         # ==============================================================
         # PARALLEL PATH  (--num-workers > 1)
@@ -1760,7 +1800,12 @@ def main() -> None:
                 "val_samples":         epoch_stats["val_samples"],
                 "val_missed":          epoch_stats["val_missed"],
                 "val_cache_hit_rate":  round(epoch_stats["val_cache_hit_rate"], 6),
+                "val_noop_rate":       round(epoch_stats["val_noop_rate"], 6),
+                "val_unmerge_rate":    round(epoch_stats["val_unmerge_rate"], 6),
+                "entropy_coef":        round(agent.entropy_coef, 6),
             })
+
+            epoch_val_reward = epoch_stats["val_avg_reward"]
 
         # ==============================================================
         # SEQUENTIAL PATH  (--num-workers 1, default — unchanged logic)
@@ -1934,7 +1979,21 @@ def main() -> None:
                 "val_avg_advantage":   round(val_metrics.get("val_avg_advantage", float("nan")), 6),
                 "val_samples":         val_metrics.get("val_samples", 0),
                 "val_missed":          val_metrics.get("val_missed", 0),
+                "entropy_coef":        round(agent.entropy_coef, 6),
             })
+
+            epoch_val_reward = val_metrics.get("val_avg_reward", float("nan"))
+
+        # --- Best-checkpoint tracking (both paths) ---
+        # Greedy val reward decides "best"; NaN (empty val set) never wins.
+        if epoch_val_reward == epoch_val_reward and epoch_val_reward > best_val_reward:
+            best_val_reward = epoch_val_reward
+            best_val_epoch = epoch
+            agent.save(str(ckpt_dir / "best.pt"))
+            log.info(
+                "New best val reward %.4f (epoch %d) — saved best.pt",
+                best_val_reward, epoch,
+            )
 
         # --- Checkpoint (both paths) ---
         if epoch % args.checkpoint_every == 0:
@@ -1942,31 +2001,74 @@ def main() -> None:
             agent.save(str(ckpt_path))
             log.info("Checkpoint saved: %s", ckpt_path)
 
-    # --- Test evaluation (final model) ---
+    # --- Test evaluation ---
+    # Uses the BEST checkpoint by greedy val reward, not the last epoch's
+    # weights: over a long run the final policy can be past its peak.
     if test_bmarks:
-        log.info("=== Test Evaluation (final model) ===")
+        best_ckpt = ckpt_dir / "best.pt"
+        if best_ckpt.exists():
+            agent.load(str(best_ckpt))
+            log.info(
+                "=== Test Evaluation (best checkpoint: epoch %s, val=%.4f) ===",
+                best_val_epoch, best_val_reward,
+            )
+        else:
+            log.info("=== Test Evaluation (final model — no best.pt found) ===")
+
         test_metrics, _ = evaluate(agent, env, test_bmarks, device, label="test")
 
+        per_b = test_metrics.get("test_per_benchmark", [])
+        # Per-benchmark verdicts at ±1% (below that is measurement noise)
+        for entry in per_b:
+            entry["verdict"] = (
+                "win" if entry["avg_reward"] > 0.01
+                else "regression" if entry["avg_reward"] < -0.01
+                else "neutral"
+            )
+        n_win = sum(1 for e in per_b if e["verdict"] == "win")
+        n_reg = sum(1 for e in per_b if e["verdict"] == "regression")
+        n_neu = len(per_b) - n_win - n_reg
+        macro_avg = (
+            sum(e["avg_reward"] for e in per_b) / len(per_b) if per_b else 0.0
+        )
+
         log.info(
-            "Test | avg_reward=%.4f avg_advantage=%.4f samples=%d missed=%d",
-            test_metrics["test_avg_reward"], test_metrics["test_avg_advantage"],
+            "Test | per-loop avg_reward=%.4f | per-benchmark avg=%.4f | "
+            "benchmarks: %d win / %d neutral / %d regression | samples=%d missed=%d",
+            test_metrics["test_avg_reward"], macro_avg,
+            n_win, n_neu, n_reg,
             test_metrics["test_samples"], test_metrics["test_missed"],
         )
         log.info("Per-benchmark test results:")
-        for entry in test_metrics.get("test_per_benchmark", []):
-            log.info("  %-40s loops=%d  avg_reward=%.4f",
-                     entry["benchmark"], entry["loops"], entry["avg_reward"])
+        for entry in per_b:
+            log.info(
+                "  %-40s loops=%3d  avg=%+.4f  min=%+.4f  max=%+.4f  "
+                "win/reg loops=%d/%d  [%s]",
+                entry["benchmark"], entry["loops"], entry["avg_reward"],
+                entry["min_reward"], entry["max_reward"],
+                entry["loops_win"], entry["loops_regression"], entry["verdict"],
+            )
 
         test_results_file = str(ckpt_dir / "test_results.csv")
+        fieldnames = ["benchmark", "loops", "avg_reward", "min_reward",
+                      "max_reward", "loops_win", "loops_regression", "verdict"]
         with open(test_results_file, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["benchmark", "loops", "avg_reward"])
+            writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
             writer.writeheader()
-            for entry in test_metrics.get("test_per_benchmark", []):
+            for entry in per_b:
                 writer.writerow(entry)
             writer.writerow({
-                "benchmark": "OVERALL",
+                "benchmark": "OVERALL_PER_LOOP",
                 "loops": test_metrics["test_samples"],
                 "avg_reward": round(test_metrics["test_avg_reward"], 6),
+            })
+            writer.writerow({
+                "benchmark": "OVERALL_PER_BENCHMARK",
+                "loops": len(per_b),
+                "avg_reward": round(macro_avg, 6),
+                "loops_win": n_win,
+                "loops_regression": n_reg,
+                "verdict": f"{n_win}W/{n_neu}N/{n_reg}R",
             })
         log.info("Test results saved: %s", test_results_file)
 

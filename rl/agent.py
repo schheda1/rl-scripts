@@ -109,11 +109,17 @@ class UnmergeActor(_MLP):
         logits = self.forward(features)
         return F.log_softmax(logits, dim=-1).gather(1, actions.unsqueeze(1)).squeeze(1)
 
-    def sample(self, features: torch.Tensor) -> tuple[int, torch.Tensor]:
+    def sample(
+        self, features: torch.Tensor, greedy: bool = False
+    ) -> tuple[int, torch.Tensor]:
+        """greedy=True takes the argmax action (deployment / evaluation mode)."""
         with torch.no_grad():
             logits = self.forward(features.unsqueeze(0))
-            dist = torch.distributions.Categorical(logits=logits)
-            action = dist.sample()
+            if greedy:
+                action = logits.argmax(dim=-1)
+            else:
+                dist = torch.distributions.Categorical(logits=logits)
+                action = dist.sample()
         log_p = F.log_softmax(logits, dim=-1)[0, action.item()]
         return int(action.item()), log_p.detach()
 
@@ -150,13 +156,18 @@ class FactorActor(_MLP):
         self,
         features: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        greedy: bool = False,
     ) -> tuple[int, torch.Tensor]:
+        """greedy=True takes the argmax of the (masked) logits."""
         with torch.no_grad():
             logits = self.forward(features.unsqueeze(0))[0]
             if mask is not None:
                 logits = logits.masked_fill(~mask.to(logits.device), float("-inf"))
-            dist = torch.distributions.Categorical(logits=logits)
-            action = dist.sample()
+            if greedy:
+                action = logits.argmax(dim=-1)
+            else:
+                dist = torch.distributions.Categorical(logits=logits)
+                action = dist.sample()
         log_p = F.log_softmax(logits, dim=-1)[action.item()]
         return int(action.item()), log_p.detach()
 
@@ -255,9 +266,11 @@ class Agent:
         with torch.no_grad():
             return self.critic.value(features.unsqueeze(0).to(self.device)).item()
 
-    def select_unmerge(self, features: torch.Tensor) -> tuple[int, torch.Tensor]:
-        """Sample unmerge action. Returns (action, log_prob)."""
-        return self.unmerge_actor.sample(features.to(self.device))
+    def select_unmerge(
+        self, features: torch.Tensor, greedy: bool = False
+    ) -> tuple[int, torch.Tensor]:
+        """Sample unmerge action (argmax if greedy). Returns (action, log_prob)."""
+        return self.unmerge_actor.sample(features.to(self.device), greedy=greedy)
 
     def select_factor(
         self,
@@ -265,6 +278,7 @@ class Agent:
         trip_known: bool = False,
         trip_count: int = 0,
         loop_idx: Optional[int] = None,
+        greedy: bool = False,
     ) -> tuple[int, torch.Tensor, torch.Tensor]:
         """
         Sample factor action with trip-count masking.
@@ -286,7 +300,7 @@ class Agent:
                 masked_out,
             )
         factor_idx, log_p = self.factor_actor.sample(
-            features.to(self.device), mask=mask.to(self.device)
+            features.to(self.device), mask=mask.to(self.device), greedy=greedy
         )
         return factor_idx, log_p, mask
 
