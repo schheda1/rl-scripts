@@ -90,8 +90,31 @@ def _grid_only_y(ax) -> None:
 
 
 def load_metrics(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df = df[pd.to_numeric(df["epoch"], errors="coerce").notna()].copy()
+    """
+    Robust metrics reader.
+
+    Tolerates a metrics.csv that grew columns mid-life (e.g. a checkpoint dir
+    reused across schema versions, where newer rows carry more fields than the
+    original header).  Rows are padded/truncated to the header width — because
+    new columns are always appended, truncation keeps the original columns
+    intact and simply omits any that post-date the header.  Any column the
+    header doesn't name is unavailable; plots that need it are skipped.
+    """
+    import csv as _csv
+    rows = list(_csv.reader(open(path, newline="")))
+    if not rows:
+        raise ValueError(f"empty metrics file: {path}")
+    header = rows[0]
+    width = len(header)
+    data = []
+    for r in rows[1:]:
+        if not r or r[0].strip() == "epoch":   # skip blanks / repeated headers
+            continue
+        data.append((r + [""] * width)[:width])
+    df = pd.DataFrame(data, columns=header)
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df[df["epoch"].notna()].copy()
     df["epoch"] = df["epoch"].astype(int)
     return df.sort_values("epoch").reset_index(drop=True)
 
@@ -143,14 +166,27 @@ def plot_performance(df: pd.DataFrame, outdir: Path) -> Path:
 # Figure 2 — How often the model chooses to act
 # ---------------------------------------------------------------------------
 
-def plot_decision_policy(df: pd.DataFrame, outdir: Path) -> Path:
+def _plot_decision_mix(df: pd.DataFrame, outdir: Path, *, prefix: str, title: str,
+                       subtitle: str, filename: str) -> "Path | None":
+    """
+    Decision-mix chart for either the training-time (sampled) policy or the
+    held-out (greedy) policy, depending on *prefix* ('train' or 'val').
+
+    The three actions partition every loop decision (mutually exclusive,
+    exhaustive): aggressive path-unmerge, lightweight unroll-only, or no-op.
+    unroll-only is derived so the three sum to 100%.  Returns None if the
+    required columns are absent (older metrics schema).
+    """
+    ncol, ncol2 = f"{prefix}_noop_rate", f"{prefix}_unmerge_rate"
+    if ncol not in df.columns or ncol2 not in df.columns:
+        return None
+    if df[ncol].isna().all() or df[ncol2].isna().all():
+        return None
+
     fig, ax = plt.subplots(figsize=(8, 4.8))
     e = df["epoch"]
-    # The three actions partition every loop decision (mutually exclusive,
-    # exhaustive): aggressive path-unmerge, lightweight unroll-only, or no-op.
-    # unroll-only is derived so the three sum to 100%.
-    unmerge = df["train_unmerge_rate"] * 100
-    noop    = df["train_noop_rate"] * 100
+    unmerge = df[ncol2] * 100
+    noop    = df[ncol] * 100
     unroll  = 100 - unmerge - noop
 
     ax.plot(e, unroll, color=AQUA, lw=2, marker="o", ms=5,
@@ -164,8 +200,7 @@ def plot_decision_policy(df: pd.DataFrame, outdir: Path) -> Path:
     _end_label(ax, e.iloc[-1], unmerge.iloc[-1], f"{unmerge.iloc[-1]:.0f}%", ORANGE)
     _end_label(ax, e.iloc[-1], noop.iloc[-1], f"{noop.iloc[-1]:.0f}%", BLUE)
 
-    _titles(ax, "How the model's choices shift as it learns",
-            "A graded response emerges: prefer the cheap transform, escalate only where it pays.")
+    _titles(ax, title, subtitle)
     ax.set_xlabel("Training progress (epochs)")
     ax.set_ylabel("Share of loop decisions")
     ax.margins(x=0.10)
@@ -174,16 +209,38 @@ def plot_decision_policy(df: pd.DataFrame, outdir: Path) -> Path:
     _grid_only_y(ax)
     ax.legend(loc="center right", fontsize=10, handlelength=1.4)
 
-    out = outdir / "fig_decision_policy.png"
+    out = outdir / filename
     fig.tight_layout()
     fig.savefig(out, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return out
 
 
+def plot_decision_policy(df: pd.DataFrame, outdir: Path) -> "Path | None":
+    return _plot_decision_mix(
+        df, outdir, prefix="train",
+        title="How the model's choices shift as it learns",
+        subtitle="A graded response emerges: prefer the cheap transform, escalate only where it pays.",
+        filename="fig_decision_policy.png",
+    )
+
+
+def plot_decision_policy_val(df: pd.DataFrame, outdir: Path) -> "Path | None":
+    return _plot_decision_mix(
+        df, outdir, prefix="val",
+        title="What the committed policy does on held-out code",
+        subtitle="Greedy (deployment-mode) choices on unseen benchmarks as training proceeds.",
+        filename="fig_decision_policy_val.png",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Figure 3 — Internal multi-panel overview
 # ---------------------------------------------------------------------------
+
+def _has(df: pd.DataFrame, col: str) -> bool:
+    return col in df.columns and not df[col].isna().all()
+
 
 def plot_training_overview(df: pd.DataFrame, outdir: Path) -> Path:
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -192,10 +249,12 @@ def plot_training_overview(df: pd.DataFrame, outdir: Path) -> Path:
     # (a) Speedup
     ax = axes[0, 0]
     ax.axhline(0, color=BASELINE, lw=1.1, ls="--")
-    ax.plot(e, df["train_avg_reward"] * 100, color=BLUE, lw=2, marker="o", ms=4,
-            label="Training")
-    ax.plot(e, df["val_avg_reward"] * 100, color=ORANGE, lw=2, marker="o", ms=4,
-            label="Held-out")
+    if _has(df, "train_avg_reward"):
+        ax.plot(e, df["train_avg_reward"] * 100, color=BLUE, lw=2, marker="o", ms=4,
+                label="Training")
+    if _has(df, "val_avg_reward"):
+        ax.plot(e, df["val_avg_reward"] * 100, color=ORANGE, lw=2, marker="o", ms=4,
+                label="Held-out")
     _titles(ax, "Mean speedup", "vs. untransformed baseline")
     ax.set_ylabel("Speedup")
     _pct_axis(ax); _grid_only_y(ax)
@@ -203,16 +262,18 @@ def plot_training_overview(df: pd.DataFrame, outdir: Path) -> Path:
 
     # (b) Decisiveness (entropy) — plain-language label
     ax = axes[0, 1]
-    ax.plot(e, df["train_entropy"], color=VIOLET, lw=2, marker="o", ms=4)
+    if _has(df, "train_entropy"):
+        ax.plot(e, df["train_entropy"], color=VIOLET, lw=2, marker="o", ms=4)
+        ax.invert_yaxis()
     _titles(ax, "Policy decisiveness",
             "lower = more deliberate, sharper choices")
     ax.set_ylabel("Decision entropy")
-    ax.invert_yaxis()
     _grid_only_y(ax)
 
     # (c) Predictor calibration (value loss)
     ax = axes[1, 0]
-    ax.plot(e, df["train_value_loss"], color=AQUA, lw=2, marker="o", ms=4)
+    if _has(df, "train_value_loss"):
+        ax.plot(e, df["train_value_loss"], color=AQUA, lw=2, marker="o", ms=4)
     _titles(ax, "Outcome-predictor error",
             "lower = better calibrated to measured results")
     ax.set_ylabel("Prediction error")
@@ -221,9 +282,10 @@ def plot_training_overview(df: pd.DataFrame, outdir: Path) -> Path:
 
     # (d) Cache hit rate (efficiency)
     ax = axes[1, 1]
-    ax.plot(e, df["train_cache_hit_rate"] * 100, color=BLUE, lw=2, marker="o", ms=4,
-            label="Training")
-    if "val_cache_hit_rate" in df:
+    if _has(df, "train_cache_hit_rate"):
+        ax.plot(e, df["train_cache_hit_rate"] * 100, color=BLUE, lw=2, marker="o",
+                ms=4, label="Training")
+    if _has(df, "val_cache_hit_rate"):
         ax.plot(e, df["val_cache_hit_rate"] * 100, color=ORANGE, lw=2, marker="o",
                 ms=4, label="Held-out")
     _titles(ax, "Measurement reuse",
@@ -256,10 +318,14 @@ def main() -> None:
     figs = [
         plot_performance(df, outdir),
         plot_decision_policy(df, outdir),
+        plot_decision_policy_val(df, outdir),   # None if val action-mix absent
         plot_training_overview(df, outdir),
     ]
     for f in figs:
-        print(f"wrote {f}")
+        if f is not None:
+            print(f"wrote {f}")
+        else:
+            print("skipped a figure (columns not present in this metrics.csv)")
 
 
 if __name__ == "__main__":

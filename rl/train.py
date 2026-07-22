@@ -548,9 +548,13 @@ def evaluate(
     benchmarks: list[Path],
     device: torch.device,
     label: str = "val",
+    greedy: bool = True,
 ) -> tuple[dict, list[Path]]:
     """
     Run the current policy over *benchmarks* without any gradient updates.
+
+    greedy=True (default) reports the deployment-mode argmax policy; greedy=False
+    samples from the policy distribution (matches the noisier training-time draw).
 
     Returns:
       (metrics_dict, failed_benchmarks)
@@ -585,9 +589,9 @@ def evaluate(
         for loop_record in env.eligible_loops:
             pre_features = loop_record.pre_features.to(device)
 
-            # Greedy (argmax) policy: evaluation reports the deployment-mode
-            # decision, not a sample from the exploration distribution.
-            unmerge, _ = agent.select_unmerge(pre_features, greedy=True)
+            # Greedy (argmax) by default: reports the deployment-mode decision,
+            # not a sample from the exploration distribution.
+            unmerge, _ = agent.select_unmerge(pre_features, greedy=greedy)
 
             if unmerge == 1:
                 try:
@@ -602,7 +606,7 @@ def evaluate(
                 trip_known=loop_record.trip_count_known,
                 trip_count=loop_record.trip_count,
                 loop_idx=loop_record.loop_idx,
-                greedy=True,
+                greedy=greedy,
             )
 
             try:
