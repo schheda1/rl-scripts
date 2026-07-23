@@ -43,7 +43,10 @@ import torch.nn.functional as F
 # timeouts in the first full run, for negligible policy value.  Reinstating
 # them changes the FactorActor output dim — old checkpoints become incompatible.
 FACTOR_VALUES: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-N_FEATURES: int = 18   # must match environment.py FEATURE_COLUMNS length
+# 18 structural features + 75 IR2Vec embedding dims.  Must equal
+# len(FEATURE_COLUMNS) in hecbench.py (asserted at startup in train.py).
+# Checkpoints from the 18-feature runs are NOT loadable (input dim changed).
+N_FEATURES: int = 93
 N_FACTORS: int = len(FACTOR_VALUES)
 
 # Indices of tripCountKnown and tripCount within the RAW feature vector.
@@ -88,12 +91,14 @@ def build_factor_mask(trip_known: bool, trip_count: int) -> torch.Tensor:
 class _MLP(nn.Module):
     def __init__(self, in_dim: int, out_dim: int) -> None:
         super().__init__()
+        # Hidden widths 128→64: the 93-dim input (18 structural + 75 IR2Vec)
+        # needs more capacity than the 64→32 stack used for the 18-dim features.
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 64),
+            nn.Linear(in_dim, 128),
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(32, out_dim),
+            nn.Linear(64, out_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

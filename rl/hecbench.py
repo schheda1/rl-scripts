@@ -41,6 +41,12 @@ def detect_arch() -> str:
 
 ARCH: str = os.environ.get("TARGET_ARCH") or detect_arch()
 
+# Path to the IR2Vec vocabulary JSON (seedEmbeddingVocab75D.json).  Required for
+# every --enable-loopcount compile — without it the LLVM pass cannot produce
+# embeddings.  Set via the IR2VEC_VOCAB env var in the slurm/launch script,
+# e.g. IR2VEC_VOCAB=$LLVM_SRC/llvm/lib/Analysis/models/seedEmbeddingVocab75D.json
+IR2VEC_VOCAB: str = os.environ.get("IR2VEC_VOCAB", "")
+
 # ---------------------------------------------------------------------------
 # Benchmark discovery
 # ---------------------------------------------------------------------------
@@ -165,6 +171,17 @@ def _build_extra_cflags(
 
     if enable_loopcount:
         parts.append("-mllvm --enable-loopcount")
+        # The IR2Vec vocab flag must accompany EVERY loopcount compile — this
+        # includes the post-unmerge feature-extraction compiles, which set both
+        # enable_uu and enable_loopcount, so keying off enable_loopcount here
+        # covers them.  Fail loudly rather than silently emit zero embeddings.
+        if not IR2VEC_VOCAB or not Path(IR2VEC_VOCAB).exists():
+            raise RuntimeError(
+                "IR2VEC_VOCAB must point to an existing seedEmbeddingVocab75D.json "
+                f"for loopcount compiles (got {IR2VEC_VOCAB!r}). Set the "
+                "IR2VEC_VOCAB env var in the launch script."
+            )
+        parts.append(f"-mllvm --ir2vec-vocab-path={IR2VEC_VOCAB}")
     if enable_uu:
         parts.append("-mllvm --enable-uu")
     if filename:
@@ -278,6 +295,11 @@ def compile_multi_loop(
 # LoopCount feature extraction
 # ---------------------------------------------------------------------------
 
+# Dimensionality of the IR2Vec loop-content embedding.  Must match IR2VecDim in
+# LoopCount.cpp and seedEmbeddingVocab75D.json.
+IR2VEC_DIM = 75
+_EMB_COLUMNS = [f"emb{i}" for i in range(IR2VEC_DIM)]
+
 LOOPCOUNT_COLUMNS = [
     "loopIdx", "loopDepth", "startLine", "startCol", "startIsImplicitCode",
     "endLine", "endCol", "endIsImplicitCode", "function", "numPaths",
@@ -288,6 +310,8 @@ LOOPCOUNT_COLUMNS = [
     "containsCall", "numExits",
     # metadata columns — not ML features, used for per-kernel measurement
     "isKernelFunction", "kernelParents",
+    # IR2Vec embedding columns — appended at the END (LLVM emits them last).
+    *_EMB_COLUMNS,
 ]
 
 FEATURE_COLUMNS = [
@@ -296,6 +320,9 @@ FEATURE_COLUMNS = [
     "containsChildLoops", "containsBranch", "tripCountKnown", "tripCount",
     "numBasicBlocks", "numMemoryInsts", "numComputeInsts", "numControlFlowInsts",
     "containsCall", "numExits",
+    # IR2Vec embedding features — appended at the END so structural feature
+    # positions (and the trip-count mask indices 10/11 in agent.py) never move.
+    *_EMB_COLUMNS,
 ]
 
 
@@ -362,6 +389,16 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
     if not parsed:
         raise RuntimeError(f"No LoopCount output from {benchmark_dir.name}")
 
+    # Stale-compiler guard: a pre-IR2Vec llvm emits no emb columns.  Catch it
+    # here rather than let the missing FEATURE_COLUMNS surface as NaNs.
+    _sample_df = next(iter(parsed[next(iter(parsed))].values()))
+    if "emb0" not in _sample_df.columns:
+        raise RuntimeError(
+            f"{benchmark_dir.name}: LoopCount output has no IR2Vec embedding "
+            "columns — rebuild llvm with the IR2Vec LoopCount changes, or check "
+            "--ir2vec-vocab-path."
+        )
+
     # Prefer the CUDA device triple when available; fall back to first triple.
     # NOTE: this triple may be the x86 host triple (see docstring).  The device
     # loop filter below is the authoritative guard, not the triple.
@@ -392,6 +429,23 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
         df_ok = df[mask].reset_index(drop=True)
         if len(df_ok) > 0:
             eligible[filename] = df_ok
+
+    # All-zero-embedding guard: if every eligible loop's embedding is zero the
+    # vocab fell back in-pass (the LLVM warning was emitted).  Training on zero
+    # embeddings silently discards the whole point, so make it loud.
+    if eligible:
+        import logging as _logging
+        _emb_cols = [c for c in _EMB_COLUMNS
+                     if c in next(iter(eligible.values())).columns]
+        all_zero = all(
+            (df[_emb_cols].abs().to_numpy().sum() == 0)
+            for df in eligible.values()
+        )
+        if all_zero and _emb_cols:
+            _logging.getLogger("hecbench").warning(
+                "%s: all IR2Vec embeddings are zero — vocab fell back in-pass "
+                "(check --ir2vec-vocab-path / llvm build)", benchmark_dir.name,
+            )
 
     primary_file = next(iter(eligible), "")
     return eligible, primary_file, triple

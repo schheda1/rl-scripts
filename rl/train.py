@@ -43,9 +43,14 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from agent import Agent, RolloutBuffer, RolloutEntry, FACTOR_VALUES
+from agent import Agent, RolloutBuffer, RolloutEntry, FACTOR_VALUES, N_FEATURES
 from environment import GpuLoopEnv
-from hecbench import ARCH, discover_benchmarks
+from hecbench import ARCH, FEATURE_COLUMNS, discover_benchmarks
+
+# Bump when the feature schema changes so a --skip-precheck run cannot load a
+# cache whose pre_features_raw / normalizer are the wrong dimensionality.
+# v1 = 18 structural features; v2 = 18 structural + 75 IR2Vec embeddings.
+FEATURES_VERSION = 2
 
 
 class _EpochFilter(logging.Filter):
@@ -218,6 +223,17 @@ def precheck_benchmarks(
     if skip and cache_file.exists():
         try:
             data = json.loads(cache_file.read_text())
+            # Feature-schema version guard: a cache written before the IR2Vec
+            # feature change carries 18-dim pre_features_raw and an 18-dim
+            # normalizer.  Loading it would silently train on the wrong feature
+            # space, so discard it and fall through to a fresh precheck.
+            if data.get("features_version") != FEATURES_VERSION:
+                log.warning(
+                    "Precheck cache features_version=%s != %d — feature schema "
+                    "changed; discarding cache and re-running the pre-flight check.",
+                    data.get("features_version"), FEATURES_VERSION,
+                )
+                raise ValueError("stale features_version")
             eligible_names = set(data["eligible"])
             loop_counts: dict[str, int] = data.get("loop_counts", {})
             loop_records_map: dict[str, list[dict]] = data.get("loop_records", {})
@@ -329,6 +345,7 @@ def precheck_benchmarks(
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps({
             "checked_at": datetime.now().isoformat(),
+            "features_version": FEATURES_VERSION,
             "eligible": [b.name for b in eligible],
             "loop_counts": loop_counts,
             "loop_records": loop_records_map,
@@ -1578,6 +1595,14 @@ def run_parallel_epoch(
 
 def main() -> None:
     args = parse_args()
+
+    # Fail fast if the feature schema and the network input dim disagree — a
+    # mismatch here would otherwise surface as an opaque shape error deep in
+    # the first forward pass, hours into a run.
+    assert len(FEATURE_COLUMNS) == N_FEATURES, (
+        f"FEATURE_COLUMNS has {len(FEATURE_COLUMNS)} entries but agent.N_FEATURES "
+        f"is {N_FEATURES} — update both together."
+    )
 
     # spawn is required for CUDA safety: forking after CUDA init is unsupported.
     # Set it early, before any torch.cuda usage.
