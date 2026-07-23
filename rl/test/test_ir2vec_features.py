@@ -175,32 +175,64 @@ def test_pre_post_unmerge(bench: Path, file_map) -> None:
     print(f"  [report] {'embedding moved under unmerge' if emb_delta > 1e-4 else 'embedding ~unchanged (mean-composition insensitivity — a finding, not a bug)'}")
 
 
-def test_dedup_delta(template_bench: Path) -> None:
-    print(f"\nT4: dedup delta ({template_bench.name}) [informational]")
-    file_map, _, _ = get_loop_features(template_bench)
-    rows = [row for df in file_map.values() for _, row in df.iterrows()]
+def _gather_loops(disc: dict, min_loops: int = 20, max_benches: int = 6,
+                  prefer: str = ""):
+    """
+    Pool eligible-loop rows across benchmarks until >= min_loops (or max_benches
+    scanned).  Single-loop benchmarks (e.g. mandelbrot) give a degenerate
+    normalizer/dedup view; pooling mirrors what the real precheck fits on.
+    Returns (rows, names_scanned).
+    """
+    rows: list = []
+    scanned: list = []
+    names = list(disc)
+    if prefer in disc:                      # scan the preferred one first
+        names = [prefer] + [n for n in names if n != prefer]
+    for name in names:
+        try:
+            fm, _, _ = get_loop_features(disc[name])
+        except Exception:
+            continue
+        for df in fm.values():
+            for _, r in df.iterrows():
+                rows.append(r)
+        scanned.append(name)
+        if len(rows) >= min_loops or len(scanned) >= max_benches:
+            break
+    return rows, scanned
+
+
+def test_dedup_delta(disc: dict, prefer: str) -> None:
+    print(f"\nT4: dedup delta [informational]")
+    rows, scanned = _gather_loops(disc, min_loops=30, prefer=prefer)
+    print(f"  pooled {len(rows)} loops across {scanned}")
     if not rows:
-        check("template benchmark has loops", False)
+        check("pooled loops available", False)
         return
     full = [tuple(_row_to_tensor(r).tolist()) for r in rows]
     struct = [tuple(_row_to_tensor(r).tolist()[:18]) for r in rows]
-    print(f"  loops: {len(rows)}  unique@18-dim: {len(set(struct))}  "
-          f"unique@93-dim: {len(set(full))}")
+    print(f"  unique@18-dim: {len(set(struct))}  unique@93-dim: {len(set(full))}")
     check("93-dim disambiguates >= 18-dim (fewer or equal dups)",
           len(set(full)) >= len(set(struct)),
           f"{len(set(full))} >= {len(set(struct))} unique")
 
 
-def test_normalizer(bench: Path) -> None:
-    print(f"\nT5: normalizer ({bench.name})")
+def test_normalizer(disc: dict) -> None:
+    print(f"\nT5: normalizer")
     from hecbench import FeatureNormalizer
-    file_map, _, _ = get_loop_features(bench)
-    tensors = [_row_to_tensor(r) for df in file_map.values() for _, r in df.iterrows()]
+    rows, scanned = _gather_loops(disc, min_loops=20)
+    print(f"  pooled {len(rows)} loops across {scanned}")
+    if len(rows) < 2:
+        check("enough loops to compute std (>=2)", False,
+              f"only {len(rows)} — pass benchmarks with more loops")
+        return
+    tensors = [_row_to_tensor(r) for r in rows]
     n = FeatureNormalizer()
     n.fit(tensors)
     check("normalizer mean length == 93", len(n.mean) == 93, f"{len(n.mean)}")
     emb_std = n.std[18:].tolist()
-    check("some embedding dims have std > 0", any(s > 1e-6 for s in emb_std))
+    check("some embedding dims have std > 0", any(s > 1e-6 for s in emb_std),
+          f"max emb std = {max(emb_std):.4g}")
 
 
 def main() -> None:
@@ -213,19 +245,30 @@ def main() -> None:
     disc = {b.name: b for b in discover_benchmarks(HECBENCH_SRC)}
     bench = disc.get(args.benchmark)
     if bench is None:
-        print(f"benchmark {args.benchmark} not found"); sys.exit(1)
+        # This test only compiles + extracts features (never runs the binary),
+        # so a benchmark that fails discover_benchmarks' runtime filters
+        # (no run: target, external ../data/, DVC) is still usable here.
+        cand = HECBENCH_SRC / args.benchmark
+        if cand.is_dir() and (cand / "Makefile").exists():
+            print(f"note: {args.benchmark} not in discover_benchmarks (likely no "
+                  f"run: target / external data) — using on-disk dir (compile-only test)")
+            bench = cand
+            disc.setdefault(args.benchmark, cand)
+        else:
+            print(f"benchmark {args.benchmark!r} not found under {HECBENCH_SRC}")
+            print(f"  note: the flag is --benchmark (singular), not --benchmarks")
+            print(f"  available (first 20): {sorted(disc)[:20]}")
+            sys.exit(1)
 
     test_schema()
     fm = test_extraction(bench)
     test_device_embeddings(bench)          # the key device-vs-host check
     if fm:
         test_pre_post_unmerge(bench, fm)
-    test_normalizer(bench)
-    tb = disc.get(args.template_benchmark)
-    if tb:
-        test_dedup_delta(tb)
-    else:
-        print(f"\nT4: skipped — {args.template_benchmark} not found")
+    # T5/T4 pool loops across benchmarks — a single-loop benchmark gives a
+    # degenerate (std=0) normalizer/dedup view.
+    test_normalizer(disc)
+    test_dedup_delta(disc, prefer=args.template_benchmark)
 
     passed = sum(1 for _, ok in _results if ok)
     print(f"\n{passed}/{len(_results)} checks passed")
