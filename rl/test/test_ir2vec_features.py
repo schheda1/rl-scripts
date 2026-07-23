@@ -239,9 +239,16 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--benchmark", default="mandelbrot-cuda")
     p.add_argument("--template-benchmark", default="sortKV-cuda")
+    p.add_argument("--hecbench-src", default=None,
+                   help="Benchmark tree to search. MUST be the same tree the "
+                        "training run used (--hecbench-src there). The default "
+                        "og-HeCBench holds only the ~16 original benchmarks — "
+                        "e.g. geglu-cuda lives only in the larger upstream tree.")
     args = p.parse_args()
 
-    from hecbench import discover_benchmarks, HECBENCH_SRC
+    from hecbench import discover_benchmarks, HECBENCH_SRC as _DEFAULT_SRC
+    HECBENCH_SRC = Path(args.hecbench_src) if args.hecbench_src else _DEFAULT_SRC
+    print(f"benchmark tree: {HECBENCH_SRC}")
     disc = {b.name: b for b in discover_benchmarks(HECBENCH_SRC)}
     bench = disc.get(args.benchmark)
     if bench is None:
@@ -257,6 +264,8 @@ def main() -> None:
         else:
             print(f"benchmark {args.benchmark!r} not found under {HECBENCH_SRC}")
             print(f"  note: the flag is --benchmark (singular), not --benchmarks")
+            print(f"  note: pass --hecbench-src <tree> if geglu etc. live in a "
+                  f"different tree than the default {_DEFAULT_SRC}")
             print(f"  available (first 20): {sorted(disc)[:20]}")
             sys.exit(1)
 
