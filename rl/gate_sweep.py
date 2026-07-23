@@ -140,13 +140,29 @@ def main() -> None:
             novelty = min_distance(lr.pre_features.tolist(), train_matrix)
 
             unmerge, lp1 = agent.select_unmerge(pre, greedy=True)
-            # Study A: unmerge==0 is a pure no-op — no factor decision, reward 0.
-            # (Selecting a factor here and compiling unmerge=0,factor>1 would
-            # invoke the confounded unroll-only path and misreport the reward.)
-            if unmerge == 0:
-                factor_idx, factor = 0, 1
-                confidence = float(torch.exp(lp1))
-                reward, cached = 0.0, True
+            # Study A action space {no-op, unroll-only, unmerge(+unroll)}: the
+            # FactorActor decides on both branches; only its input state differs
+            # (post-unmerge vs. pre-unmerge features).  Trip count is invariant
+            # under unmerge, so the pre-features mask is valid for unroll-only.
+            if unmerge == 1:
+                pf = postf_cache.get(f"{bench.name}|{lr.loop_idx}")
+                if pf is not None:
+                    step2 = torch.tensor(pf, dtype=torch.float32).to(device)
+                else:
+                    try:
+                        step2 = env.get_post_unmerge_features(lr).to(device)
+                    except Exception:
+                        step2 = pre
+            else:
+                step2 = pre
+            factor_idx, lp2, _ = agent.select_factor(
+                step2, trip_known=lr.trip_count_known,
+                trip_count=lr.trip_count, loop_idx=lr.loop_idx, greedy=True)
+            factor = FACTOR_VALUES[factor_idx]
+            confidence = float(torch.exp(lp1) * torch.exp(lp2))
+
+            # Pure no-op (unmerge==0, factor==1): reward 0 by definition, no compile.
+            if unmerge == 0 and factor == 1:
                 loop_rows.append({
                     "benchmark": bench.name, "loop_idx": lr.loop_idx,
                     "unmerge": 0, "factor": 1,
@@ -156,21 +172,7 @@ def main() -> None:
                 })
                 continue
 
-            pf = postf_cache.get(f"{bench.name}|{lr.loop_idx}")
-            if pf is not None:
-                step2 = torch.tensor(pf, dtype=torch.float32).to(device)
-            else:
-                try:
-                    step2 = env.get_post_unmerge_features(lr).to(device)
-                except Exception:
-                    step2 = pre
-            factor_idx, lp2, _ = agent.select_factor(
-                step2, trip_known=lr.trip_count_known,
-                trip_count=lr.trip_count, loop_idx=lr.loop_idx, greedy=True)
-            factor = FACTOR_VALUES[factor_idx]
-            confidence = float(torch.exp(lp1) * torch.exp(lp2))
-
-            # --- Reward (unmerge==1 only): cache → measure ---
+            # --- Reward (unmerge==1 or unroll-only): cache → measure ---
             cached = True
             key = f"{bench.name}|{lr.loop_idx}|{unmerge}|{factor}"
             hit = reward_cache.get(key)

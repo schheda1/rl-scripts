@@ -638,22 +638,27 @@ def evaluate(
             # not a sample from the exploration distribution.
             unmerge, _ = agent.select_unmerge(pre_features, greedy=greedy)
 
-            # Study A: unmerge==0 is a pure no-op — no factor, reward 0, done via
-            # env.step's own no-op fast path (factor_idx=0 → factor=1).
+            # Study A action space is {no-op, unroll-only, unmerge(+unroll)}:
+            #   unmerge==1            → post-unmerge features → factor → full UU
+            #   unmerge==0, factor>1  → unroll-only on the un-unmerged loop
+            #   unmerge==0, factor==1 → pure no-op (env.step fast path)
+            # The FactorActor is consulted on both branches; only its input
+            # state differs (post-unmerge vs. pre-unmerge features).  Trip count
+            # is invariant under unmerge, so the pre-features mask is valid here.
             if unmerge == 1:
                 try:
                     step2_features = env.get_post_unmerge_features(loop_record).to(device)
                 except Exception:
                     step2_features = pre_features
-                factor_idx, _, _ = agent.select_factor(
-                    step2_features,
-                    trip_known=loop_record.trip_count_known,
-                    trip_count=loop_record.trip_count,
-                    loop_idx=loop_record.loop_idx,
-                    greedy=greedy,
-                )
             else:
-                factor_idx = 0   # FACTOR_VALUES[0] == 1 → env.step no-op
+                step2_features = pre_features
+            factor_idx, _, _ = agent.select_factor(
+                step2_features,
+                trip_known=loop_record.trip_count_known,
+                trip_count=loop_record.trip_count,
+                loop_idx=loop_record.loop_idx,
+                greedy=greedy,
+            )
 
             try:
                 _, reward, done = env.step(loop_record, unmerge, factor_idx)
@@ -1096,35 +1101,33 @@ def _worker_fn(
                 greedy = (mode == "eval")
                 unmerge, log_p1 = agent.select_unmerge(pre_features, greedy=greedy)
 
-                # Study A: factor magnifies unmerge only.  unmerge==0 is a pure
-                # no-op (leave the loop alone) — no factor decision, reward 0 by
-                # construction, no compile.  The FactorActor is not consulted and
-                # not trained on these samples (factor_active=False).
-                if unmerge == 0:
-                    v = agent.predict_value(pre_features)
-                    _send_loop_result(
-                        result_q, mode, rank, bench_name, loop_idx,
-                        0, 1, 0.0, v, False,
-                        pre_features, pre_features, 0,
-                        log_p1, _ZERO_LOGP, None,
-                        cached=False, factor_active=False,
-                    )
-                    continue
-
-                # unmerge == 1: post-unmerge features (deterministic per loop —
-                # cache hits skip the 2-compile feature extraction), then factor.
-                _pf = postf_cache.get(f"{bench_name}|{loop_idx}")
-                if _pf is not None:
-                    step2_features = torch.tensor(
-                        _pf, dtype=torch.float32
-                    ).to(device)
-                else:
-                    try:
-                        step2_features = env.get_post_unmerge_features(
-                            loop_record
+                # Study A action space is {no-op, unroll-only, unmerge(+unroll)}:
+                #   unmerge==1            → post-unmerge features → factor → full UU
+                #   unmerge==0, factor>1  → unroll-only on the un-unmerged loop
+                #   unmerge==0, factor==1 → pure no-op (free, no compile)
+                # The FactorActor decides on BOTH the unmerge==1 and unmerge==0
+                # branches; only its input state differs (post-unmerge vs.
+                # pre-unmerge features).  Trip count is invariant under unmerge,
+                # so the pre-features mask is valid for the unroll-only branch.
+                if unmerge == 1:
+                    # Post-unmerge features (deterministic per loop — cache hits
+                    # skip the 2-compile feature extraction), then factor.
+                    _pf = postf_cache.get(f"{bench_name}|{loop_idx}")
+                    if _pf is not None:
+                        step2_features = torch.tensor(
+                            _pf, dtype=torch.float32
                         ).to(device)
-                    except Exception:
-                        step2_features = pre_features
+                    else:
+                        try:
+                            step2_features = env.get_post_unmerge_features(
+                                loop_record
+                            ).to(device)
+                        except Exception:
+                            step2_features = pre_features
+                else:
+                    # Unroll-only / no-op: no unmerge compile, so the factor
+                    # decision conditions on the loop's pre-unmerge features.
+                    step2_features = pre_features
 
                 factor_idx, log_p2, mask2 = agent.select_factor(
                     step2_features,
@@ -1135,7 +1138,21 @@ def _worker_fn(
                 )
                 factor = FACTOR_VALUES[factor_idx]
 
-                # --- Compile + measure (unmerge=1, factor) ---
+                # Pure no-op (unmerge==0, factor==1): reward 0 by definition, no
+                # compile.  The FactorActor is not trained on this sample
+                # (factor_active=False) — there is no unroll decision to learn.
+                if unmerge == 0 and factor == 1:
+                    v = agent.predict_value(pre_features)
+                    _send_loop_result(
+                        result_q, mode, rank, bench_name, loop_idx,
+                        0, 1, 0.0, v, False,
+                        pre_features, step2_features, factor_idx,
+                        log_p1, log_p2, mask2,
+                        cached=False, factor_active=False,
+                    )
+                    continue
+
+                # --- Compile + measure (unmerge, factor) ---
                 is_timeout = False
                 from_cache = False
                 _rc_key = f"{bench_name}|{loop_idx}|{unmerge}|{factor}"
@@ -1390,6 +1407,7 @@ def run_parallel_epoch(
     train_cache_hits  = 0
     train_noops       = 0
     train_unmerges    = 0
+    train_unrolls     = 0
     done_count = 0
 
     while done_count < n_workers:
@@ -1411,6 +1429,8 @@ def run_parallel_epoch(
             train_advantages.append(msg["reward"] - msg["value"])
 
             # Harvest into cross-epoch caches (skip no-ops — always free).
+            # Three mutually-exclusive actions: no-op (unmerge==0, factor==1),
+            # unroll-only (unmerge==0, factor>1), unmerge (unmerge==1).
             _is_noop = msg["unmerge"] == 0 and msg["factor"] == 1
             if _is_noop:
                 train_noops += 1
@@ -1418,6 +1438,8 @@ def run_parallel_epoch(
                 reward_cache[
                     f"{msg['benchmark']}|{msg['loop_idx']}|{msg['unmerge']}|{msg['factor']}"
                 ] = msg["reward"]
+                if msg["unmerge"] == 0:
+                    train_unrolls += 1
             if msg["unmerge"] == 1:
                 train_unmerges += 1
                 _pf_key = f"{msg['benchmark']}|{msg['loop_idx']}"
@@ -1494,6 +1516,7 @@ def run_parallel_epoch(
     val_cache_hits = 0
     val_noops      = 0
     val_unmerges   = 0
+    val_unrolls    = 0
     if val_loop_assignments:
         val_per_worker = assign_loops_to_workers(val_loop_assignments, n_workers)
         val_weights = _get_weights(agent)
@@ -1551,6 +1574,8 @@ def run_parallel_epoch(
                     reward_cache[
                         f"{msg['benchmark']}|{msg['loop_idx']}|{msg['unmerge']}|{msg['factor']}"
                     ] = msg["reward"]
+                    if msg.get("unmerge") == 0:
+                        val_unrolls += 1
                 if msg.get("unmerge") == 1:
                     val_unmerges += 1
                 if msg.get("cached"):
@@ -1616,6 +1641,7 @@ def run_parallel_epoch(
         "train_updates":       train_updates,
         "train_noop_rate":     train_noops / _n_s,
         "train_unmerge_rate":  train_unmerges / _n_s,
+        "train_unroll_rate":   train_unrolls / _n_s,
         "train_cache_hit_rate": train_cache_hits / _n_s,
         "val_avg_reward":      val_avg_reward,
         "val_avg_advantage":   val_avg_advantage,
@@ -1624,6 +1650,7 @@ def run_parallel_epoch(
         "val_cache_hit_rate":  val_cache_hits / max(val_samples, 1),
         "val_noop_rate":       val_noops / max(val_samples, 1),
         "val_unmerge_rate":    val_unmerges / max(val_samples, 1),
+        "val_unroll_rate":     val_unrolls / max(val_samples, 1),
         "val_per_benchmark":   val_per_benchmark,
     }
     return epoch_stats, [], []
@@ -1859,6 +1886,7 @@ def main() -> None:
                 "train_entropy":       round(epoch_stats["train_entropy"], 6),
                 "train_noop_rate":     round(epoch_stats["train_noop_rate"], 6),
                 "train_unmerge_rate":  round(epoch_stats["train_unmerge_rate"], 6),
+                "train_unroll_rate":   round(epoch_stats["train_unroll_rate"], 6),
                 "train_cache_hit_rate": round(epoch_stats["train_cache_hit_rate"], 6),
                 "val_avg_reward":      round(epoch_stats["val_avg_reward"]
                                             if epoch_stats["val_avg_reward"] == epoch_stats["val_avg_reward"]
@@ -1871,6 +1899,7 @@ def main() -> None:
                 "val_cache_hit_rate":  round(epoch_stats["val_cache_hit_rate"], 6),
                 "val_noop_rate":       round(epoch_stats["val_noop_rate"], 6),
                 "val_unmerge_rate":    round(epoch_stats["val_unmerge_rate"], 6),
+                "val_unroll_rate":     round(epoch_stats["val_unroll_rate"], 6),
                 "entropy_coef":        round(agent.entropy_coef, 6),
             })
 
@@ -1918,25 +1947,28 @@ def main() -> None:
 
                     unmerge, log_p1 = agent.select_unmerge(pre_features)
 
-                    # Study A: unmerge==0 → no-op (reward 0, no factor, no
-                    # compile); factor_active=False. unmerge==1 → factor + UU.
+                    # Study A action space {no-op, unroll-only, unmerge(+unroll)}:
+                    # the FactorActor decides on both branches; only its input
+                    # state differs (post-unmerge vs. pre-unmerge features).
+                    # Trip count is invariant under unmerge, so the pre-features
+                    # mask is valid for the unroll-only branch.
                     if unmerge == 1:
                         try:
                             step2_features = env.get_post_unmerge_features(loop_record).to(device)
                         except Exception as e:
                             log.debug("post-unmerge feature extraction failed: %s", e)
                             step2_features = pre_features
-                        factor_idx, log_p2, mask2 = agent.select_factor(
-                            step2_features,
-                            trip_known=loop_record.trip_count_known,
-                            trip_count=loop_record.trip_count,
-                            loop_idx=loop_record.loop_idx,
-                        )
-                        factor_active = True
                     else:
                         step2_features = pre_features
-                        factor_idx, log_p2, mask2 = 0, _ZERO_LOGP, None
-                        factor_active = False
+                    factor_idx, log_p2, mask2 = agent.select_factor(
+                        step2_features,
+                        trip_known=loop_record.trip_count_known,
+                        trip_count=loop_record.trip_count,
+                        loop_idx=loop_record.loop_idx,
+                    )
+                    # Pure no-op (unmerge==0, factor==1) has no unroll decision to
+                    # learn, so the FactorActor is not trained on it.
+                    factor_active = not (unmerge == 0 and FACTOR_VALUES[factor_idx] == 1)
 
                     try:
                         next_features, reward, done = env.step(loop_record, unmerge, factor_idx)

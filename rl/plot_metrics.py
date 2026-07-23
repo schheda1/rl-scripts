@@ -187,7 +187,13 @@ def _plot_decision_mix(df: pd.DataFrame, outdir: Path, *, prefix: str, title: st
     e = df["epoch"]
     unmerge = df[ncol2] * 100
     noop    = df[ncol] * 100
-    unroll  = 100 - unmerge - noop
+    # Prefer the explicit unroll-only column (newer metrics schema); fall back
+    # to the residual (100 - unmerge - noop) for older runs that predate it.
+    ncol3 = f"{prefix}_unroll_rate"
+    if ncol3 in df.columns and not df[ncol3].isna().all():
+        unroll = df[ncol3] * 100
+    else:
+        unroll = 100 - unmerge - noop
 
     ax.plot(e, unroll, color=AQUA, lw=2, marker="o", ms=5,
             label="Lightweight unroll-only", zorder=3)
