@@ -208,6 +208,9 @@ class RolloutEntry:
     reward: float
     mask2: Optional[torch.Tensor] = None  # factor mask at collection time
                                           # (bool, (N_FACTORS,)); None = all valid
+    factor_active: bool = True            # Study A: False when unmerge==0 (no-op,
+                                          # no factor chosen) — the FactorActor is
+                                          # not trained on these samples.
 
 
 class RolloutBuffer:
@@ -351,33 +354,42 @@ class Agent:
                     for e in batch
                 ]).to(self.device)
 
+                # Study A: the FactorActor only decided on unmerge==1 samples;
+                # unmerge==0 is a no-op with no factor.  Train / measure entropy
+                # of the FactorActor ONLY over factor-active samples, so no-op
+                # samples don't push its distribution around.
+                fa = torch.tensor([e.factor_active for e in batch],
+                                  dtype=torch.bool, device=self.device)
+
                 # Critic forward (not detached — value loss trains the critic)
                 values = self.critic.value(s1)
 
                 # Advantage: use critic baseline, normalised by buffer-level stats
                 adv = ((r - values.detach()) - adv_mean) / adv_std
 
-                # Clipped actor losses.  The factor actor's new log-probs are
-                # computed under the SAME mask used at collection time so the
-                # PPO ratio compares like-for-like distributions.
+                # UnmergeActor loss over ALL samples.
                 new_lp1 = self.unmerge_actor.log_prob(s1, a1)
-                new_lp2 = self.factor_actor.log_prob(s2, a2, mask=m2)
                 actor_loss = _clipped_pg_loss(new_lp1, old_lp1, adv, self.clip_eps)
-                actor_loss = actor_loss + _clipped_pg_loss(new_lp2, old_lp2, adv, self.clip_eps)
 
-                # Entropy bonus — computed from CURRENT policy logits (not old
-                # log-probs) so it reflects the policy being updated this step.
-                # Subtracted from total loss to maximise entropy (encourage
-                # exploration).  Tracked separately so training logs can show
-                # whether the policy is collapsing prematurely.
-                # Factor entropy respects the collection-time mask: invalid
-                # factors carry zero probability, so pushing entropy toward
-                # them would be pushing probability mass onto unreachable actions.
-                factor_logits = self.factor_actor.forward(s2).masked_fill(
-                    ~m2, float("-inf")
-                )
+                # FactorActor loss over factor-active samples only.  New log-probs
+                # use the SAME mask as at collection time so the PPO ratio compares
+                # like-for-like distributions.
+                if fa.any():
+                    new_lp2 = self.factor_actor.log_prob(s2[fa], a2[fa], mask=m2[fa])
+                    actor_loss = actor_loss + _clipped_pg_loss(
+                        new_lp2, old_lp2[fa], adv[fa], self.clip_eps)
+
+                # Entropy bonus — from CURRENT policy logits (encourages
+                # exploration; tracked to watch for premature collapse).
+                # Unmerge entropy over all samples; factor entropy over active
+                # ones only, respecting the collection-time mask.
                 entropy1 = _policy_entropy(self.unmerge_actor.forward(s1))
-                entropy2 = _policy_entropy(factor_logits)
+                if fa.any():
+                    factor_logits = self.factor_actor.forward(s2[fa]).masked_fill(
+                        ~m2[fa], float("-inf"))
+                    entropy2 = _policy_entropy(factor_logits)
+                else:
+                    entropy2 = torch.zeros((), device=self.device)
                 entropy = entropy1 + entropy2
 
                 # Critic (value) loss: MSE against actual rewards

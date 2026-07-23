@@ -140,60 +140,70 @@ def main() -> None:
             novelty = min_distance(lr.pre_features.tolist(), train_matrix)
 
             unmerge, lp1 = agent.select_unmerge(pre, greedy=True)
-            if unmerge == 1:
-                pf = postf_cache.get(f"{bench.name}|{lr.loop_idx}")
-                if pf is not None:
-                    step2 = torch.tensor(pf, dtype=torch.float32).to(device)
-                else:
-                    try:
-                        step2 = env.get_post_unmerge_features(lr).to(device)
-                    except Exception:
-                        step2 = pre
+            # Study A: unmerge==0 is a pure no-op — no factor decision, reward 0.
+            # (Selecting a factor here and compiling unmerge=0,factor>1 would
+            # invoke the confounded unroll-only path and misreport the reward.)
+            if unmerge == 0:
+                factor_idx, factor = 0, 1
+                confidence = float(torch.exp(lp1))
+                reward, cached = 0.0, True
+                loop_rows.append({
+                    "benchmark": bench.name, "loop_idx": lr.loop_idx,
+                    "unmerge": 0, "factor": 1,
+                    "reward": 0.0, "value": round(value, 6),
+                    "novelty": round(novelty, 4),
+                    "confidence": round(confidence, 4), "cached": 1,
+                })
+                continue
+
+            pf = postf_cache.get(f"{bench.name}|{lr.loop_idx}")
+            if pf is not None:
+                step2 = torch.tensor(pf, dtype=torch.float32).to(device)
             else:
-                step2 = pre
+                try:
+                    step2 = env.get_post_unmerge_features(lr).to(device)
+                except Exception:
+                    step2 = pre
             factor_idx, lp2, _ = agent.select_factor(
                 step2, trip_known=lr.trip_count_known,
                 trip_count=lr.trip_count, loop_idx=lr.loop_idx, greedy=True)
             factor = FACTOR_VALUES[factor_idx]
             confidence = float(torch.exp(lp1) * torch.exp(lp2))
 
-            # --- Reward: no-op → 0; else cache → measure ---
+            # --- Reward (unmerge==1 only): cache → measure ---
             cached = True
-            if unmerge == 0 and factor == 1:
-                reward = 0.0
+            key = f"{bench.name}|{lr.loop_idx}|{unmerge}|{factor}"
+            hit = reward_cache.get(key)
+            if hit is not None:
+                reward = float(hit)
             else:
-                key = f"{bench.name}|{lr.loop_idx}|{unmerge}|{factor}"
-                hit = reward_cache.get(key)
-                if hit is not None:
-                    reward = float(hit)
-                else:
-                    cached = False
-                    fresh += 1
-                    kernel_filter, baseline_ms = env._resolve_measurement(lr)
+                cached = False
+                fresh += 1
+                kernel_filter, baseline_ms = env._resolve_measurement(lr)
+                try:
+                    ok = compile_single_loop(
+                        env._benchmark_dir, loop_idx=lr.loop_idx,
+                        unmerge=unmerge, factor=factor,
+                        filename=lr.filename, triple=lr.triple,
+                        arch=args.arch)
+                except subprocess.TimeoutExpired:
+                    ok, reward = False, -1.0
+                if ok:
                     try:
-                        ok = compile_single_loop(
-                            env._benchmark_dir, loop_idx=lr.loop_idx,
-                            unmerge=unmerge, factor=factor,
-                            filename=lr.filename, triple=lr.triple,
-                            arch=args.arch)
-                    except subprocess.TimeoutExpired:
-                        ok, reward = False, -1.0
-                    if ok:
-                        try:
-                            modified = measure_kernel_time(
-                                env._benchmark_dir, arch=args.arch,
-                                n_runs=args.n_runs,
-                                nsys_timeout=args.nsys_timeout,
-                                tmp_dir=tmp_dir, gpu_id=args.gpu_id,
-                                kernel_filter=kernel_filter)
-                            reward = max(
-                                (baseline_ms - modified) / max(baseline_ms, 1e-9),
-                                -1.0)
-                        except RuntimeError:
-                            reward = 0.0
-                    elif reward != -1.0:
-                        reward = 0.0     # compile error → no-op fallback
-                    reward_cache[key] = reward
+                        modified = measure_kernel_time(
+                            env._benchmark_dir, arch=args.arch,
+                            n_runs=args.n_runs,
+                            nsys_timeout=args.nsys_timeout,
+                            tmp_dir=tmp_dir, gpu_id=args.gpu_id,
+                            kernel_filter=kernel_filter)
+                        reward = max(
+                            (baseline_ms - modified) / max(baseline_ms, 1e-9),
+                            -1.0)
+                    except RuntimeError:
+                        reward = 0.0
+                elif reward != -1.0:
+                    reward = 0.0     # compile error → no-op fallback
+                reward_cache[key] = reward
 
             loop_rows.append({
                 "benchmark": bench.name, "loop_idx": lr.loop_idx,

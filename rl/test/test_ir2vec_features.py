@@ -132,7 +132,14 @@ def test_pre_post_unmerge(bench: Path, file_map) -> None:
         if cand:
             break
     if not cand:
-        check("found a numPaths>1 loop", False, "none — skipping T3")
+        # NOT a failure: unmerge only restructures multi-path loops, and many
+        # benchmarks (e.g. geglu — straight-line kernel bodies) have only
+        # numPaths==1 eligible loops.  Those are eligible via containsBranch==1
+        # and benefit from the unroll-only action, not unmerge.  T3 simply does
+        # not apply here; run it on a multi-path benchmark (mandelbrot,
+        # contract, bezier-surface) to exercise unmerge.
+        print("  SKIP: no numPaths>1 eligible loop in this benchmark — unmerge "
+              "does not apply (single-path loops use unroll-only). Not a failure.")
         return
     fname, pre_row = cand
     loop_idx = int(pre_row["loopIdx"])

@@ -300,6 +300,16 @@ def compile_multi_loop(
 IR2VEC_DIM = 75
 _EMB_COLUMNS = [f"emb{i}" for i in range(IR2VEC_DIM)]
 
+# --- Study A (unmerge) eligibility ---------------------------------------
+# Study A isolates "when is unmerging appropriate": only loops with divergent
+# control flow (numPaths > 1) can be meaningfully unmerged.  The upper bound
+# matches the original UU heuristic cap (canUnrollAndUnmerge skips numPaths>16);
+# beyond it, path duplication blows up code size and compiles mostly time out.
+# NUMPATHS_MIN=1 (exclusive lower bound via > ) disables the Study-A restriction
+# and recovers the broad filter.  Overridable via the STUDY_A_NUMPATHS_MAX env.
+STUDY_A_NUMPATHS_MIN = 1          # eligible requires numPaths > this
+STUDY_A_NUMPATHS_MAX = int(os.environ.get("STUDY_A_NUMPATHS_MAX", "16"))
+
 LOOPCOUNT_COLUMNS = [
     "loopIdx", "loopDepth", "startLine", "startCol", "startIsImplicitCode",
     "endLine", "endCol", "endIsImplicitCode", "function", "numPaths",
@@ -418,6 +428,10 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
             df["kernelParents"].notna()
             & (df["kernelParents"].astype(str).str.strip() != "")
         )
+        # Study A: only divergent-control-flow loops (numPaths in (1, MAX]) are
+        # eligible — unmerge is a no-op on single-path loops, and very high path
+        # counts explode under specialisation.  numPaths already parsed as float.
+        _np = df["numPaths"].astype(float)
         mask = (
             (df["duplicatable"] == 1.0)
             & (df["containsBarrier"] == 0.0)
@@ -425,6 +439,8 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
             & df["function"].notna()
             & (df["function"] != "")
             & (is_kernel | has_parents)
+            & (_np > STUDY_A_NUMPATHS_MIN)
+            & (_np <= STUDY_A_NUMPATHS_MAX)
         )
         df_ok = df[mask].reset_index(drop=True)
         if len(df_ok) > 0:

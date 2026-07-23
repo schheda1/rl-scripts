@@ -45,12 +45,28 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from agent import Agent, RolloutBuffer, RolloutEntry, FACTOR_VALUES, N_FEATURES
 from environment import GpuLoopEnv
-from hecbench import ARCH, FEATURE_COLUMNS, discover_benchmarks
+from hecbench import (
+    ARCH, FEATURE_COLUMNS, STUDY_A_NUMPATHS_MIN, STUDY_A_NUMPATHS_MAX,
+    discover_benchmarks,
+)
 
 # Bump when the feature schema changes so a --skip-precheck run cannot load a
 # cache whose pre_features_raw / normalizer are the wrong dimensionality.
 # v1 = 18 structural features; v2 = 18 structural + 75 IR2Vec embeddings.
 FEATURES_VERSION = 2
+
+# Eligibility marker: changing which loops are eligible (e.g. Study A's
+# numPaths>1 gate) does NOT change feature dims, so FEATURES_VERSION won't
+# catch a stale precheck cache reused via --skip-precheck.  Derived from the
+# actual bounds so a changed STUDY_A_NUMPATHS_MAX env var invalidates the cache.
+ELIGIBILITY_VERSION = (
+    f"studyA:numPaths>{STUDY_A_NUMPATHS_MIN},<={STUDY_A_NUMPATHS_MAX}"
+)
+
+# Placeholder factor log-prob for no-op (unmerge==0) rollout entries — never
+# used in the PPO update (factor_active=False masks it out), but RolloutEntry
+# needs a tensor.
+_ZERO_LOGP = torch.zeros(())
 
 
 class _EpochFilter(logging.Filter):
@@ -234,6 +250,17 @@ def precheck_benchmarks(
                     data.get("features_version"), FEATURES_VERSION,
                 )
                 raise ValueError("stale features_version")
+            # Eligibility guard: changing the eligible loop SET (Study A's
+            # numPaths>1 gate) does not change feature dims, so it slips past the
+            # features_version check.  A mismatch means the cache holds a
+            # different loop population — discard and re-run.
+            if data.get("eligibility_version") != ELIGIBILITY_VERSION:
+                log.warning(
+                    "Precheck cache eligibility_version=%s != %s — eligible loop "
+                    "set changed; discarding cache and re-running the pre-flight check.",
+                    data.get("eligibility_version"), ELIGIBILITY_VERSION,
+                )
+                raise ValueError("stale eligibility_version")
             eligible_names = set(data["eligible"])
             loop_counts: dict[str, int] = data.get("loop_counts", {})
             loop_records_map: dict[str, list[dict]] = data.get("loop_records", {})
@@ -346,6 +373,7 @@ def precheck_benchmarks(
         cache_file.write_text(json.dumps({
             "checked_at": datetime.now().isoformat(),
             "features_version": FEATURES_VERSION,
+            "eligibility_version": ELIGIBILITY_VERSION,
             "eligible": [b.name for b in eligible],
             "loop_counts": loop_counts,
             "loop_records": loop_records_map,
@@ -610,21 +638,22 @@ def evaluate(
             # not a sample from the exploration distribution.
             unmerge, _ = agent.select_unmerge(pre_features, greedy=greedy)
 
+            # Study A: unmerge==0 is a pure no-op — no factor, reward 0, done via
+            # env.step's own no-op fast path (factor_idx=0 → factor=1).
             if unmerge == 1:
                 try:
                     step2_features = env.get_post_unmerge_features(loop_record).to(device)
                 except Exception:
                     step2_features = pre_features
+                factor_idx, _, _ = agent.select_factor(
+                    step2_features,
+                    trip_known=loop_record.trip_count_known,
+                    trip_count=loop_record.trip_count,
+                    loop_idx=loop_record.loop_idx,
+                    greedy=greedy,
+                )
             else:
-                step2_features = pre_features
-
-            factor_idx, _, _ = agent.select_factor(
-                step2_features,
-                trip_known=loop_record.trip_count_known,
-                trip_count=loop_record.trip_count,
-                loop_idx=loop_record.loop_idx,
-                greedy=greedy,
-            )
+                factor_idx = 0   # FACTOR_VALUES[0] == 1 → env.step no-op
 
             try:
                 _, reward, done = env.step(loop_record, unmerge, factor_idx)
@@ -1067,23 +1096,35 @@ def _worker_fn(
                 greedy = (mode == "eval")
                 unmerge, log_p1 = agent.select_unmerge(pre_features, greedy=greedy)
 
-                if unmerge == 1:
-                    # Post-unmerge features are deterministic per loop —
-                    # cache hits skip the 2-compile feature extraction.
-                    _pf = postf_cache.get(f"{bench_name}|{loop_idx}")
-                    if _pf is not None:
-                        step2_features = torch.tensor(
-                            _pf, dtype=torch.float32
-                        ).to(device)
-                    else:
-                        try:
-                            step2_features = env.get_post_unmerge_features(
-                                loop_record
-                            ).to(device)
-                        except Exception:
-                            step2_features = pre_features
+                # Study A: factor magnifies unmerge only.  unmerge==0 is a pure
+                # no-op (leave the loop alone) — no factor decision, reward 0 by
+                # construction, no compile.  The FactorActor is not consulted and
+                # not trained on these samples (factor_active=False).
+                if unmerge == 0:
+                    v = agent.predict_value(pre_features)
+                    _send_loop_result(
+                        result_q, mode, rank, bench_name, loop_idx,
+                        0, 1, 0.0, v, False,
+                        pre_features, pre_features, 0,
+                        log_p1, _ZERO_LOGP, None,
+                        cached=False, factor_active=False,
+                    )
+                    continue
+
+                # unmerge == 1: post-unmerge features (deterministic per loop —
+                # cache hits skip the 2-compile feature extraction), then factor.
+                _pf = postf_cache.get(f"{bench_name}|{loop_idx}")
+                if _pf is not None:
+                    step2_features = torch.tensor(
+                        _pf, dtype=torch.float32
+                    ).to(device)
                 else:
-                    step2_features = pre_features
+                    try:
+                        step2_features = env.get_post_unmerge_features(
+                            loop_record
+                        ).to(device)
+                    except Exception:
+                        step2_features = pre_features
 
                 factor_idx, log_p2, mask2 = agent.select_factor(
                     step2_features,
@@ -1094,16 +1135,12 @@ def _worker_fn(
                 )
                 factor = FACTOR_VALUES[factor_idx]
 
-                # --- Compile + measure ---
+                # --- Compile + measure (unmerge=1, factor) ---
                 is_timeout = False
                 from_cache = False
                 _rc_key = f"{bench_name}|{loop_idx}|{unmerge}|{factor}"
                 _rc_hit = reward_cache.get(_rc_key)
-                if unmerge == 0 and factor == 1:
-                    # No-op: reward is exactly 0 by definition; skip
-                    # compilation and measurement entirely.
-                    reward = 0.0
-                elif _rc_hit is not None:
+                if _rc_hit is not None:
                     # Cross-epoch cache hit: the action is still sampled fresh
                     # from the current policy (on-policy log-probs above);
                     # only the deterministic compile+measure is memoized.
@@ -1134,7 +1171,7 @@ def _worker_fn(
                             result_q, mode, rank, bench_name, loop_idx,
                             unmerge, factor, reward, v, is_timeout,
                             pre_features, step2_features, factor_idx,
-                            log_p1, log_p2, mask2,
+                            log_p1, log_p2, mask2, factor_active=True,
                         )
                         continue
 
@@ -1173,6 +1210,7 @@ def _worker_fn(
                     unmerge, factor, reward, v, is_timeout,
                     pre_features, step2_features, factor_idx,
                     log_p1, log_p2, mask2, cached=from_cache,
+                    factor_active=True,
                 )
 
     finally:
@@ -1197,6 +1235,7 @@ def _send_loop_result(
     log_p2,
     mask2=None,
     cached: bool = False,
+    factor_active: bool = True,
 ) -> None:
     """Put one loop result onto result_q in the appropriate format."""
     import torch
@@ -1213,6 +1252,7 @@ def _send_loop_result(
                 log_prob2=log_p2.cpu(),
                 reward=reward,
                 mask2=mask2.cpu() if mask2 is not None else None,
+                factor_active=factor_active,
             ),
             "benchmark": bench_name,
             "loop_idx":  loop_idx,
@@ -1878,21 +1918,25 @@ def main() -> None:
 
                     unmerge, log_p1 = agent.select_unmerge(pre_features)
 
+                    # Study A: unmerge==0 → no-op (reward 0, no factor, no
+                    # compile); factor_active=False. unmerge==1 → factor + UU.
                     if unmerge == 1:
                         try:
                             step2_features = env.get_post_unmerge_features(loop_record).to(device)
                         except Exception as e:
                             log.debug("post-unmerge feature extraction failed: %s", e)
                             step2_features = pre_features
+                        factor_idx, log_p2, mask2 = agent.select_factor(
+                            step2_features,
+                            trip_known=loop_record.trip_count_known,
+                            trip_count=loop_record.trip_count,
+                            loop_idx=loop_record.loop_idx,
+                        )
+                        factor_active = True
                     else:
                         step2_features = pre_features
-
-                    factor_idx, log_p2, mask2 = agent.select_factor(
-                        step2_features,
-                        trip_known=loop_record.trip_count_known,
-                        trip_count=loop_record.trip_count,
-                        loop_idx=loop_record.loop_idx,
-                    )
+                        factor_idx, log_p2, mask2 = 0, _ZERO_LOGP, None
+                        factor_active = False
 
                     try:
                         next_features, reward, done = env.step(loop_record, unmerge, factor_idx)
@@ -1928,7 +1972,8 @@ def main() -> None:
                         log_prob1=log_p1.cpu(),
                         log_prob2=log_p2.cpu(),
                         reward=reward,
-                        mask2=mask2.cpu(),
+                        mask2=mask2.cpu() if mask2 is not None else None,
+                        factor_active=factor_active,
                     ))
 
                     if buffer.full():
