@@ -68,6 +68,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-runs", type=int, default=2)
     p.add_argument("--nsys-timeout", type=int, default=300)
     p.add_argument("--gpu-id", type=int, default=0)
+    # Must match the training run's reward encoding, or the numbers
+    # are computed on a different scale than the policy was trained on.
+    p.add_argument("--compile-failure-penalty", type=float, default=-0.25)
+    p.add_argument("--reward-deadzone", type=float, default=0.01)
     p.add_argument("--hecbench-src", default=None)
     p.add_argument("--tmp-dir", default=None)
     return p.parse_args()
@@ -117,6 +121,8 @@ def main() -> None:
     # ── Env + agent ───────────────────────────────────────────────────────
     env = GpuLoopEnv(arch=args.arch, n_runs=args.n_runs,
                      nsys_timeout=args.nsys_timeout, tmp_dir=tmp_dir,
+                     compile_failure_penalty=args.compile_failure_penalty,
+                     reward_deadzone=args.reward_deadzone,
                      gpu_id=args.gpu_id, normalizer=normalizer,
                      baseline_cache=baseline_cache)
     agent = Agent(device=device)
@@ -201,11 +207,23 @@ def main() -> None:
                         reward = max(
                             (baseline_ms - modified) / max(baseline_ms, 1e-9),
                             -1.0)
+                        # Deadzone: |r| under the noise floor is not signal.
+                        if args.reward_deadzone > 0 and abs(reward) < args.reward_deadzone:
+                            reward = 0.0
+                        cacheable = True
                     except RuntimeError:
-                        reward = 0.0
-                elif reward != -1.0:
-                    reward = 0.0     # compile error → no-op fallback
-                reward_cache[key] = reward
+                        # Measurement failure — infrastructure, not the action's
+                        # fault.  Score 0 and do NOT cache (may be transient).
+                        reward, cacheable = 0.0, False
+                elif reward == -1.0:
+                    cacheable = True                     # compile timeout
+                else:
+                    # Compile failure — same penalty training uses, so the gate
+                    # curves sit on the reward scale the policy was trained on.
+                    reward, cacheable = args.compile_failure_penalty, True
+
+                if cacheable:
+                    reward_cache[key] = reward
 
             loop_rows.append({
                 "benchmark": bench.name, "loop_idx": lr.loop_idx,

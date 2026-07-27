@@ -76,6 +76,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--nsys-timeout", type=int, default=300)
     p.add_argument("--gpu-id", type=int, default=0)
     p.add_argument("--compile-timeout-penalty", type=float, default=-1.0)
+    # Must match the training run's reward encoding, or the numbers
+    # are computed on a different scale than the policy was trained on.
+    p.add_argument("--compile-failure-penalty", type=float, default=-0.25)
+    p.add_argument("--reward-deadzone", type=float, default=0.01)
     p.add_argument("--tmp-dir", default=None,
                    help="Temp dir for nsys reports (default: {run-dir}/eval_tmp)")
     p.add_argument("--hecbench-src", default=None)
@@ -145,6 +149,8 @@ def main() -> None:
         nsys_timeout=args.nsys_timeout,
         tmp_dir=tmp_dir,
         compile_timeout_penalty=args.compile_timeout_penalty,
+        compile_failure_penalty=args.compile_failure_penalty,
+        reward_deadzone=args.reward_deadzone,
         gpu_id=args.gpu_id,
         normalizer=normalizer,
         baseline_cache=baseline_cache,

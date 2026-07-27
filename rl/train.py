@@ -125,6 +125,22 @@ def parse_args() -> argparse.Namespace:
                    help="Reward assigned when compilation times out due to SCEV/unroll "
                         "complexity. Should be negative to discourage large factors. "
                         "(default: -1.0)")
+    p.add_argument("--compile-failure-penalty", type=float, default=-0.25,
+                   help="Reward assigned when compilation FAILS (not a timeout). "
+                        "Previously 0.0, which is indistinguishable from a genuine "
+                        "no-effect transform — the agent could not learn to avoid "
+                        "over-aggressive actions. Must rank below no-op (0.0); kept "
+                        "well above -1.0 so the ~36%% failure mass does not swamp the "
+                        "genuine slowdown signal. (default: -0.25)")
+    p.add_argument("--reward-deadzone", type=float, default=0.01,
+                   help="Rewards with |r| below this are treated as measurement noise "
+                        "and set to exactly 0.0. Applied AFTER failure penalties, so "
+                        "penalties are never zeroed. Set 0 to disable. (default: 0.01)")
+    p.add_argument("--test-checkpoints", type=str, default="best,last",
+                   help="Which checkpoints to run the final test evaluation on: "
+                        "comma-separated from {best,last} or explicit .pt paths. "
+                        "'best' guards against best-val being picked early; 'last' "
+                        "shows the converged policy. (default: best,last)")
     p.add_argument("--arch", type=str, default=ARCH)
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--checkpoint-every", type=int, default=1,
@@ -627,6 +643,7 @@ def evaluate(
     all_advantages: list[float] = []
     per_benchmark: list[dict] = []
     failed: list[Path] = []
+    failures: list[dict] = []   # compile failures, reported separately
     samples = 0
     missed = 0
 
@@ -693,6 +710,26 @@ def evaluate(
             status = getattr(env, "last_status", "ok")
             bmark_status[status] = bmark_status.get(status, 0) + 1
 
+            # Excluded from the REPORTED statistics (training still saw the
+            # penalty — see the methodology note):
+            #   measure_failed  — infrastructure, not a result
+            #   compile_failed  — a transform-coverage limitation, studied
+            #                     separately via the CPU-only remark analysis
+            if status in ("measure_failed", "compile_failed"):
+                if status == "compile_failed":
+                    failures.append({
+                        "benchmark": benchmark_dir.name,
+                        "loop_idx":  loop_record.loop_idx,
+                        "unmerge":   unmerge,
+                        "factor":    FACTOR_VALUES[factor_idx],
+                        "error_signature": getattr(env, "last_error", ""),
+                    })
+                else:
+                    missed += 1
+                if done:
+                    break
+                continue
+
             v = agent.predict_value(pre_features)
             log.info(
                 "  [%s] %s loop_idx=%d unmerge=%d factor=%d "
@@ -711,9 +748,11 @@ def evaluate(
                 break
 
         if bmark_rewards:
-            # no_signal = loops whose reward is 0.0 only because the toolchain
-            # failed, NOT because the transform was neutral.  Without this the
-            # two are indistinguishable and inflate the "neutral" verdict.
+            # no_signal = loops excluded from the statistics because the
+            # toolchain failed to measure them.  NOTE: compile failures are NOT
+            # no-signal any more — they are scored with an explicit penalty, so
+            # they are a real (negative) result.  Only measurement failures,
+            # which are dropped, count as no-signal.
             n_fail    = bmark_status.get("compile_failed", 0)
             n_timeout = bmark_status.get("compile_timeout", 0)
             n_measfail = bmark_status.get("measure_failed", 0)
@@ -730,7 +769,7 @@ def evaluate(
                 "compile_failed":   n_fail,
                 "compile_timeout":  n_timeout,
                 "measure_failed":   n_measfail,
-                "no_signal":        n_fail + n_measfail,
+                "no_signal":        n_measfail,   # compile failures are scored, not no-signal
             })
             if n_fail or n_timeout or n_measfail:
                 log.warning(
@@ -749,6 +788,7 @@ def evaluate(
         f"{label}_samples":       samples,
         f"{label}_missed":        missed,
         f"{label}_per_benchmark": per_benchmark,
+        f"{label}_compile_failures": failures,
     }
     return metrics, failed
 
@@ -965,7 +1005,7 @@ def _worker_fn(
         _IDX_TRIP_COUNT_KNOWN, _IDX_TRIP_COUNT,
     )
     from environment import GpuLoopEnv, LoopRecord
-    from hecbench import FeatureNormalizer, compile_single_loop, demangle, demangled_to_filter, measure_kernel_time
+    from hecbench import FeatureNormalizer, compile_single_loop_ex, demangle, demangled_to_filter, measure_kernel_time
 
     _epoch = hparams.get("epoch", 0)
     _total = hparams.get("total_epochs", 0)
@@ -1197,6 +1237,7 @@ def _worker_fn(
                 # --- Compile + measure (unmerge, factor) ---
                 is_timeout = False
                 from_cache = False
+                status = "ok"
                 _rc_key = f"{bench_name}|{loop_idx}|{unmerge}|{factor}"
                 _rc_hit = reward_cache.get(_rc_key)
                 if _rc_hit is not None:
@@ -1208,8 +1249,9 @@ def _worker_fn(
                     reward = float(_rc_hit)
                     from_cache = True
                 else:
+                    err_sig = ""
                     try:
-                        ok = compile_single_loop(
+                        ok, err_sig = compile_single_loop_ex(
                             copy_dir,
                             loop_idx=loop_idx,
                             unmerge=unmerge,
@@ -1222,8 +1264,9 @@ def _worker_fn(
                         reward    = hparams["compile_timeout_penalty"]
                         is_timeout = True
                         _log.warning(
-                            "%s loop_idx=%d compile timeout — penalty=%.2f",
-                            bench_name, loop_idx, reward,
+                            "%s loop_idx=%d unmerge=%d factor=%d — COMPILE TIMEOUT "
+                            "(penalty=%.2f)",
+                            bench_name, loop_idx, unmerge, factor, reward,
                         )
                         v = agent.predict_value(pre_features)
                         _send_loop_result(
@@ -1231,12 +1274,24 @@ def _worker_fn(
                             unmerge, factor, reward, v, is_timeout,
                             pre_features, step2_features, factor_idx,
                             log_p1, log_p2, mask2, factor_active=True,
+                            status="compile_timeout", error="compile timeout",
                         )
+                        reward_cache[_rc_key] = reward
                         continue
 
                     if not ok:
-                        # Compile error — treat as no-op (no training signal)
-                        modified_ms = baseline_ms
+                        # Compile FAILED.  Previously scored 0.0, which is
+                        # indistinguishable from a genuine no-effect transform —
+                        # so the agent could never learn to avoid over-aggressive
+                        # actions.  Now an explicit penalty: the action is
+                        # unusable, and must rank below declining to transform.
+                        status = "compile_failed"
+                        reward = hparams["compile_failure_penalty"]
+                        _log.warning(
+                            "%s loop_idx=%d unmerge=%d factor=%d — COMPILE FAILED "
+                            "(penalty=%.2f)",
+                            bench_name, loop_idx, unmerge, factor, reward,
+                        )
                     else:
                         try:
                             modified_ms = measure_kernel_time(
@@ -1249,19 +1304,38 @@ def _worker_fn(
                                 kernel_filter=kernel_filter,
                             )
                         except RuntimeError:
-                            modified_ms = baseline_ms
+                            # Measurement failure is INFRASTRUCTURE, not the
+                            # action's fault — penalising would teach the agent
+                            # to avoid a perfectly good action.  Drop the sample
+                            # entirely and do NOT cache it (may be transient).
+                            _log.warning(
+                                "%s loop_idx=%d unmerge=%d factor=%d — MEASUREMENT "
+                                "FAILED, sample dropped (not cached)",
+                                bench_name, loop_idx, unmerge, factor,
+                            )
+                            result_q.put({"type": "step_failed",
+                                          "loop_idx": loop_idx, "rank": rank})
+                            continue
 
-                    # Clip at -1.0 (the timeout-penalty scale): a pathological
-                    # slowdown (observed: -52 on wlcpow) would otherwise
-                    # dominate the normalised advantages of its whole PPO
-                    # buffer.  Upside is bounded at 1.0 by construction.
-                    reward_raw = (baseline_ms - modified_ms) / max(baseline_ms, 1e-9)
-                    reward = max(reward_raw, -1.0)
-                    if reward_raw < -1.0:
-                        _log.warning(
-                            "%s loop_idx=%d reward %.2f clipped to -1.0",
-                            bench_name, loop_idx, reward_raw,
-                        )
+                        # Clip at -1.0 (the timeout-penalty scale): a pathological
+                        # slowdown (observed: -52 on wlcpow) would otherwise
+                        # dominate the normalised advantages of its whole PPO
+                        # buffer.  Upside is bounded at 1.0 by construction.
+                        reward_raw = (baseline_ms - modified_ms) / max(baseline_ms, 1e-9)
+                        reward = max(reward_raw, -1.0)
+                        if reward_raw < -1.0:
+                            _log.warning(
+                                "%s loop_idx=%d reward %.2f clipped to -1.0",
+                                bench_name, loop_idx, reward_raw,
+                            )
+                        # Deadzone: |r| below the measurement-noise floor is not
+                        # signal.  Applied only to measured rewards — never to
+                        # failure/timeout penalties.
+                        _dz = hparams.get("reward_deadzone", 0.0)
+                        if _dz > 0 and abs(reward) < _dz:
+                            reward = 0.0
+
+                    reward_cache[_rc_key] = reward
 
                 v = agent.predict_value(pre_features)
                 _send_loop_result(
@@ -1269,7 +1343,7 @@ def _worker_fn(
                     unmerge, factor, reward, v, is_timeout,
                     pre_features, step2_features, factor_idx,
                     log_p1, log_p2, mask2, cached=from_cache,
-                    factor_active=True,
+                    factor_active=True, status=status, error=err_sig,
                 )
 
     finally:
@@ -1295,6 +1369,8 @@ def _send_loop_result(
     mask2=None,
     cached: bool = False,
     factor_active: bool = True,
+    status: str = "ok",
+    error: str = "",
 ) -> None:
     """
     Put one loop result onto result_q in the appropriate format.
@@ -1327,6 +1403,8 @@ def _send_loop_result(
             "value":     value,
             "timeout":   is_timeout,
             "cached":    cached,
+            "status":    status,
+            "error":     error,
             "rank":      rank,
         })
     else:
@@ -1340,8 +1418,202 @@ def _send_loop_result(
             "value":     value,
             "timeout":   is_timeout,
             "cached":    cached,
+            "status":    status,
+            "error":     error,
             "rank":      rank,
         })
+
+
+def run_parallel_eval(
+    agent: Agent,
+    loop_assignments: list[dict],
+    normalizer: "FeatureNormalizer",
+    baseline_cache: dict,
+    n_workers: int,
+    args,
+    label: str = "test",
+    reward_cache: "dict | None" = None,
+    postf_cache: "dict | None" = None,
+    use_reward_cache: bool = False,
+) -> dict:
+    """
+    Multi-GPU evaluation of the current policy (greedy), mirroring the training
+    pass's worker layout: loops are bin-packed across *n_workers*, worker k on
+    GPU k.  Replaces the old single-GPU sequential `evaluate()` for the test set.
+
+    use_reward_cache=False (default for TEST) forces a fresh compile+measure for
+    every loop.  This matters: the cached path returns *frozen first
+    measurements*, so evaluating against it measures "did the policy pick cells
+    whose stored values are high", not out-of-distribution generalisation.
+
+    Returns a metrics dict shaped like evaluate()'s, including per-benchmark
+    stats with failure/no-signal counts.
+    """
+    hparams = {
+        "arch":                    args.arch,
+        "n_runs":                  args.n_runs,
+        "nsys_timeout":            args.nsys_timeout,
+        "tmp_dir":                 args.tmp_dir,
+        "compile_timeout_penalty": args.compile_timeout_penalty,
+        "compile_failure_penalty": args.compile_failure_penalty,
+        "reward_deadzone":         args.reward_deadzone,
+        "clip_eps":                args.clip_eps,
+        "K":                       args.K,
+        "batch_size":              args.batch_size,
+        "lr":                      args.lr,
+        "value_loss_coef":         args.value_loss_coef,
+        "entropy_coef":            args.entropy_coef,
+        "normalizer_state":        normalizer.state_dict(),
+        "baseline_cache":          baseline_cache,
+        "reward_cache":            dict(reward_cache or {}) if use_reward_cache else {},
+        "postf_cache":             dict(postf_cache or {}),
+        "epoch":                   0,
+        "total_epochs":            0,
+    }
+    per_worker = assign_loops_to_workers(loop_assignments, n_workers)
+    weights = _get_weights(agent)
+    rq: mp.Queue = mp.Queue()
+    wqs: list[mp.Queue] = [mp.Queue() for _ in range(n_workers)]
+    procs = []
+    for rank in range(n_workers):
+        p = mp.Process(target=_worker_fn,
+                       args=(rank, rank, per_worker[rank], weights, hparams,
+                             rq, wqs[rank], "eval"),
+                       daemon=True)
+        p.start()
+        procs.append(p)
+
+    msg_timeout = args.n_runs * args.nsys_timeout + 300
+    by_bench: dict[str, list[float]] = {}
+    status_by_bench: dict[str, dict] = {}
+    rewards: list[float] = []
+    failures: list[dict] = []
+    samples = missed = done = 0
+
+    while done < n_workers:
+        try:
+            msg = rq.get(timeout=msg_timeout)
+        except queue.Empty:
+            if not any(p.is_alive() for p in procs):
+                log.error("[%s] all workers died", label)
+                break
+            continue
+        except Exception as e:
+            log.error("[%s] result message DROPPED (%s: %s)", label,
+                      type(e).__name__, e)
+            if not any(p.is_alive() for p in procs):
+                break
+            continue
+
+        t = msg["type"]
+        if t == "eval_result":
+            b = msg["benchmark"]
+            st = status_by_bench.setdefault(b, {})
+            s = msg.get("status", "ok")
+            st[s] = st.get(s, 0) + 1
+            if s == "compile_failed":
+                # Excluded from reported stats — a transform-coverage limit,
+                # studied separately (CPU-only remark analysis), not a result.
+                failures.append({
+                    "benchmark": b, "loop_idx": msg["loop_idx"],
+                    "unmerge": msg["unmerge"], "factor": msg["factor"],
+                    "error_signature": msg.get("error", ""),
+                })
+                continue
+            by_bench.setdefault(b, []).append(msg["reward"])
+            rewards.append(msg["reward"])
+            samples += 1
+            log.info("  [%s W%d] %s loop_idx=%d unmerge=%d factor=%d "
+                     "reward=%+.4f%s",
+                     label, msg["rank"], b, msg["loop_idx"], msg["unmerge"],
+                     msg["factor"], msg["reward"],
+                     "" if s in ("ok", "noop") else f" [{s.upper()}]")
+        elif t == "step_failed":
+            missed += 1
+        elif t == "worker_done":
+            done += 1
+
+    for p in procs:
+        p.join(timeout=30)
+
+    per_benchmark = []
+    for b in sorted(set(by_bench) | set(status_by_bench)):
+        rs = by_bench.get(b)
+        if not rs:
+            # every loop in this benchmark failed to compile — no measurable
+            # result; recorded in compile_failures.csv, omitted from the table
+            continue
+        st = status_by_bench.get(b, {})
+        n_fail = st.get("compile_failed", 0)
+        n_to   = st.get("compile_timeout", 0)
+        n_mf   = st.get("measure_failed", 0)
+        per_benchmark.append({
+            "benchmark": b, "loops": len(rs),
+            "avg_reward": sum(rs) / len(rs),
+            "min_reward": min(rs), "max_reward": max(rs),
+            "loops_win":        sum(1 for r in rs if r > 0.01),
+            "loops_regression": sum(1 for r in rs if r < -0.01),
+            "loops_noop":       st.get("noop", 0),
+            "compile_failed":   n_fail,
+            "compile_timeout":  n_to,
+            "measure_failed":   n_mf,
+            "no_signal":        n_mf,   # compile failures are scored, not no-signal
+        })
+    per_benchmark.sort(key=lambda e: e["benchmark"])
+    return {
+        f"{label}_avg_reward":    sum(rewards) / len(rewards) if rewards else 0.0,
+        f"{label}_avg_advantage": float("nan"),
+        f"{label}_samples":       samples,
+        f"{label}_missed":        missed,
+        f"{label}_per_benchmark": per_benchmark,
+        f"{label}_compile_failures": failures,
+    }
+
+
+def _write_test_report(per_b: list, metrics: dict, label: str,
+                       out_file: Path, tag: str) -> dict:
+    """Score verdicts, log the table, write the CSV. Returns summary counts."""
+    for e in per_b:
+        e["verdict"] = ("win" if e["avg_reward"] > 0.01
+                        else "regression" if e["avg_reward"] < -0.01
+                        else "neutral")
+    n_win = sum(1 for e in per_b if e["verdict"] == "win")
+    n_reg = sum(1 for e in per_b if e["verdict"] == "regression")
+    n_neu = len(per_b) - n_win - n_reg
+    macro = sum(e["avg_reward"] for e in per_b) / len(per_b) if per_b else 0.0
+    no_sig = sum(e.get("no_signal", 0) for e in per_b)
+
+    log.info("[%s] per-loop avg=%+.4f | per-benchmark avg=%+.4f | "
+             "%d win / %d neutral / %d regression | samples=%d no_signal=%d",
+             tag, metrics[f"{label}_avg_reward"], macro, n_win, n_neu, n_reg,
+             metrics[f"{label}_samples"], no_sig)
+    for e in per_b:
+        log.info("  %-38s loops=%3d avg=%+.4f min=%+.4f max=%+.4f "
+                 "win/reg=%d/%d no_signal=%d [%s]",
+                 e["benchmark"], e["loops"], e["avg_reward"], e["min_reward"],
+                 e["max_reward"], e["loops_win"], e["loops_regression"],
+                 e.get("no_signal", 0), e["verdict"])
+
+    fields = ["benchmark", "loops", "avg_reward", "min_reward", "max_reward",
+              "loops_win", "loops_regression", "loops_noop", "compile_failed",
+              "compile_timeout", "measure_failed", "no_signal", "verdict"]
+    with open(out_file, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, restval="", extrasaction="ignore")
+        w.writeheader()
+        for e in per_b:
+            w.writerow(e)
+        w.writerow({"benchmark": "OVERALL_PER_LOOP",
+                    "loops": metrics[f"{label}_samples"],
+                    "avg_reward": round(metrics[f"{label}_avg_reward"], 6),
+                    "no_signal": no_sig})
+        w.writerow({"benchmark": "OVERALL_PER_BENCHMARK", "loops": len(per_b),
+                    "avg_reward": round(macro, 6), "loops_win": n_win,
+                    "loops_regression": n_reg,
+                    "verdict": f"{n_win}W/{n_neu}N/{n_reg}R"})
+    log.info("[%s] results saved: %s", tag, out_file)
+    return {"tag": tag, "per_loop": metrics[f"{label}_avg_reward"],
+            "macro": macro, "W": n_win, "N": n_neu, "R": n_reg,
+            "no_signal": no_sig}
 
 
 # ---------------------------------------------------------------------------
@@ -1389,6 +1661,8 @@ def run_parallel_epoch(
         "nsys_timeout":            args.nsys_timeout,
         "tmp_dir":                 args.tmp_dir,
         "compile_timeout_penalty": args.compile_timeout_penalty,
+        "compile_failure_penalty": args.compile_failure_penalty,
+        "reward_deadzone":         args.reward_deadzone,
         "clip_eps":                args.clip_eps,
         "K":                       args.K,
         "batch_size":              args.batch_size,
@@ -1453,6 +1727,7 @@ def run_parallel_epoch(
     train_entropy     = 0.0
     train_updates     = 0
     train_cache_hits  = 0
+    train_failures    = 0   # compile_failed + compile_timeout
     train_noops       = 0
     train_unmerges    = 0
     train_unrolls     = 0
@@ -1527,6 +1802,8 @@ def run_parallel_epoch(
                     postf_cache[_pf_key] = msg["state2"]
             if msg.get("cached"):
                 train_cache_hits += 1
+            if msg.get("status") in ("compile_failed", "compile_timeout"):
+                train_failures += 1
 
             timeout_flag = " [compile timeout — penalty]" if msg.get("timeout") else ""
             cached_flag  = " [cached]" if msg.get("cached") else ""
@@ -1741,6 +2018,7 @@ def run_parallel_epoch(
         "train_unmerge_rate":  train_unmerges / _n_s,
         "train_unroll_rate":   train_unrolls / _n_s,
         "train_cache_hit_rate": train_cache_hits / _n_s,
+        "train_failure_rate":  train_failures / _n_s,
         "val_avg_reward":      val_avg_reward,
         "val_avg_advantage":   val_avg_advantage,
         "val_samples":         val_samples,
@@ -1889,6 +2167,8 @@ def main() -> None:
         nsys_timeout=args.nsys_timeout,
         tmp_dir=tmp_dir,
         compile_timeout_penalty=args.compile_timeout_penalty,
+        compile_failure_penalty=args.compile_failure_penalty,
+        reward_deadzone=args.reward_deadzone,
         normalizer=normalizer,
         baseline_cache=baseline_cache,
     )
@@ -1986,6 +2266,7 @@ def main() -> None:
                 "train_unmerge_rate":  round(epoch_stats["train_unmerge_rate"], 6),
                 "train_unroll_rate":   round(epoch_stats["train_unroll_rate"], 6),
                 "train_cache_hit_rate": round(epoch_stats["train_cache_hit_rate"], 6),
+                "train_failure_rate":   round(epoch_stats["train_failure_rate"], 6),
                 "val_avg_reward":      round(epoch_stats["val_avg_reward"]
                                             if epoch_stats["val_avg_reward"] == epoch_stats["val_avg_reward"]
                                             else float("nan"), 6),
@@ -2206,78 +2487,86 @@ def main() -> None:
             log.info("Checkpoint saved: %s", ckpt_path)
 
     # --- Test evaluation ---
-    # Uses the BEST checkpoint by greedy val reward, not the last epoch's
-    # weights: over a long run the final policy can be past its peak.
+    # Runs on MULTIPLE checkpoints (default best + last): best-by-val can be
+    # picked very early — in the 95-epoch run it landed at epoch 27 — so the
+    # converged policy must be reported alongside it.
+    # Always FRESH-measured (no reward cache): the cached path returns frozen
+    # first-measurements, which measures cache lookup, not generalisation.
     if test_bmarks:
-        best_ckpt = ckpt_dir / "best.pt"
-        if best_ckpt.exists():
-            agent.load(str(best_ckpt))
-            log.info(
-                "=== Test Evaluation (best checkpoint: epoch %s, val=%.4f) ===",
-                best_val_epoch, best_val_reward,
-            )
-        else:
-            log.info("=== Test Evaluation (final model — no best.pt found) ===")
+        test_loop_assignments = build_loop_assignments(test_bmarks, loop_records_map)
+        log.info("=== Test Evaluation: %d benchmarks, %d loops ===",
+                 len(test_bmarks), len(test_loop_assignments))
 
-        test_metrics, _ = evaluate(agent, env, test_bmarks, device, label="test")
+        wanted = [s.strip() for s in args.test_checkpoints.split(",") if s.strip()]
+        candidates: list[tuple[str, Path]] = []
+        for w in wanted:
+            if w == "best":
+                p = ckpt_dir / "best.pt"
+                if p.exists():
+                    candidates.append((f"best(ep{best_val_epoch},val={best_val_reward:+.4f})", p))
+                else:
+                    log.warning("test-checkpoints: no best.pt found — skipping")
+            elif w == "last":
+                p = ckpt_dir / f"epoch_{args.epochs:04d}.pt"
+                if not p.exists():
+                    saved = sorted(ckpt_dir.glob("epoch_*.pt"))
+                    p = saved[-1] if saved else None
+                if p is not None and p.exists():
+                    candidates.append((f"last({p.stem})", p))
+                else:
+                    log.warning("test-checkpoints: no epoch checkpoint found — skipping")
+            else:
+                p = Path(w)
+                if p.exists():
+                    candidates.append((p.stem, p))
+                else:
+                    log.warning("test-checkpoints: %s not found — skipping", w)
 
-        per_b = test_metrics.get("test_per_benchmark", [])
-        # Per-benchmark verdicts at ±1% (below that is measurement noise)
-        for entry in per_b:
-            entry["verdict"] = (
-                "win" if entry["avg_reward"] > 0.01
-                else "regression" if entry["avg_reward"] < -0.01
-                else "neutral"
-            )
-        n_win = sum(1 for e in per_b if e["verdict"] == "win")
-        n_reg = sum(1 for e in per_b if e["verdict"] == "regression")
-        n_neu = len(per_b) - n_win - n_reg
-        macro_avg = (
-            sum(e["avg_reward"] for e in per_b) / len(per_b) if per_b else 0.0
-        )
+        summaries = []
+        for tag, ckpt_path in candidates:
+            agent.load(str(ckpt_path))
+            log.info("--- Test on %s (%s) ---", tag, ckpt_path.name)
+            if args.num_workers > 1:
+                tm = run_parallel_eval(
+                    agent, test_loop_assignments, normalizer, baseline_cache,
+                    args.num_workers, args, label="test",
+                    use_reward_cache=False,       # fresh measurement
+                    postf_cache=postf_cache,
+                )
+            else:
+                tm, _ = evaluate(agent, env, test_bmarks, device, label="test")
+            out = ckpt_dir / f"test_results_{ckpt_path.stem}.csv"
+            summaries.append(_write_test_report(
+                tm.get("test_per_benchmark", []), tm, "test", out, tag))
 
-        log.info(
-            "Test | per-loop avg_reward=%.4f | per-benchmark avg=%.4f | "
-            "benchmarks: %d win / %d neutral / %d regression | samples=%d missed=%d",
-            test_metrics["test_avg_reward"], macro_avg,
-            n_win, n_neu, n_reg,
-            test_metrics["test_samples"], test_metrics["test_missed"],
-        )
-        log.info("Per-benchmark test results:")
-        for entry in per_b:
-            log.info(
-                "  %-40s loops=%3d  avg=%+.4f  min=%+.4f  max=%+.4f  "
-                "win/reg loops=%d/%d  [%s]",
-                entry["benchmark"], entry["loops"], entry["avg_reward"],
-                entry["min_reward"], entry["max_reward"],
-                entry["loops_win"], entry["loops_regression"], entry["verdict"],
-            )
+            # Compile failures are NOT part of the reported speedup statistics —
+            # they are a transform-coverage limitation, not a policy result.
+            # Dumped here for the separate CPU-only remark analysis
+            # (analyze_compile_failures.py).
+            cf = tm.get("test_compile_failures", [])
+            if cf:
+                cf_path = ckpt_dir / f"compile_failures_{ckpt_path.stem}.csv"
+                with open(cf_path, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=[
+                        "benchmark", "loop_idx", "unmerge", "factor",
+                        "error_signature"])
+                    w.writeheader()
+                    w.writerows(cf)
+                by_sig: dict = {}
+                for r in cf:
+                    by_sig[r["error_signature"]] = by_sig.get(r["error_signature"], 0) + 1
+                log.info("[%s] %d compile failures EXCLUDED from the stats above "
+                         "-> %s", tag, len(cf), cf_path)
+                for sig, n in sorted(by_sig.items(), key=lambda kv: -kv[1])[:5]:
+                    log.info("      %4d x  %s", n, sig[:110])
 
-        test_results_file = str(ckpt_dir / "test_results.csv")
-        fieldnames = ["benchmark", "loops", "avg_reward", "min_reward",
-                      "max_reward", "loops_win", "loops_regression",
-                      "loops_noop", "compile_failed", "compile_timeout",
-                      "measure_failed", "no_signal", "verdict"]
-        with open(test_results_file, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, restval="",
-                                    extrasaction="ignore")
-            writer.writeheader()
-            for entry in per_b:
-                writer.writerow(entry)
-            writer.writerow({
-                "benchmark": "OVERALL_PER_LOOP",
-                "loops": test_metrics["test_samples"],
-                "avg_reward": round(test_metrics["test_avg_reward"], 6),
-            })
-            writer.writerow({
-                "benchmark": "OVERALL_PER_BENCHMARK",
-                "loops": len(per_b),
-                "avg_reward": round(macro_avg, 6),
-                "loops_win": n_win,
-                "loops_regression": n_reg,
-                "verdict": f"{n_win}W/{n_neu}N/{n_reg}R",
-            })
-        log.info("Test results saved: %s", test_results_file)
+        if len(summaries) > 1:
+            log.info("=== Test summary across checkpoints ===")
+            for s in summaries:
+                log.info("  %-34s per-loop=%+.4f macro=%+.4f  %dW/%dN/%dR  "
+                         "no_signal=%d",
+                         s["tag"], s["per_loop"], s["macro"], s["W"], s["N"],
+                         s["R"], s["no_signal"])
 
     # --- Plots ---
     plot_training_curves(metrics_file, str(ckpt_dir))

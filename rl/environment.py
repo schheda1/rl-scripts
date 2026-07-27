@@ -43,6 +43,7 @@ from hecbench import (
     _row_to_tensor,
     compile_loopcount,
     compile_single_loop,
+    compile_single_loop_ex,
     compile_baseline,
     get_loop_features,
     measure_kernel_time,
@@ -83,10 +84,14 @@ class GpuLoopEnv:
         nsys_timeout: int = 300,
         tmp_dir: Path = DEFAULT_TMP_DIR,
         compile_timeout_penalty: float = -1.0,
+        compile_failure_penalty: float = -0.25,
+        reward_deadzone: float = 0.01,
         gpu_id: int = 0,
         normalizer: Optional[FeatureNormalizer] = None,
         baseline_cache: Optional[dict] = None,
     ) -> None:
+        self.compile_failure_penalty = compile_failure_penalty
+        self.reward_deadzone = reward_deadzone
         self.arch = arch
         self.n_runs = n_runs
         self.nsys_timeout = nsys_timeout
@@ -115,6 +120,7 @@ class GpuLoopEnv:
         # this to separate a genuine neutral result from a no-signal failure —
         # both of which produce reward 0.0 and are otherwise indistinguishable.
         self.last_status: str = "ok"
+        self.last_error: str = ""
 
         self._awaiting_factor: bool = False
         self._pending_unmerge: int = 0
@@ -341,7 +347,7 @@ class GpuLoopEnv:
         kernel_filter, baseline_ms = self._resolve_measurement(loop_record)
 
         try:
-            ok = compile_single_loop(
+            ok, self.last_error = compile_single_loop_ex(
                 self._benchmark_dir,
                 loop_idx=loop_record.loop_idx,
                 unmerge=unmerge,
@@ -370,18 +376,23 @@ class GpuLoopEnv:
             return next_features, self.compile_timeout_penalty, self.done
 
         if not ok:
-            # Compile error (bad flags, source issue) — treat as no-op,
-            # no signal to the agent.  NOTE: this yields reward exactly 0.0,
-            # which is indistinguishable from a genuine no-effect transform in
-            # the reward alone — hence the explicit status + warning, so test
-            # reports can separate "no signal" from "neutral".
+            # Compile FAILED — the action is unusable.  Scored with an explicit
+            # penalty (not 0.0, which reads as "neutral") so it ranks below
+            # declining to transform, and so the agent can learn the
+            # over-aggressiveness boundary from measurement.
             self.last_status = "compile_failed"
             _env_log.warning(
                 "%s loop_idx=%d unmerge=%d factor=%d — COMPILE FAILED "
-                "(reward forced to 0.0, no signal)",
+                "(penalty=%.2f)",
                 self._benchmark_dir.name, loop_record.loop_idx, unmerge, factor,
+                self.compile_failure_penalty,
             )
-            modified_time_ms = baseline_ms
+            self._loop_cursor += 1
+            next_features = (
+                None if self.done
+                else self._eligible_loops[self._loop_cursor].pre_features
+            )
+            return next_features, self.compile_failure_penalty, self.done
         else:
             try:
                 modified_time_ms = measure_kernel_time(
@@ -391,10 +402,13 @@ class GpuLoopEnv:
                     kernel_filter=kernel_filter,
                 )
             except RuntimeError:
+                # Measurement failure is INFRASTRUCTURE, not the action's fault.
+                # Score 0.0 (no signal) and flag it — callers exclude these from
+                # the reported statistics rather than counting them as neutral.
                 self.last_status = "measure_failed"
                 _env_log.warning(
                     "%s loop_idx=%d unmerge=%d factor=%d — MEASUREMENT FAILED "
-                    "(reward forced to 0.0, no signal)",
+                    "(no signal; excluded from reported stats)",
                     self._benchmark_dir.name, loop_record.loop_idx, unmerge, factor,
                 )
                 modified_time_ms = baseline_ms
@@ -408,6 +422,11 @@ class GpuLoopEnv:
             (baseline_ms - modified_time_ms) / max(baseline_ms, 1e-9),
             -1.0,
         )
+        # Deadzone: |r| below the measurement-noise floor is not signal.
+        # Applied only to measured rewards — failure/timeout penalties return
+        # early above and are never zeroed here.
+        if self.reward_deadzone > 0 and abs(reward) < self.reward_deadzone:
+            reward = 0.0
 
         self._loop_cursor += 1
         if self.done:

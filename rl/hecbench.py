@@ -248,6 +248,46 @@ def compile_loopcount(benchmark_dir: Path, arch: str = ARCH) -> subprocess.Compl
     return _make(benchmark_dir, extra_cflags=cflags, arch=arch)
 
 
+def compile_single_loop_ex(
+    benchmark_dir: Path,
+    loop_idx: int,
+    unmerge: int,
+    factor: int,
+    filename: str,
+    triple: str,
+    arch: str = ARCH,
+) -> tuple[bool, str]:
+    """
+    Like compile_single_loop, but also returns an error signature on failure.
+
+    The signature is the first line matching a compiler-error pattern, which is
+    what makes thousands of failures group into a handful of root causes.
+    Returns an empty signature when the compile succeeds.
+    """
+    cflags = _build_extra_cflags(
+        enable_uu=True,
+        filename=filename,
+        triple=triple,
+        loop_indices=[loop_idx],
+        unmerge_flags=[unmerge],
+        unroll_factors=[factor],
+    )
+    result = _make(benchmark_dir, extra_cflags=cflags, arch=arch)
+    if result.returncode == 0:
+        return True, ""
+    return False, extract_error_signature(result.stderr)
+
+
+def extract_error_signature(stderr: str, maxlen: int = 200) -> str:
+    """First compiler-error-ish line, truncated — used to group failures."""
+    pats = ("LLVM ERROR", "Assertion", "fatal error", "error:", "Stack dump")
+    for line in (stderr or "").splitlines():
+        if any(p in line for p in pats):
+            return line.strip()[:maxlen]
+    tail = [l for l in (stderr or "").splitlines() if l.strip()]
+    return tail[-1].strip()[:maxlen] if tail else "unknown"
+
+
 def compile_single_loop(
     benchmark_dir: Path,
     loop_idx: int,
@@ -258,16 +298,9 @@ def compile_single_loop(
     arch: str = ARCH,
 ) -> bool:
     """Sequential mode: compile targeting one loop. Used during training."""
-    cflags = _build_extra_cflags(
-        enable_uu=True,
-        filename=filename,
-        triple=triple,
-        loop_indices=[loop_idx],
-        unmerge_flags=[unmerge],
-        unroll_factors=[factor],
-    )
-    result = _make(benchmark_dir, extra_cflags=cflags, arch=arch)
-    return result.returncode == 0
+    ok, _ = compile_single_loop_ex(benchmark_dir, loop_idx, unmerge, factor,
+                                   filename, triple, arch)
+    return ok
 
 
 def compile_multi_loop(
