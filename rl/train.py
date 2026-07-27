@@ -141,6 +141,22 @@ def parse_args() -> argparse.Namespace:
                         "comma-separated from {best,last} or explicit .pt paths. "
                         "'best' guards against best-val being picked early; 'last' "
                         "shows the converged policy. (default: best,last)")
+    # --- Run health gates: fail fast instead of producing empty epochs ---
+    p.add_argument("--tolerate-worker-crashes", type=int, default=0,
+                   help="Abort the run if more than N workers crash in an epoch. "
+                        "A crash is a code bug — every expected failure is handled "
+                        "in-worker — and it silently forfeits that worker's whole "
+                        "shard. (default: 0, i.e. abort on the first crash)")
+    p.add_argument("--min-sample-frac", type=float, default=0.5,
+                   help="An epoch collecting fewer than this fraction of the "
+                        "BEST epoch's sample count so far is 'starved' (zero "
+                        "samples always counts). Relative to the best epoch, "
+                        "not to the assigned count, so loops that are "
+                        "legitimately skipped every epoch never trip it. "
+                        "(default: 0.5)")
+    p.add_argument("--max-starved-epochs", type=int, default=2,
+                   help="Abort after this many CONSECUTIVE starved epochs — "
+                        "training is not seeing its data. (default: 2)")
     p.add_argument("--arch", type=str, default=ARCH)
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--checkpoint-every", type=int, default=1,
@@ -722,6 +738,8 @@ def evaluate(
                         "loop_idx":  loop_record.loop_idx,
                         "unmerge":   unmerge,
                         "factor":    FACTOR_VALUES[factor_idx],
+                        "filename":  loop_record.filename,
+                        "triple":    loop_record.triple,
                         "error_signature": getattr(env, "last_error", ""),
                     })
                 else:
@@ -1017,54 +1035,64 @@ def _worker_fn(
         datefmt="%H:%M:%S",
     )
 
-    # ------------------------------------------------------------------
-    # GPU assignment: set CUDA_VISIBLE_DEVICES BEFORE any CUDA call so
-    # PyTorch maps device 0 → physical GPU gpu_id in this process.
-    # ------------------------------------------------------------------
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    agent = Agent(
-        clip_eps=hparams["clip_eps"],
-        K=hparams["K"],
-        batch_size=hparams["batch_size"],
-        lr=hparams["lr"],
-        value_loss_coef=hparams["value_loss_coef"],
-        entropy_coef=hparams["entropy_coef"],
-        device=device,
-    )
-    _load_weights(agent, initial_weights)
-
-    worker_normalizer = FeatureNormalizer.from_state_dict(
-        hparams.get("normalizer_state", {})
-    )
-    baseline_cache: dict = hparams.get("baseline_cache", {})
-    # Cross-epoch caches (read-only snapshots; main merges new results and
-    # persists them).  The environment is deterministic — same (loop, action)
-    # → same binary → same reward — so a hit replaces compile + measure.
-    reward_cache: dict = hparams.get("reward_cache", {})
-    postf_cache: dict = hparams.get("postf_cache", {})
-
-    # Per-worker directories
-    tmp_dir = _Path(hparams["tmp_dir"]) / f"worker_{rank}"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    working_set_dir = tmp_dir / "working_set"
-    working_set_dir.mkdir(parents=True, exist_ok=True)
-
-    # Lightweight env used only for get_post_unmerge_features().
-    # _benchmark_dir is set per benchmark group below.
-    env = GpuLoopEnv(
-        arch=hparams["arch"],
-        n_runs=hparams["n_runs"],
-        nsys_timeout=hparams["nsys_timeout"],
-        tmp_dir=tmp_dir,
-        compile_timeout_penalty=hparams["compile_timeout_penalty"],
-        gpu_id=gpu_id,
-        normalizer=worker_normalizer,
-        baseline_cache=baseline_cache,
-    )
-
+    # Everything below runs inside the try: a setup failure (CUDA init,
+    # bad normalizer state, unwritable tmp dir) would otherwise kill this
+    # process with neither worker_crashed nor worker_done on the queue,
+    # leaving main to discover it only via the idle timeout.
     try:
+        # ------------------------------------------------------------------
+        # GPU assignment: set CUDA_VISIBLE_DEVICES BEFORE any CUDA call so
+        # PyTorch maps device 0 → physical GPU gpu_id in this process.
+        # ------------------------------------------------------------------
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        agent = Agent(
+            clip_eps=hparams["clip_eps"],
+            K=hparams["K"],
+            batch_size=hparams["batch_size"],
+            lr=hparams["lr"],
+            value_loss_coef=hparams["value_loss_coef"],
+            entropy_coef=hparams["entropy_coef"],
+            device=device,
+        )
+        _load_weights(agent, initial_weights)
+
+        worker_normalizer = FeatureNormalizer.from_state_dict(
+            hparams.get("normalizer_state", {})
+        )
+        baseline_cache: dict = hparams.get("baseline_cache", {})
+        # Cross-epoch caches (read-only snapshots; main merges new results and
+        # persists them).  The environment is deterministic — same (loop, action)
+        # → same binary → same reward — so a hit replaces compile + measure.
+        reward_cache: dict = hparams.get("reward_cache", {})
+        postf_cache: dict = hparams.get("postf_cache", {})
+
+        # Per-worker directories
+        tmp_dir = _Path(hparams["tmp_dir"]) / f"worker_{rank}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        working_set_dir = tmp_dir / "working_set"
+        working_set_dir.mkdir(parents=True, exist_ok=True)
+
+        # Lightweight env used only for get_post_unmerge_features().
+        # _benchmark_dir is set per benchmark group below.
+        env = GpuLoopEnv(
+            arch=hparams["arch"],
+            n_runs=hparams["n_runs"],
+            nsys_timeout=hparams["nsys_timeout"],
+            tmp_dir=tmp_dir,
+            compile_timeout_penalty=hparams["compile_timeout_penalty"],
+            # This env is used only for get_post_unmerge_features() — the worker
+            # scores rewards inline — but keep the penalties in sync with the
+            # inline path so an env.step() added here later cannot silently use
+            # different reward semantics from the rest of the run.
+            compile_failure_penalty=hparams["compile_failure_penalty"],
+            reward_deadzone=hparams.get("reward_deadzone", 0.0),
+            gpu_id=gpu_id,
+            normalizer=worker_normalizer,
+            baseline_cache=baseline_cache,
+        )
+
         # loop_assignments is sorted by (benchmark_name, loop_idx) so groupby
         # yields contiguous benchmark groups — one shutil.copytree per benchmark.
         for bench_name, bench_iter in groupby(
@@ -1231,6 +1259,7 @@ def _worker_fn(
                         pre_features, step2_features, factor_idx,
                         log_p1, log_p2, mask2,
                         cached=False, factor_active=False,
+                        status="noop", filename=filename, triple=triple,
                     )
                     continue
 
@@ -1238,6 +1267,12 @@ def _worker_fn(
                 is_timeout = False
                 from_cache = False
                 status = "ok"
+                # Must be reset PER LOOP, not inside the cache-miss branch: on a
+                # cache hit the compile is skipped, so a branch-local binding is
+                # unbound on the first hit (UnboundLocalError kills the whole
+                # worker) and stale on later ones (a previous loop's error
+                # signature attached to an unrelated result).
+                err_sig = ""
                 _rc_key = f"{bench_name}|{loop_idx}|{unmerge}|{factor}"
                 _rc_hit = reward_cache.get(_rc_key)
                 if _rc_hit is not None:
@@ -1249,7 +1284,6 @@ def _worker_fn(
                     reward = float(_rc_hit)
                     from_cache = True
                 else:
-                    err_sig = ""
                     try:
                         ok, err_sig = compile_single_loop_ex(
                             copy_dir,
@@ -1275,6 +1309,7 @@ def _worker_fn(
                             pre_features, step2_features, factor_idx,
                             log_p1, log_p2, mask2, factor_active=True,
                             status="compile_timeout", error="compile timeout",
+                            filename=filename, triple=triple,
                         )
                         reward_cache[_rc_key] = reward
                         continue
@@ -1314,6 +1349,7 @@ def _worker_fn(
                                 bench_name, loop_idx, unmerge, factor,
                             )
                             result_q.put({"type": "step_failed",
+                                          "benchmark": bench_name,
                                           "loop_idx": loop_idx, "rank": rank})
                             continue
 
@@ -1344,8 +1380,19 @@ def _worker_fn(
                     pre_features, step2_features, factor_idx,
                     log_p1, log_p2, mask2, cached=from_cache,
                     factor_active=True, status=status, error=err_sig,
+                    filename=filename, triple=triple,
                 )
 
+    except Exception as e:
+        # A crash here forfeits the REST of this worker's shard for the epoch.
+        # The traceback only reaches the worker's stderr; main would otherwise
+        # see a clean worker_done and the loss would surface solely as a
+        # sample-accounting shortfall.  Report it on the queue so it is loud.
+        import traceback as _tb
+        _log.error("Worker %d CRASHED — remaining loops in this shard are lost:"
+                   "\n%s", rank, _tb.format_exc())
+        result_q.put({"type": "worker_crashed", "rank": rank,
+                      "error": f"{type(e).__name__}: {e}"})
     finally:
         result_q.put({"type": "worker_done", "rank": rank})
 
@@ -1371,6 +1418,8 @@ def _send_loop_result(
     factor_active: bool = True,
     status: str = "ok",
     error: str = "",
+    filename: str = "",
+    triple: str = "",
 ) -> None:
     """
     Put one loop result onto result_q in the appropriate format.
@@ -1405,6 +1454,12 @@ def _send_loop_result(
             "cached":    cached,
             "status":    status,
             "error":     error,
+            # Needed to REPRODUCE this compile in the CPU-only analysis: the
+            # UU pass is scoped by -uu-match-filename / -uu-match-targettriple,
+            # so without them a loop index would match a same-numbered loop in
+            # another TU, or on the host side. See analyze_compile_failures.py.
+            "filename":  filename,
+            "triple":    triple,
             "rank":      rank,
         })
     else:
@@ -1420,6 +1475,12 @@ def _send_loop_result(
             "cached":    cached,
             "status":    status,
             "error":     error,
+            # Needed to REPRODUCE this compile in the CPU-only analysis: the
+            # UU pass is scoped by -uu-match-filename / -uu-match-targettriple,
+            # so without them a loop index would match a same-numbered loop in
+            # another TU, or on the host side. See analyze_compile_failures.py.
+            "filename":  filename,
+            "triple":    triple,
             "rank":      rank,
         })
 
@@ -1517,6 +1578,8 @@ def run_parallel_eval(
                 failures.append({
                     "benchmark": b, "loop_idx": msg["loop_idx"],
                     "unmerge": msg["unmerge"], "factor": msg["factor"],
+                    "filename": msg.get("filename", ""),
+                    "triple":   msg.get("triple", ""),
                     "error_signature": msg.get("error", ""),
                 })
                 continue
@@ -1529,7 +1592,17 @@ def run_parallel_eval(
                      msg["factor"], msg["reward"],
                      "" if s in ("ok", "noop") else f" [{s.upper()}]")
         elif t == "step_failed":
+            # A measurement failure never sends an eval_result, so attribute it
+            # here — otherwise per-benchmark measure_failed/no_signal read 0
+            # even when loops were dropped.
             missed += 1
+            if msg.get("benchmark"):
+                _st = status_by_bench.setdefault(msg["benchmark"], {})
+                _st["measure_failed"] = _st.get("measure_failed", 0) + 1
+        elif t == "worker_crashed":
+            log.error("[%s] Worker %d crashed (%s) — its remaining loops are "
+                      "missing from these results", label, msg["rank"],
+                      msg.get("error"))
         elif t == "worker_done":
             done += 1
 
@@ -1734,6 +1807,13 @@ def run_parallel_epoch(
     done_count = 0
 
     dropped_msgs = 0
+    crashed_workers = 0
+    # Keys whose cached value is a compile-failure PENALTY rather than a
+    # measurement.  Recorded so the penalty stays re-tunable: once a cell holds
+    # -0.15 it is no longer identifiable by value, and migrate_reward_cache.py
+    # needs the key list to move it again.  Merged into the on-disk "migration"
+    # block at save time (see the cache-persist block below).
+    epoch_failure_keys: set[str] = set()
     while done_count < n_workers:
         try:
             msg = result_q.get(timeout=worker_msg_timeout)
@@ -1804,6 +1884,10 @@ def run_parallel_epoch(
                 train_cache_hits += 1
             if msg.get("status") in ("compile_failed", "compile_timeout"):
                 train_failures += 1
+            if msg.get("status") == "compile_failed":
+                epoch_failure_keys.add(
+                    f"{msg['benchmark']}|{msg['loop_idx']}|{msg['unmerge']}|{msg['factor']}"
+                )
 
             timeout_flag = " [compile timeout — penalty]" if msg.get("timeout") else ""
             cached_flag  = " [cached]" if msg.get("cached") else ""
@@ -1836,12 +1920,25 @@ def run_parallel_epoch(
         elif mtype == "step_failed":
             train_missed += 1
 
+        elif mtype == "worker_crashed":
+            crashed_workers += 1
+            log.error("Worker %d CRASHED (%s) — the rest of its shard is lost "
+                      "for this epoch", msg["rank"], msg.get("error"))
+
         elif mtype == "worker_done":
             done_count += 1
             log.info("Worker %d finished training pass", msg["rank"])
 
     for p in workers:
         p.join(timeout=30)
+        if p.exitcode not in (0, None):
+            log.error("Worker exited with code %s — check its traceback above",
+                      p.exitcode)
+
+    if crashed_workers:
+        log.error("%d/%d workers crashed this epoch — the gradient step is "
+                  "computed on a PARTIAL shard; treat this epoch as suspect",
+                  crashed_workers, n_workers)
 
     # Sample accounting: every assigned loop should produce exactly one entry.
     # A shortfall means loops were skipped (no baseline / copy failure) or
@@ -1955,6 +2052,11 @@ def run_parallel_epoch(
                     val_unmerges += 1
                 if msg.get("cached"):
                     val_cache_hits += 1
+                if msg.get("status") == "compile_failed":
+                    epoch_failure_keys.add(
+                        f"{msg['benchmark']}|{msg['loop_idx']}|"
+                        f"{msg['unmerge']}|{msg['factor']}"
+                    )
                 timeout_flag = " [compile timeout — penalty]" if msg.get("timeout") else ""
                 cached_flag  = " [cached]" if msg.get("cached") else ""
                 log.info(
@@ -1965,6 +2067,12 @@ def run_parallel_epoch(
 
             elif mtype == "step_failed":
                 val_missed += 1
+
+            elif mtype == "worker_crashed":
+                crashed_workers += 1
+                log.error("Worker %d CRASHED during val (%s) — val metrics for "
+                          "this epoch are incomplete", msg["rank"],
+                          msg.get("error"))
 
             elif mtype == "worker_done":
                 val_done_count += 1
@@ -1991,14 +2099,42 @@ def run_parallel_epoch(
             json.dumps(normalizer.state_dict(), sort_keys=True).encode()
         ).hexdigest()[:12]
         cache_path = Path(args.checkpoint_dir) / "reward_cache.json"
-        cache_path.write_text(json.dumps({
+
+        # Carry forward the "migration" block written by
+        # migrate_reward_cache.py.  Rewriting the file from scratch used to drop
+        # it after the first epoch, which silently destroyed the ability to
+        # re-tune --compile-failure-penalty later: a cell holding -0.15 is
+        # indistinguishable from a genuine -0.15 measurement, so the key list is
+        # the only record of which cells are failures.  Newly observed failures
+        # from THIS run are unioned in, so the list stays complete.
+        _mig: dict = {}
+        if cache_path.exists():
+            try:
+                _mig = json.loads(cache_path.read_text()).get("migration") or {}
+            except Exception:
+                _mig = {}
+        if epoch_failure_keys or _mig:
+            _mig["failure_keys"] = sorted(
+                set(_mig.get("failure_keys", [])) | epoch_failure_keys
+            )
+            _mig.setdefault("failure_penalty", args.compile_failure_penalty)
+            _mig.setdefault("deadzone", args.reward_deadzone)
+            _mig.setdefault("deadzoned_keys", [])
+            _mig.setdefault("history", [])
+
+        _payload = {
             "normalizer_sig": _sig,
             "rewards":        reward_cache,
             "post_features":  postf_cache,
-        }))
+        }
+        if _mig:
+            _payload["migration"] = _mig
+        cache_path.write_text(json.dumps(_payload))
         log.info(
-            "Caches saved: %d rewards, %d post-unmerge feature vectors (%s)",
-            len(reward_cache), len(postf_cache), cache_path,
+            "Caches saved: %d rewards, %d post-unmerge feature vectors, "
+            "%d known failure cells (%s)",
+            len(reward_cache), len(postf_cache),
+            len(_mig.get("failure_keys", [])), cache_path,
         )
     except Exception as e:
         log.warning("Could not save reward cache: %s", e)
@@ -2008,6 +2144,8 @@ def run_parallel_epoch(
     epoch_stats = {
         "train_samples":       train_samples,
         "train_missed":        train_missed,
+        "crashed_workers":     crashed_workers,
+        "assigned_loops":      _assigned,
         "train_rewards":       train_rewards,
         "train_advantages":    train_advantages,
         "train_actor_loss":    train_actor_loss / n_upd,
@@ -2192,6 +2330,8 @@ def main() -> None:
     # evaluation at the end uses it instead of the last epoch's weights.
     best_val_reward = float("-inf")
     best_val_epoch: "int | None" = None
+    starved_epochs = 0
+    peak_samples   = 0
 
     for epoch in range(1, args.epochs + 1):
         _epoch_filter.set(epoch, args.epochs)
@@ -2232,6 +2372,58 @@ def main() -> None:
             )
 
             total_updates += epoch_stats["train_updates"]
+
+            # ----------------------------------------------------------
+            # Run health gate.  A worker crash is a CODE bug by definition —
+            # every expected failure (no baseline, copy failure, compile
+            # failure/timeout, measurement failure) is handled in-worker.  A
+            # crashed worker forfeits its whole shard, and because workers are
+            # re-spawned per epoch the same bug re-arms every epoch: a single
+            # unbound-variable bug once produced 23 consecutive near-empty
+            # epochs that still "completed" cleanly.  Burn a minute of GPU
+            # time, not a night of it.
+            _crashed  = epoch_stats.get("crashed_workers", 0)
+            _assigned = epoch_stats.get("assigned_loops", 0)
+            _got      = epoch_stats["train_samples"]
+            if _crashed > args.tolerate_worker_crashes:
+                log.error(
+                    "ABORTING: %d worker(s) crashed this epoch (tolerance %d). "
+                    "The shard is partial, so this gradient step is computed on "
+                    "a biased subset of benchmarks. Fix the traceback above and "
+                    "restart; reward_cache.json in this run dir is valid and "
+                    "can be carried forward. Override with "
+                    "--tolerate-worker-crashes.",
+                    _crashed, args.tolerate_worker_crashes,
+                )
+                raise SystemExit(2)
+            # Starvation is measured against the BEST epoch so far, not against
+            # the assigned count: loops legitimately skipped in-worker (no
+            # cached baseline, copy failure) are skipped every epoch, so an
+            # absolute fraction of `assigned` would false-abort a healthy run
+            # and burn GPU hours for nothing.  A self-calibrating floor only
+            # fires on a real collapse.
+            peak_samples = max(peak_samples, _got)
+            if _got == 0 or (peak_samples
+                             and _got < args.min_sample_frac * peak_samples):
+                starved_epochs += 1
+                log.error(
+                    "Epoch %d collected %d samples (%d assigned, best epoch so "
+                    "far %d, floor %.0f%% of best) — %d consecutive starved "
+                    "epoch(s)",
+                    epoch, _got, _assigned, peak_samples,
+                    100 * args.min_sample_frac, starved_epochs,
+                )
+                if starved_epochs >= args.max_starved_epochs:
+                    log.error(
+                        "ABORTING: %d consecutive starved epochs. Training is "
+                        "not seeing its data — check the worker logs for "
+                        "'CRASHED', 'No baseline cached', or 'Failed to copy'. "
+                        "Override with --max-starved-epochs / --min-sample-frac.",
+                        starved_epochs,
+                    )
+                    raise SystemExit(2)
+            else:
+                starved_epochs = 0
 
             epoch_rewards    = epoch_stats["train_rewards"]
             epoch_advantages = epoch_stats["train_advantages"]
@@ -2547,9 +2739,13 @@ def main() -> None:
             if cf:
                 cf_path = ckpt_dir / f"compile_failures_{ckpt_path.stem}.csv"
                 with open(cf_path, "w", newline="") as f:
+                    # filename/triple are REQUIRED by analyze_compile_failures.py
+                    # to reproduce the exact compile — the UU pass is scoped by
+                    # -uu-match-filename / -uu-match-targettriple.
                     w = csv.DictWriter(f, fieldnames=[
                         "benchmark", "loop_idx", "unmerge", "factor",
-                        "error_signature"])
+                        "filename", "triple", "error_signature"],
+                        extrasaction="ignore", restval="")
                     w.writeheader()
                     w.writerows(cf)
                 by_sig: dict = {}
