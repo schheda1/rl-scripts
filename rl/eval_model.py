@@ -181,6 +181,12 @@ def main() -> None:
     log.info("Per-benchmark avg reward : %+.4f  (%d benchmarks)", macro_avg, len(per_b))
     log.info("Benchmark verdicts       : %d win / %d neutral / %d regression",
              n_win, n_neu, n_reg)
+    _ns = sum(e.get("no_signal", 0) for e in per_b)
+    _to = sum(e.get("compile_timeout", 0) for e in per_b)
+    if _ns or _to:
+        log.info("No-signal loops          : %d of %d (compile/measure failed) "
+                 "+ %d compile timeouts — these report reward 0.0 and are NOT "
+                 "genuine neutrals", _ns, per_loop_samples, _to)
     log.info("")
     for e in sorted(per_b, key=lambda x: x["avg_reward"], reverse=True):
         log.info("  %-40s loops=%3d  avg=%+.4f  min=%+.4f  max=%+.4f  "
@@ -192,7 +198,8 @@ def main() -> None:
     # --- Write CSV ---
     out = Path(args.out) if args.out else run_dir / f"eval_{args.split}_{ckpt.stem}.csv"
     fields = ["benchmark", "loops", "avg_reward", "min_reward", "max_reward",
-              "loops_win", "loops_regression", "verdict"]
+              "loops_win", "loops_regression", "loops_noop", "compile_failed",
+              "compile_timeout", "measure_failed", "no_signal", "verdict"]
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, restval="")
         w.writeheader()

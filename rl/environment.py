@@ -23,10 +23,13 @@ Episode structure (per benchmark):
 The training loop (train.py) manages the 2-step sequence explicitly.
 """
 
+import logging
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+_env_log = logging.getLogger("environment")
 
 import numpy as np
 import pandas as pd
@@ -107,6 +110,12 @@ class GpuLoopEnv:
         self._loop_cursor: int = 0
 
         # State set mid-step (unmerge=1 path)
+        # Outcome of the most recent step(): "ok" | "noop" | "compile_failed"
+        # | "compile_timeout" | "measure_failed".  Callers (evaluate()) read
+        # this to separate a genuine neutral result from a no-signal failure —
+        # both of which produce reward 0.0 and are otherwise indistinguishable.
+        self.last_status: str = "ok"
+
         self._awaiting_factor: bool = False
         self._pending_unmerge: int = 0
         self._pending_post_features: Optional[torch.Tensor] = None
@@ -317,11 +326,13 @@ class GpuLoopEnv:
           done:          True when all eligible loops in the episode are exhausted.
         """
         factor = FACTOR_VALUES[factor_idx]
+        self.last_status = "ok"
 
         # No-op: unmerge=0 and factor=1 leaves the binary identical to baseline.
         # Skip compilation and measurement entirely — reward is exactly 0 by definition.
         # Any nsys measurement here would only inject noise.
         if unmerge == 0 and factor == 1:
+            self.last_status = "noop"
             self._loop_cursor += 1
             if self.done:
                 return None, 0.0, True
@@ -344,6 +355,13 @@ class GpuLoopEnv:
             # Return a penalty reward so the agent learns to avoid this
             # (loop features, factor) combination.  Distinguish from a
             # generic compile error which gets reward=0 (no signal).
+            self.last_status = "compile_timeout"
+            _env_log.warning(
+                "%s loop_idx=%d unmerge=%d factor=%d — COMPILE TIMEOUT "
+                "(reward=%.2f penalty)",
+                self._benchmark_dir.name, loop_record.loop_idx, unmerge, factor,
+                self.compile_timeout_penalty,
+            )
             self._loop_cursor += 1
             next_features = (
                 None if self.done
@@ -353,7 +371,16 @@ class GpuLoopEnv:
 
         if not ok:
             # Compile error (bad flags, source issue) — treat as no-op,
-            # no signal to the agent.
+            # no signal to the agent.  NOTE: this yields reward exactly 0.0,
+            # which is indistinguishable from a genuine no-effect transform in
+            # the reward alone — hence the explicit status + warning, so test
+            # reports can separate "no signal" from "neutral".
+            self.last_status = "compile_failed"
+            _env_log.warning(
+                "%s loop_idx=%d unmerge=%d factor=%d — COMPILE FAILED "
+                "(reward forced to 0.0, no signal)",
+                self._benchmark_dir.name, loop_record.loop_idx, unmerge, factor,
+            )
             modified_time_ms = baseline_ms
         else:
             try:
@@ -364,6 +391,12 @@ class GpuLoopEnv:
                     kernel_filter=kernel_filter,
                 )
             except RuntimeError:
+                self.last_status = "measure_failed"
+                _env_log.warning(
+                    "%s loop_idx=%d unmerge=%d factor=%d — MEASUREMENT FAILED "
+                    "(reward forced to 0.0, no signal)",
+                    self._benchmark_dir.name, loop_record.loop_idx, unmerge, factor,
+                )
                 modified_time_ms = baseline_ms
 
         # Clip at -1.0 (the timeout-penalty scale).  A pathological slowdown

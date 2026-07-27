@@ -616,6 +616,10 @@ def evaluate(
 
     for benchmark_dir in benchmarks:
         bmark_rewards: list[float] = []
+        # Per-benchmark outcome tally.  reward==0.0 is ambiguous on its own —
+        # it means "no-op", "compile failed", or "measurement failed" — so read
+        # env.last_status to separate a genuine neutral from a no-signal loop.
+        bmark_status: dict[str, int] = {}
 
         try:
             first_features = env.reset(benchmark_dir)
@@ -670,12 +674,16 @@ def evaluate(
                 missed += 1
                 continue
 
+            status = getattr(env, "last_status", "ok")
+            bmark_status[status] = bmark_status.get(status, 0) + 1
+
             v = agent.predict_value(pre_features)
             log.info(
                 "  [%s] %s loop_idx=%d unmerge=%d factor=%d "
-                "reward=%.4f V(s)=%.4f",
+                "reward=%.4f V(s)=%.4f%s",
                 label, benchmark_dir.name, loop_record.loop_idx,
                 unmerge, FACTOR_VALUES[factor_idx], reward, v,
+                "" if status in ("ok", "noop") else f" [{status.upper()}]",
             )
 
             all_rewards.append(reward)
@@ -687,6 +695,12 @@ def evaluate(
                 break
 
         if bmark_rewards:
+            # no_signal = loops whose reward is 0.0 only because the toolchain
+            # failed, NOT because the transform was neutral.  Without this the
+            # two are indistinguishable and inflate the "neutral" verdict.
+            n_fail    = bmark_status.get("compile_failed", 0)
+            n_timeout = bmark_status.get("compile_timeout", 0)
+            n_measfail = bmark_status.get("measure_failed", 0)
             per_benchmark.append({
                 "benchmark":   benchmark_dir.name,
                 "loops":       len(bmark_rewards),
@@ -696,7 +710,19 @@ def evaluate(
                 # ±1% classification thresholds — below that is measurement noise
                 "loops_win":        sum(1 for r in bmark_rewards if r > 0.01),
                 "loops_regression": sum(1 for r in bmark_rewards if r < -0.01),
+                "loops_noop":       bmark_status.get("noop", 0),
+                "compile_failed":   n_fail,
+                "compile_timeout":  n_timeout,
+                "measure_failed":   n_measfail,
+                "no_signal":        n_fail + n_measfail,
             })
+            if n_fail or n_timeout or n_measfail:
+                log.warning(
+                    "[%s] %-30s %d/%d loops gave NO SIGNAL "
+                    "(compile_failed=%d, compile_timeout=%d, measure_failed=%d)",
+                    label, benchmark_dir.name, n_fail + n_timeout + n_measfail,
+                    len(bmark_rewards), n_fail, n_timeout, n_measfail,
+                )
 
     avg_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
     avg_adv    = sum(all_advantages) / len(all_advantages) if all_advantages else 0.0
@@ -2157,9 +2183,12 @@ def main() -> None:
 
         test_results_file = str(ckpt_dir / "test_results.csv")
         fieldnames = ["benchmark", "loops", "avg_reward", "min_reward",
-                      "max_reward", "loops_win", "loops_regression", "verdict"]
+                      "max_reward", "loops_win", "loops_regression",
+                      "loops_noop", "compile_failed", "compile_timeout",
+                      "measure_failed", "no_signal", "verdict"]
         with open(test_results_file, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
+            writer = csv.DictWriter(f, fieldnames=fieldnames, restval="",
+                                    extrasaction="ignore")
             writer.writeheader()
             for entry in per_b:
                 writer.writerow(entry)
