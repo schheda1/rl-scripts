@@ -188,6 +188,12 @@ def main() -> None:
                 cached = False
                 fresh += 1
                 kernel_filter, baseline_ms = env._resolve_measurement(lr)
+                # `timed_out` rather than testing reward == -1.0 below: on a
+                # compile failure that did NOT time out, `reward` was never
+                # assigned this iteration, so the old test either raised
+                # UnboundLocalError or — worse — read a STALE reward leaked from
+                # the previous loop and cached a compile failure as a timeout.
+                timed_out = False
                 try:
                     ok = compile_single_loop(
                         env._benchmark_dir, loop_idx=lr.loop_idx,
@@ -195,7 +201,7 @@ def main() -> None:
                         filename=lr.filename, triple=lr.triple,
                         arch=args.arch)
                 except subprocess.TimeoutExpired:
-                    ok, reward = False, -1.0
+                    ok, timed_out = False, True
                 if ok:
                     try:
                         modified = measure_kernel_time(
@@ -215,8 +221,8 @@ def main() -> None:
                         # Measurement failure — infrastructure, not the action's
                         # fault.  Score 0 and do NOT cache (may be transient).
                         reward, cacheable = 0.0, False
-                elif reward == -1.0:
-                    cacheable = True                     # compile timeout
+                elif timed_out:
+                    reward, cacheable = -1.0, True       # compile timeout
                 else:
                     # Compile failure — same penalty training uses, so the gate
                     # curves sit on the reward scale the policy was trained on.
