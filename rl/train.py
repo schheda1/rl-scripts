@@ -543,8 +543,24 @@ def measure_baselines(
             b.name, total_ms, len(per_kernel_ms),
         )
 
-    log.info("Baseline cache: %d benchmarks total (%d newly measured)",
-             len(cache), len(benchmarks))
+    # Accounting: len(benchmarks) is what was ATTEMPTED this call (the ones not
+    # already cached), not what succeeded.  Report both — a benchmark without a
+    # baseline is silently skipped by every worker in every epoch, so a failure
+    # here permanently removes its loops from training.
+    attempted = len(benchmarks)
+    succeeded = sum(1 for b in benchmarks if b.name in cache)
+    failed    = attempted - succeeded
+    log.info(
+        "Baseline cache: %d benchmarks total (attempted %d, succeeded %d, failed %d)",
+        len(cache), attempted, succeeded, failed,
+    )
+    if failed:
+        _lost = [b.name for b in benchmarks if b.name not in cache]
+        log.warning(
+            "%d benchmarks have NO baseline and will be skipped in EVERY epoch "
+            "(their loops never become training samples): %s",
+            failed, _lost,
+        )
 
     if cache_file is not None:
         try:
@@ -1280,23 +1296,29 @@ def _send_loop_result(
     cached: bool = False,
     factor_active: bool = True,
 ) -> None:
-    """Put one loop result onto result_q in the appropriate format."""
-    import torch
-    from agent import RolloutEntry
+    """
+    Put one loop result onto result_q in the appropriate format.
+
+    IMPORTANT: only plain Python types cross the queue — never torch tensors.
+    `torch.multiprocessing`'s Queue passes tensors by SHARED MEMORY, and the
+    backing store is released when the producing worker exits.  Once workers
+    became fast (near-100% reward-cache hits) they finished and exited while
+    main was still inside ppo_update, so main's queue.get() raised on unpickling
+    and the sample was silently dropped — 15k of 30k samples lost in the
+    2026-07 run.  Lists are pickled by value and have no such lifetime coupling.
+    """
     if mode == "train":
         result_q.put({
             "type":      "entry",
-            "entry":     RolloutEntry(
-                state1=pre_features.cpu(),
-                state2=step2_features.cpu(),
-                action1=unmerge,
-                action2=factor_idx,
-                log_prob1=log_p1.cpu(),
-                log_prob2=log_p2.cpu(),
-                reward=reward,
-                mask2=mask2.cpu() if mask2 is not None else None,
-                factor_active=factor_active,
-            ),
+            # RolloutEntry payload, as plain Python (rebuilt in main)
+            "state1":        pre_features.detach().cpu().tolist(),
+            "state2":        step2_features.detach().cpu().tolist(),
+            "action1":       int(unmerge),
+            "action2":       int(factor_idx),
+            "log_prob1":     float(log_p1),
+            "log_prob2":     float(log_p2),
+            "mask2":         mask2.detach().cpu().tolist() if mask2 is not None else None,
+            "factor_active": bool(factor_active),
             "benchmark": bench_name,
             "loop_idx":  loop_idx,
             "unmerge":   unmerge,
@@ -1436,11 +1458,27 @@ def run_parallel_epoch(
     train_unrolls     = 0
     done_count = 0
 
+    dropped_msgs = 0
     while done_count < n_workers:
         try:
             msg = result_q.get(timeout=worker_msg_timeout)
-        except Exception:
-            log.warning("result_q timed out waiting for workers — checking alive")
+        except queue.Empty:
+            log.warning("result_q idle for %ds — checking workers are alive",
+                        worker_msg_timeout)
+            if not any(p.is_alive() for p in workers):
+                log.error("All workers have died unexpectedly")
+                break
+            continue
+        except Exception as e:
+            # NOT a timeout: the message itself failed to arrive/deserialize.
+            # Each occurrence is a LOST training sample, so log it distinctly —
+            # conflating this with a timeout hid ~15k dropped samples in the
+            # 2026-07 run.  Payloads are now plain Python (see
+            # _send_loop_result), which should make this path unreachable.
+            dropped_msgs += 1
+            log.error("result_q message DROPPED (%s: %s) — sample lost, "
+                      "%d dropped so far this epoch",
+                      type(e).__name__, e, dropped_msgs)
             if not any(p.is_alive() for p in workers):
                 log.error("All workers have died unexpectedly")
                 break
@@ -1449,7 +1487,20 @@ def run_parallel_epoch(
         mtype = msg["type"]
 
         if mtype == "entry":
-            buffer.append(msg["entry"])
+            # Rebuild the RolloutEntry from plain Python — workers send lists,
+            # never tensors (see _send_loop_result for why).
+            buffer.append(RolloutEntry(
+                state1=torch.tensor(msg["state1"], dtype=torch.float32),
+                state2=torch.tensor(msg["state2"], dtype=torch.float32),
+                action1=msg["action1"],
+                action2=msg["action2"],
+                log_prob1=torch.tensor(msg["log_prob1"], dtype=torch.float32),
+                log_prob2=torch.tensor(msg["log_prob2"], dtype=torch.float32),
+                reward=msg["reward"],
+                mask2=(torch.tensor(msg["mask2"], dtype=torch.bool)
+                       if msg["mask2"] is not None else None),
+                factor_active=msg["factor_active"],
+            ))
             train_samples += 1
             train_rewards.append(msg["reward"])
             train_advantages.append(msg["reward"] - msg["value"])
@@ -1472,10 +1523,8 @@ def run_parallel_epoch(
                 # Don't cache the pre-features fallback (extraction failure
                 # sets state2 = state1); a genuine post-unmerge vector that
                 # happens to equal state1 just gets re-extracted — harmless.
-                if _pf_key not in postf_cache and not torch.equal(
-                    msg["entry"].state2, msg["entry"].state1
-                ):
-                    postf_cache[_pf_key] = msg["entry"].state2.tolist()
+                if _pf_key not in postf_cache and msg["state2"] != msg["state1"]:
+                    postf_cache[_pf_key] = msg["state2"]
             if msg.get("cached"):
                 train_cache_hits += 1
 
@@ -1516,6 +1565,19 @@ def run_parallel_epoch(
 
     for p in workers:
         p.join(timeout=30)
+
+    # Sample accounting: every assigned loop should produce exactly one entry.
+    # A shortfall means loops were skipped (no baseline / copy failure) or
+    # messages were dropped — both previously silent.  Surface it every epoch.
+    _assigned = len(train_loop_assignments)
+    if train_samples < _assigned:
+        log.warning(
+            "Sample accounting: %d/%d assigned loops produced samples "
+            "(%d missing: %d dropped messages, %d step_failed, rest skipped "
+            "in-worker — grep 'No baseline cached' / 'Failed to copy')",
+            train_samples, _assigned, _assigned - train_samples,
+            dropped_msgs, train_missed,
+        )
 
     # Flush partial buffer
     if len(buffer) > 0:
@@ -1580,7 +1642,17 @@ def run_parallel_epoch(
         while val_done_count < n_workers:
             try:
                 msg = val_result_q.get(timeout=worker_msg_timeout)
-            except Exception:
+            except queue.Empty:
+                log.warning("val_result_q idle for %ds — checking workers",
+                            worker_msg_timeout)
+                if not any(p.is_alive() for p in val_workers):
+                    log.error("All val workers have died unexpectedly")
+                    break
+                continue
+            except Exception as e:
+                # Dropped message = lost val sample (see the train loop).
+                log.error("val_result_q message DROPPED (%s: %s) — sample lost",
+                          type(e).__name__, e)
                 if not any(p.is_alive() for p in val_workers):
                     log.error("All val workers have died unexpectedly")
                     break
