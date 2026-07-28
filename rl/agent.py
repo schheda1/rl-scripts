@@ -598,12 +598,32 @@ class BanditAgent(Agent):
         Q-regression update.  (Method name kept so every train.py call site is
         agnostic to the agent type.)
 
-        Unlike the PPO update, Q2 trains on ALL samples including no-ops:
-        factor_active gating exists to keep no-ops out of the FactorActor's
-        *policy-gradient* ratio, but in regression every (state, action,
-        reward) triple is valid supervision — and the no-op's by-definition
-        reward of 0 is exactly what anchors the factor==1 arm, without which
-        argmax would compare trained arms against an untrained output.
+        Two Q-heads over a 2-step decision (pick unmerge, then pick factor):
+
+          Q2(s2, f)  <- r                         (leaf: measured reward)
+          Q1(s1, u)  <- max_f' Q2(s2(u), f')      (node: best reachable leaf)
+
+        The Q1 target is the MAX over factors, NOT the raw reward.  Regressing
+        Q1 to r (as the first cut did) drives it to the MEAN reward over the
+        factors sampled under u — because several (s1,u,·) rows share one Q1
+        output and MSE averages them.  The unmerge branch has the widest factor
+        spread AND a fat negative tail (failures/timeouts), so its mean is
+        dragged below the unroll branch and argmax_u picks u=0 even on loops
+        where the BEST unmerge factor is the global winner.  The oracle audit
+        shows unmerge is the best action on ~35% of loops, so a mean target
+        systematically forfeits them — this is the extinction bug, in the
+        target itself.  The max backup makes Q1(s1,u) predict the value of
+        committing to u and THEN acting greedily — exactly what select_unmerge
+        does at inference.
+
+        Note (maximization bias): early on Q2 is noisy, so max_f' Q2 overshoots
+        (max of noise).  This inflates BOTH branches' Q1 roughly equally (same
+        ~10 factors, trip-count mask invariant to unmerge), so argmax_u — the
+        only thing that drives selection — is largely unbiased; the absolute Q1
+        scale is not used.  It anneals out as Q2 -> r.
+
+        Q2 trains on ALL samples including no-ops: every (s2, f, r) triple is
+        valid supervision, and the no-op's r=0 anchors the factor==1 arm.
         """
         total_q_loss = 0.0
         total_value_loss = 0.0
@@ -621,14 +641,29 @@ class BanditAgent(Agent):
                                   dtype=torch.long, device=self.device)
                 r = torch.tensor([e.reward for e in batch],
                                  dtype=torch.float32, device=self.device)
+                # Per-entry factor mask (all-valid when None), so the max backup
+                # ranges over the SAME trip-count-valid factors that
+                # select_factor considers at inference.
+                m2 = torch.stack([
+                    e.mask2 if e.mask2 is not None
+                    else torch.ones(N_FACTORS, dtype=torch.bool)
+                    for e in batch
+                ]).to(self.device)
 
+                q2_all = self.factor_actor.forward(s2)            # (B, N_FACTORS)
+                q2 = q2_all.gather(1, a2.unsqueeze(1)).squeeze(1)  # taken factor
                 q1 = self.unmerge_actor.forward(s1).gather(
                     1, a1.unsqueeze(1)).squeeze(1)
-                q2 = self.factor_actor.forward(s2).gather(
-                    1, a2.unsqueeze(1)).squeeze(1)
                 values = self.critic.value(s1)
 
-                q_loss = F.mse_loss(q1, r) + F.mse_loss(q2, r)
+                # Bootstrap target for Q1: best VALID factor value in this
+                # entry's branch (s2 already corresponds to this entry's u).
+                # Detached — Q2 is supervised only by its own r regression.
+                with torch.no_grad():
+                    q1_target = q2_all.detach().masked_fill(
+                        ~m2, float("-inf")).max(dim=1).values
+
+                q_loss = F.mse_loss(q1, q1_target) + F.mse_loss(q2, r)
                 value_loss = F.mse_loss(values, r)
                 loss = q_loss + self.value_loss_coef * value_loss
 

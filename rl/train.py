@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from agent import (
     Agent, BanditAgent, RolloutBuffer, RolloutEntry, FACTOR_VALUES, N_FEATURES,
+    build_factor_mask, _IDX_TRIP_COUNT_KNOWN, _IDX_TRIP_COUNT,
 )
 from environment import GpuLoopEnv
 from hecbench import (
@@ -1585,6 +1586,13 @@ def build_warm_start_entries(
     anchor (reward 0 by definition) is added per loop so the factor==1 arm
     and the unmerge==0 row are grounded rather than left at their random
     initialisation during warm start.
+
+    Every entry carries the loop's trip-count factor mask (build_factor_mask
+    on the RAW features).  The bandit's Q1 target is max over VALID factors, so
+    an unmasked warm-start entry would let Q1 back up an untrained (noise) Q2
+    for a trip-count-invalid factor — inflating exactly the unmerge branch this
+    is meant to value correctly.  The mask is invariant under unmerge (trip
+    count is), so one mask per loop serves both the u=0 and u=1 rows.
     """
     by_loop = {
         f"{a['benchmark_name']}|{a['loop_idx']}": a
@@ -1592,6 +1600,12 @@ def build_warm_start_entries(
     }
     zero = torch.tensor(0.0)
     entries: list[RolloutEntry] = []
+
+    def _loop_mask(la: dict) -> torch.Tensor:
+        raw = la["pre_features_raw"]
+        trip_known = raw[_IDX_TRIP_COUNT_KNOWN] > 0.5
+        trip_count = int(raw[_IDX_TRIP_COUNT])
+        return build_factor_mask(trip_known, trip_count)
 
     n_cached = 0
     for key, r in reward_cache.items():
@@ -1619,7 +1633,7 @@ def build_warm_start_entries(
             state1=s1, state2=s2, action1=um,
             action2=FACTOR_VALUES.index(fac),
             log_prob1=zero, log_prob2=zero,
-            reward=float(r), mask2=None, factor_active=True,
+            reward=float(r), mask2=_loop_mask(la), factor_active=True,
         ))
         n_cached += 1
 
@@ -1630,7 +1644,7 @@ def build_warm_start_entries(
         entries.append(RolloutEntry(
             state1=s1, state2=s1, action1=0, action2=noop_idx,
             log_prob1=zero, log_prob2=zero,
-            reward=0.0, mask2=None, factor_active=True,
+            reward=0.0, mask2=_loop_mask(a), factor_active=True,
         ))
     return entries, n_cached, len(train_loop_assignments)
 
