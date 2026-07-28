@@ -479,6 +479,151 @@ class Agent:
             group["weight_decay"] = wd
 
 
+class BanditAgent(Agent):
+    """
+    Value-based contextual-bandit agent, exchangeable with the PPO Agent
+    (--agent bandit).  Same formulation — one decision per loop, immediate
+    reward — different solution method:
+
+      - the two "actor" nets are reinterpreted as Q-heads:
+          unmerge_actor(s1) -> Q(s1, unmerge in {0,1})
+          factor_actor(s2)  -> Q(s2, factor)
+        trained by direct reward regression instead of the clipped policy
+        gradient;
+      - collection-time selection is epsilon-greedy over Q instead of softmax
+        sampling; greedy (val/test) selection is argmax of forward(), which is
+        the IDENTICAL code path the PPO agent uses, so evaluation semantics
+        and eval tooling carry over unchanged.
+
+    Deliberately reuses the parent's attribute names and net shapes, so
+    _get_weights / _load_weights / save / load and the worker weight-broadcast
+    protocol work untouched, and the critic keeps its role + loss so the
+    value_loss metric stays comparable across agent types.
+
+    Because Q-regression needs no behaviour-policy log-probs, the reward cache
+    is a valid training set: warm_start() ingests every cached (state, action,
+    reward) cell before epoch 1 — the thing PPO structurally could not do
+    (cached cells carry no collection-time log-probs, so the importance ratio
+    is undefined for them).
+
+    Metric-column semantics for bandit runs (documented, not schema-changed):
+      actor_loss = Q1+Q2 regression MSE, value_loss = critic MSE (as in PPO),
+      entropy = current epsilon.  RolloutEntry log_probs are 0.0 dummies.
+    """
+
+    def __init__(self, *, epsilon: float = 0.1, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+
+    def select_unmerge(
+        self, features: torch.Tensor, greedy: bool = False
+    ) -> tuple[int, torch.Tensor]:
+        with torch.no_grad():
+            q = self.unmerge_actor.forward(
+                features.unsqueeze(0).to(self.device))[0]
+            if greedy or random.random() >= self.epsilon:
+                action = int(q.argmax().item())
+            else:
+                action = random.randrange(2)
+        return action, torch.tensor(0.0)
+
+    def select_factor(
+        self,
+        features: torch.Tensor,
+        trip_known: bool = False,
+        trip_count: int = 0,
+        loop_idx: Optional[int] = None,
+        greedy: bool = False,
+    ) -> tuple[int, torch.Tensor, torch.Tensor]:
+        mask = build_factor_mask(trip_known, trip_count)
+        with torch.no_grad():
+            q = self.factor_actor.forward(
+                features.unsqueeze(0).to(self.device))[0]
+            q = q.masked_fill(~mask.to(q.device), float("-inf"))
+            if greedy or random.random() >= self.epsilon:
+                factor_idx = int(q.argmax().item())
+            else:
+                # Uniform over trip-count-valid factors only.
+                valid = [i for i, ok in enumerate(mask.tolist()) if ok]
+                factor_idx = random.choice(valid)
+        return factor_idx, torch.tensor(0.0), mask
+
+    def ppo_update(self, buffer: RolloutBuffer) -> dict[str, float]:
+        """
+        Q-regression update.  (Method name kept so every train.py call site is
+        agnostic to the agent type.)
+
+        Unlike the PPO update, Q2 trains on ALL samples including no-ops:
+        factor_active gating exists to keep no-ops out of the FactorActor's
+        *policy-gradient* ratio, but in regression every (state, action,
+        reward) triple is valid supervision — and the no-op's by-definition
+        reward of 0 is exactly what anchors the factor==1 arm, without which
+        argmax would compare trained arms against an untrained output.
+        """
+        total_q_loss = 0.0
+        total_value_loss = 0.0
+        num_updates = 0
+
+        for _ in range(self.K):
+            for batch in buffer.sample_batches(self.batch_size):
+                if not batch:
+                    continue
+                s1 = torch.stack([e.state1 for e in batch]).to(self.device)
+                s2 = torch.stack([e.state2 for e in batch]).to(self.device)
+                a1 = torch.tensor([e.action1 for e in batch],
+                                  dtype=torch.long, device=self.device)
+                a2 = torch.tensor([e.action2 for e in batch],
+                                  dtype=torch.long, device=self.device)
+                r = torch.tensor([e.reward for e in batch],
+                                 dtype=torch.float32, device=self.device)
+
+                q1 = self.unmerge_actor.forward(s1).gather(
+                    1, a1.unsqueeze(1)).squeeze(1)
+                q2 = self.factor_actor.forward(s2).gather(
+                    1, a2.unsqueeze(1)).squeeze(1)
+                values = self.critic.value(s1)
+
+                q_loss = F.mse_loss(q1, r) + F.mse_loss(q2, r)
+                value_loss = F.mse_loss(values, r)
+                loss = q_loss + self.value_loss_coef * value_loss
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                if self.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self._all_params, self.max_grad_norm)
+                self.optimizer.step()
+
+                total_q_loss += q_loss.item()
+                total_value_loss += value_loss.item()
+                num_updates += 1
+
+        n = max(num_updates, 1)
+        return {
+            "actor_loss": total_q_loss / n,
+            "value_loss": total_value_loss / n,
+            "entropy": self.epsilon,
+        }
+
+    def warm_start(self, entries: "list[RolloutEntry]",
+                   epochs: int) -> dict[str, float]:
+        """
+        Regress the Q-heads + critic on pre-collected (state, action, reward)
+        entries — the reward cache — before any environment interaction.
+        Each `epoch` here is one ppo_update() call, i.e. K passes over the
+        data; total passes = epochs * K.  Returns the last call's stats.
+        """
+        stats: dict[str, float] = {}
+        if not entries:
+            return stats
+        buf = RolloutBuffer(capacity=len(entries))
+        for e in entries:
+            buf.append(e)
+        for _ in range(max(epochs, 0)):
+            stats = self.ppo_update(buf)
+        return stats
+
+
 def _policy_entropy(logits: torch.Tensor) -> torch.Tensor:
     """
     Mean entropy of a categorical distribution over a batch of logits.

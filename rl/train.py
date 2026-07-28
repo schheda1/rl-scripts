@@ -43,7 +43,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from agent import Agent, RolloutBuffer, RolloutEntry, FACTOR_VALUES, N_FEATURES
+from agent import (
+    Agent, BanditAgent, RolloutBuffer, RolloutEntry, FACTOR_VALUES, N_FEATURES,
+)
 from environment import GpuLoopEnv
 from hecbench import (
     ARCH, FEATURE_COLUMNS, STUDY_A_NUMPATHS_MIN, STUDY_A_NUMPATHS_MAX,
@@ -162,6 +164,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-every", type=int, default=1,
                    help="Save a checkpoint every N epochs (default: every epoch)")
     p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--agent", choices=("ppo", "bandit"), default="ppo",
+                   help="Solution method for the (identical) contextual-bandit "
+                        "formulation: 'ppo' = on-policy clipped policy gradient; "
+                        "'bandit' = value-based Q-regression with epsilon-greedy "
+                        "collection, warm-started from the reward cache. Same "
+                        "nets, buffer, workers, caches, and eval paths; greedy "
+                        "val/test selection is identical code for both. "
+                        "(default: ppo)")
+    p.add_argument("--bandit-epsilon", type=float, default=0.3,
+                   help="Bandit collection epsilon at epoch 1; decays linearly "
+                        "to --bandit-epsilon-final over the run. Ignored for "
+                        "--agent ppo. (default: 0.3)")
+    p.add_argument("--bandit-epsilon-final", type=float, default=0.05,
+                   help="Bandit epsilon at the last epoch. Set equal to "
+                        "--bandit-epsilon to disable the decay. (default: 0.05)")
+    p.add_argument("--bandit-warm-epochs", type=int, default=10,
+                   help="Warm-start passes over the cached (state, action, "
+                        "reward) cells before epoch 1 (each pass = K update "
+                        "epochs). 0 disables. Ignored for --agent ppo. "
+                        "(default: 10)")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01,
                    help="AdamW decoupled weight decay on the networks' weight "
@@ -1027,7 +1049,7 @@ def _worker_fn(
 
     import torch
     from agent import (
-        Agent, RolloutEntry, FACTOR_VALUES,
+        Agent, BanditAgent, RolloutEntry, FACTOR_VALUES,
         _IDX_TRIP_COUNT_KNOWN, _IDX_TRIP_COUNT,
     )
     from environment import GpuLoopEnv, LoopRecord
@@ -1055,7 +1077,10 @@ def _worker_fn(
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        agent = Agent(
+        # Agent type mirrors main's --agent flag; both classes expose the same
+        # interface (select_*, predict_value, ppo_update) and net shapes, so
+        # everything downstream — weight broadcast, buffer, queue — is agnostic.
+        _common = dict(
             clip_eps=hparams["clip_eps"],
             K=hparams["K"],
             batch_size=hparams["batch_size"],
@@ -1066,6 +1091,11 @@ def _worker_fn(
             max_grad_norm=hparams["max_grad_norm"],
             device=device,
         )
+        if hparams.get("agent_type") == "bandit":
+            agent = BanditAgent(epsilon=hparams.get("bandit_epsilon", 0.0),
+                                **_common)
+        else:
+            agent = Agent(**_common)
         _load_weights(agent, initial_weights)
 
         worker_normalizer = FeatureNormalizer.from_state_dict(
@@ -1495,6 +1525,84 @@ def _send_loop_result(
         })
 
 
+def build_warm_start_entries(
+    train_loop_assignments: list[dict],
+    reward_cache: dict,
+    postf_cache: dict,
+    normalizer,
+) -> "tuple[list[RolloutEntry], int, int]":
+    """
+    Turn the reward cache into a (state, action, reward) training set for the
+    bandit agent's warm start.  Returns (entries, n_cached, n_anchors).
+
+    Only TRAIN-split loops are included: the cache also holds val-harvested
+    cells, and warming up on those would leak the val set into training and
+    quietly bias best-checkpoint selection.
+
+    Penalty cells (compile failure / timeout) are included deliberately —
+    avoidance is part of what the Q-heads must learn.  A synthetic no-op
+    anchor (reward 0 by definition) is added per loop so the factor==1 arm
+    and the unmerge==0 row are grounded rather than left at their random
+    initialisation during warm start.
+    """
+    by_loop = {
+        f"{a['benchmark_name']}|{a['loop_idx']}": a
+        for a in train_loop_assignments
+    }
+    zero = torch.tensor(0.0)
+    entries: list[RolloutEntry] = []
+
+    n_cached = 0
+    for key, r in reward_cache.items():
+        parts = key.split("|")
+        if len(parts) != 4:
+            continue
+        bench, li, um, fac = parts
+        la = by_loop.get(f"{bench}|{li}")
+        if la is None:
+            continue                      # val-split or no-longer-eligible loop
+        um, fac = int(um), int(fac)
+        if fac not in FACTOR_VALUES:
+            continue
+        s1 = normalizer.normalize(
+            torch.tensor(la["pre_features_raw"], dtype=torch.float32))
+        if um == 1:
+            pf = postf_cache.get(f"{bench}|{li}")
+            # Same fallback the live pipeline uses when post-unmerge feature
+            # extraction is unavailable: condition on pre-unmerge features.
+            s2 = (torch.tensor(pf, dtype=torch.float32)
+                  if pf is not None else s1)
+        else:
+            s2 = s1
+        entries.append(RolloutEntry(
+            state1=s1, state2=s2, action1=um,
+            action2=FACTOR_VALUES.index(fac),
+            log_prob1=zero, log_prob2=zero,
+            reward=float(r), mask2=None, factor_active=True,
+        ))
+        n_cached += 1
+
+    noop_idx = FACTOR_VALUES.index(1)
+    for a in train_loop_assignments:
+        s1 = normalizer.normalize(
+            torch.tensor(a["pre_features_raw"], dtype=torch.float32))
+        entries.append(RolloutEntry(
+            state1=s1, state2=s1, action1=0, action2=noop_idx,
+            log_prob1=zero, log_prob2=zero,
+            reward=0.0, mask2=None, factor_active=True,
+        ))
+    return entries, n_cached, len(train_loop_assignments)
+
+
+def _bandit_epsilon(args, epoch: int, total_epochs: int) -> float:
+    """Linear epsilon decay for --agent bandit, mirroring the entropy schedule."""
+    if getattr(args, "agent", "ppo") != "bandit":
+        return 0.0
+    frac = (epoch - 1) / (total_epochs - 1) if total_epochs > 1 else 0.0
+    return args.bandit_epsilon + frac * (
+        args.bandit_epsilon_final - args.bandit_epsilon)
+
+
 def run_parallel_eval(
     agent: Agent,
     loop_assignments: list[dict],
@@ -1536,6 +1644,8 @@ def run_parallel_eval(
         "entropy_coef":            args.entropy_coef,
         "weight_decay":            args.weight_decay,
         "max_grad_norm":           args.max_grad_norm,
+        "agent_type":              getattr(args, "agent", "ppo"),
+        "bandit_epsilon":          0.0,   # eval is greedy — epsilon unused
         "normalizer_state":        normalizer.state_dict(),
         "baseline_cache":          baseline_cache,
         "reward_cache":            dict(reward_cache or {}) if use_reward_cache else {},
@@ -1756,6 +1866,8 @@ def run_parallel_epoch(
         "entropy_coef":            args.entropy_coef,
         "weight_decay":            args.weight_decay,
         "max_grad_norm":           args.max_grad_norm,
+        "agent_type":              getattr(args, "agent", "ppo"),
+        "bandit_epsilon":          _bandit_epsilon(args, current_epoch, total_epochs),
         "normalizer_state":        normalizer.state_dict(),
         "baseline_cache":          baseline_cache,
         # Read-only snapshots for the workers; main merges new results into
@@ -2209,7 +2321,7 @@ def main() -> None:
     if args.num_workers > 1:
         log.info("Parallel mode: %d workers, one GPU each", args.num_workers)
 
-    agent = Agent(
+    _agent_common = dict(
         clip_eps=args.clip_eps,
         K=args.K,
         batch_size=args.batch_size,
@@ -2220,6 +2332,14 @@ def main() -> None:
         max_grad_norm=args.max_grad_norm,
         device=device,
     )
+    if args.agent == "bandit":
+        agent = BanditAgent(epsilon=args.bandit_epsilon, **_agent_common)
+        log.info("Agent: value-based bandit (epsilon %.2f -> %.2f, "
+                 "warm-start epochs %d)",
+                 args.bandit_epsilon, args.bandit_epsilon_final,
+                 args.bandit_warm_epochs)
+    else:
+        agent = Agent(**_agent_common)
     if args.resume:
         agent.load(args.resume)
         log.info("Resumed from %s", args.resume)
@@ -2338,6 +2458,32 @@ def main() -> None:
         len(train_loop_assignments), len(val_loop_assignments),
     )
 
+    # --- Bandit warm start: regress Q-heads on the cached measurements ---
+    # Q-regression needs no behaviour-policy log-probs, so every cached cell
+    # is valid supervision — the PPO path structurally cannot do this.
+    if args.agent == "bandit" and args.bandit_warm_epochs > 0:
+        if args.resume:
+            log.info("Bandit warm start SKIPPED (--resume: the checkpoint "
+                     "already encodes its training history)")
+        else:
+            ws_entries, n_cells, n_anchors = build_warm_start_entries(
+                train_loop_assignments, reward_cache, postf_cache, normalizer)
+            if n_cells == 0:
+                log.warning(
+                    "Bandit warm start: 0 usable cached cells (empty or "
+                    "non-train-split cache) — starting from scratch; "
+                    "expect the first epochs to be mostly exploration")
+            else:
+                log.info(
+                    "Bandit warm start: %d cached cells + %d no-op anchors, "
+                    "%d passes x K=%d update epochs",
+                    n_cells, n_anchors, args.bandit_warm_epochs, args.K)
+                ws_stats = agent.warm_start(ws_entries, args.bandit_warm_epochs)
+                log.info(
+                    "Warm start done | q_loss=%.4f value_loss=%.4f",
+                    ws_stats.get("actor_loss", float("nan")),
+                    ws_stats.get("value_loss", float("nan")))
+
     total_updates = 0
     rng = random.Random(args.split_seed)
 
@@ -2360,7 +2506,14 @@ def main() -> None:
         agent.entropy_coef = (
             args.entropy_coef + frac * (args.entropy_coef_final - args.entropy_coef)
         )
-        log.info("Entropy coefficient this epoch: %.5f", agent.entropy_coef)
+        if args.agent == "bandit":
+            # Workers get their epsilon via hparams (run_parallel_epoch computes
+            # the same schedule); set it on the main agent too so the sequential
+            # path and the entropy metric column (= epsilon) stay correct.
+            agent.epsilon = _bandit_epsilon(args, epoch, args.epochs)
+            log.info("Bandit epsilon this epoch: %.4f", agent.epsilon)
+        else:
+            log.info("Entropy coefficient this epoch: %.5f", agent.entropy_coef)
 
         # ==============================================================
         # PARALLEL PATH  (--num-workers > 1)
