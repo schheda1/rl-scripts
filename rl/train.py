@@ -134,10 +134,15 @@ def parse_args() -> argparse.Namespace:
                         "over-aggressive actions. Must rank below no-op (0.0); kept "
                         "well above -1.0 so the ~36%% failure mass does not swamp the "
                         "genuine slowdown signal. (default: -0.25)")
-    p.add_argument("--reward-deadzone", type=float, default=0.01,
-                   help="Rewards with |r| below this are treated as measurement noise "
-                        "and set to exactly 0.0. Applied AFTER failure penalties, so "
-                        "penalties are never zeroed. Set 0 to disable. (default: 0.01)")
+    p.add_argument("--reward-deadzone", type=float, default=0.005,
+                   help="Measured rewards with |r| below this are treated as "
+                        "measurement noise and set to exactly 0.0 (symmetric: "
+                        "small + and small - alike). Failure/timeout penalties "
+                        "return early and are never zeroed. Lowered from 0.01 to "
+                        "0.005 so genuine small speedups survive — the oracle "
+                        "audit shows real wins are large (>0.10), so this is a "
+                        "minor change, but 0.01 needlessly erased the small-gain "
+                        "tail. Set 0 to disable. (default: 0.005)")
     p.add_argument("--test-checkpoints", type=str, default="best,last",
                    help="Which checkpoints to run the final test evaluation on: "
                         "comma-separated from {best,last} or explicit .pt paths. "
@@ -163,6 +168,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--checkpoint-every", type=int, default=1,
                    help="Save a checkpoint every N epochs (default: every epoch)")
+    p.add_argument("--live-val", action="store_true",
+                   help="Select best.pt from a FRESH-measured val pass instead of "
+                        "the cache-frozen one. OFF by default: the cache-frozen "
+                        "val reward is constant once the policy stops changing, so "
+                        "best.pt pins to the first plateau — but fresh val does "
+                        "NOT fix the deeper issues (exploration + whether val even "
+                        "tracks generalization), and it costs a full extra "
+                        "compile+measure pass over the val split every epoch. Turn "
+                        "on only when comparing model-selection criteria. "
+                        "(default: off — behaviour unchanged)")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--agent", choices=("ppo", "bandit"), default="ppo",
                    help="Solution method for the (identical) contextual-bandit "
@@ -205,10 +220,29 @@ def parse_args() -> argparse.Namespace:
                    help="Entropy bonus coefficient (encourages exploration). "
                         "Increase if no-op rate stays >80%% early in training.")
     p.add_argument("--entropy-coef-final", type=float, default=0.001,
-                   help="Entropy coefficient at the LAST epoch: the coefficient "
-                        "decays linearly from --entropy-coef to this value over "
-                        "the run, so the policy explores early and commits late. "
-                        "Set equal to --entropy-coef to disable the decay.")
+                   help="FACTOR-head entropy coefficient at the LAST epoch: the "
+                        "coefficient decays linearly from --entropy-coef to this "
+                        "value over the run, so the policy explores early and "
+                        "commits late. Set equal to --entropy-coef to disable "
+                        "the decay.")
+    p.add_argument("--entropy-coef-unmerge", type=float, default=0.05,
+                   help="Entropy coefficient for the BINARY unmerge head, held "
+                        "CONSTANT across the run (no decay). Separate from the "
+                        "factor-head coefficient because one shared weight let "
+                        "the 10-way factor head (max entropy ln10=2.30) swamp "
+                        "the binary head (ln2=0.69), starving unmerge toward "
+                        "extinction — yet the oracle shows unmerge is the best "
+                        "action on ~35%% of loops. Higher + flat keeps it alive. "
+                        "Set equal to --entropy-coef for the old shared-weight "
+                        "behaviour. (default: 0.05)")
+    p.add_argument("--logit-cap", type=float, default=4.0,
+                   help="Bound actor logits to [-C, C] via C*tanh(logit/C), "
+                        "capping softmax saturation — the mechanism of "
+                        "schedule-independent entropy collapse that LayerNorm + "
+                        "weight-decay left uncontrolled on the output layer. "
+                        "For the binary head this floors p(unmerge) at "
+                        "sigmoid(-2C). Monotone, so greedy argmax is unchanged. "
+                        "0 disables. Applies to --agent ppo only. (default: 4.0)")
     p.add_argument("--val-ratio", type=float, default=0.15,
                    help="Fraction of benchmarks held out for validation")
     p.add_argument("--test-ratio", type=float, default=0.15,
@@ -1095,7 +1129,14 @@ def _worker_fn(
             agent = BanditAgent(epsilon=hparams.get("bandit_epsilon", 0.0),
                                 **_common)
         else:
-            agent = Agent(**_common)
+            # logit_cap MUST match main: workers sample the behaviour policy, so
+            # an uncapped worker head would produce log-probs that don't match
+            # main's capped update policy, biasing every PPO ratio.
+            agent = Agent(
+                entropy_coef_unmerge=hparams.get("entropy_coef_unmerge"),
+                logit_cap=hparams.get("logit_cap", 0.0),
+                **_common,
+            )
         _load_weights(agent, initial_weights)
 
         worker_normalizer = FeatureNormalizer.from_state_dict(
@@ -1642,6 +1683,8 @@ def run_parallel_eval(
         "lr":                      args.lr,
         "value_loss_coef":         args.value_loss_coef,
         "entropy_coef":            args.entropy_coef,
+        "entropy_coef_unmerge":    getattr(args, "entropy_coef_unmerge", None),
+        "logit_cap":               getattr(args, "logit_cap", 0.0),
         "weight_decay":            args.weight_decay,
         "max_grad_norm":           args.max_grad_norm,
         "agent_type":              getattr(args, "agent", "ppo"),
@@ -1864,6 +1907,8 @@ def run_parallel_epoch(
         "lr":                      args.lr,
         "value_loss_coef":         args.value_loss_coef,
         "entropy_coef":            args.entropy_coef,
+        "entropy_coef_unmerge":    getattr(args, "entropy_coef_unmerge", None),
+        "logit_cap":               getattr(args, "logit_cap", 0.0),
         "weight_decay":            args.weight_decay,
         "max_grad_norm":           args.max_grad_norm,
         "agent_type":              getattr(args, "agent", "ppo"),
@@ -1924,6 +1969,8 @@ def run_parallel_epoch(
     train_actor_loss  = 0.0
     train_value_loss  = 0.0
     train_entropy     = 0.0
+    train_entropy_unmerge = 0.0   # per-head, to watch the binary head's collapse
+    train_entropy_factor  = 0.0
     train_updates     = 0
     train_cache_hits  = 0
     train_failures    = 0   # compile_failed + compile_timeout
@@ -2031,6 +2078,8 @@ def run_parallel_epoch(
                 train_actor_loss += stats["actor_loss"]
                 train_value_loss += stats["value_loss"]
                 train_entropy    += stats["entropy"]
+                train_entropy_unmerge += stats.get("entropy_unmerge", 0.0)
+                train_entropy_factor  += stats.get("entropy_factor", 0.0)
                 log.info(
                     "  PPO update #%d | actor_loss=%.4f | value_loss=%.4f | entropy=%.4f",
                     train_updates, stats["actor_loss"], stats["value_loss"], stats["entropy"],
@@ -2087,6 +2136,8 @@ def run_parallel_epoch(
         train_actor_loss += stats["actor_loss"]
         train_value_loss += stats["value_loss"]
         train_entropy    += stats["entropy"]
+        train_entropy_unmerge += stats.get("entropy_unmerge", 0.0)
+        train_entropy_factor  += stats.get("entropy_factor", 0.0)
         log.info(
             "Epoch-end PPO flush | actor_loss=%.4f | value_loss=%.4f | entropy=%.4f",
             stats["actor_loss"], stats["value_loss"], stats["entropy"],
@@ -2277,6 +2328,8 @@ def run_parallel_epoch(
         "train_actor_loss":    train_actor_loss / n_upd,
         "train_value_loss":    train_value_loss / n_upd,
         "train_entropy":       train_entropy / n_upd,
+        "train_entropy_unmerge": train_entropy_unmerge / n_upd,
+        "train_entropy_factor":  train_entropy_factor / n_upd,
         "train_updates":       train_updates,
         "train_noop_rate":     train_noops / _n_s,
         "train_unmerge_rate":  train_unmerges / _n_s,
@@ -2333,13 +2386,24 @@ def main() -> None:
         device=device,
     )
     if args.agent == "bandit":
+        # logit_cap / entropy_coef_unmerge are PPO-only: the bandit's heads are
+        # Q-values, not softmax logits — a tanh cap would distort Q regression,
+        # and there is no policy entropy term. Left at their (disabled) defaults.
         agent = BanditAgent(epsilon=args.bandit_epsilon, **_agent_common)
         log.info("Agent: value-based bandit (epsilon %.2f -> %.2f, "
                  "warm-start epochs %d)",
                  args.bandit_epsilon, args.bandit_epsilon_final,
                  args.bandit_warm_epochs)
     else:
-        agent = Agent(**_agent_common)
+        agent = Agent(
+            entropy_coef_unmerge=args.entropy_coef_unmerge,
+            logit_cap=args.logit_cap,
+            **_agent_common,
+        )
+        log.info("Agent: PPO (factor-entropy %.4f→%.4f, unmerge-entropy %.4f "
+                 "flat, logit_cap %.1f)",
+                 args.entropy_coef, args.entropy_coef_final,
+                 args.entropy_coef_unmerge, args.logit_cap)
     if args.resume:
         agent.load(args.resume)
         log.info("Resumed from %s", args.resume)
@@ -2499,9 +2563,12 @@ def main() -> None:
         _epoch_filter.set(epoch, args.epochs)
         log.info("=== Epoch %d / %d ===", epoch, args.epochs)
 
-        # Entropy-coefficient decay: linear from --entropy-coef (epoch 1) to
-        # --entropy-coef-final (last epoch).  PPO updates run on this (main)
-        # agent in both paths, so setting it here is sufficient.
+        # FACTOR-head entropy decay: linear from --entropy-coef (epoch 1) to
+        # --entropy-coef-final (last epoch).  The UNMERGE-head coefficient is
+        # held flat (set once in __init__) — it protects the binary head from
+        # extinction and must not decay to near-zero mid-run.  PPO updates run
+        # on this (main) agent in both paths, so setting it here is sufficient;
+        # workers never call ppo_update.
         frac = (epoch - 1) / (args.epochs - 1) if args.epochs > 1 else 0.0
         agent.entropy_coef = (
             args.entropy_coef + frac * (args.entropy_coef_final - args.entropy_coef)
@@ -2513,7 +2580,8 @@ def main() -> None:
             agent.epsilon = _bandit_epsilon(args, epoch, args.epochs)
             log.info("Bandit epsilon this epoch: %.4f", agent.epsilon)
         else:
-            log.info("Entropy coefficient this epoch: %.5f", agent.entropy_coef)
+            log.info("Entropy coef this epoch: factor=%.5f unmerge=%.5f (flat)",
+                     agent.entropy_coef, agent.entropy_coef_unmerge)
 
         # ==============================================================
         # PARALLEL PATH  (--num-workers > 1)
@@ -2623,6 +2691,8 @@ def main() -> None:
                 "train_actor_loss":    round(epoch_stats["train_actor_loss"], 6),
                 "train_value_loss":    round(epoch_stats["train_value_loss"], 6),
                 "train_entropy":       round(epoch_stats["train_entropy"], 6),
+                "train_entropy_unmerge": round(epoch_stats["train_entropy_unmerge"], 6),
+                "train_entropy_factor":  round(epoch_stats["train_entropy_factor"], 6),
                 "train_noop_rate":     round(epoch_stats["train_noop_rate"], 6),
                 "train_unmerge_rate":  round(epoch_stats["train_unmerge_rate"], 6),
                 "train_unroll_rate":   round(epoch_stats["train_unroll_rate"], 6),
@@ -2641,6 +2711,7 @@ def main() -> None:
                 "val_unmerge_rate":    round(epoch_stats["val_unmerge_rate"], 6),
                 "val_unroll_rate":     round(epoch_stats["val_unroll_rate"], 6),
                 "entropy_coef":        round(agent.entropy_coef, 6),
+                "entropy_coef_unmerge": round(agent.entropy_coef_unmerge, 6),
             })
 
             epoch_val_reward = epoch_stats["val_avg_reward"]
@@ -2660,6 +2731,8 @@ def main() -> None:
             epoch_actor_loss  = 0.0
             epoch_value_loss  = 0.0
             epoch_entropy     = 0.0
+            epoch_entropy_unmerge = 0.0
+            epoch_entropy_factor  = 0.0
             epoch_updates     = 0
 
             # Iterate over a snapshot; failed benchmarks are removed after the loop
@@ -2756,6 +2829,8 @@ def main() -> None:
                         epoch_actor_loss += stats["actor_loss"]
                         epoch_value_loss += stats["value_loss"]
                         epoch_entropy    += stats["entropy"]
+                        epoch_entropy_unmerge += stats.get("entropy_unmerge", 0.0)
+                        epoch_entropy_factor  += stats.get("entropy_factor", 0.0)
                         log.info(
                             "  PPO update #%d | actor_loss=%.4f | value_loss=%.4f | entropy=%.4f",
                             total_updates, stats["actor_loss"], stats["value_loss"], stats["entropy"],
@@ -2779,6 +2854,8 @@ def main() -> None:
                 epoch_actor_loss += stats["actor_loss"]
                 epoch_value_loss += stats["value_loss"]
                 epoch_entropy    += stats["entropy"]
+                epoch_entropy_unmerge += stats.get("entropy_unmerge", 0.0)
+                epoch_entropy_factor  += stats.get("entropy_factor", 0.0)
                 log.info(
                     "Epoch-end PPO update #%d | actor_loss=%.4f | value_loss=%.4f | entropy=%.4f",
                     total_updates, stats["actor_loss"], stats["value_loss"], stats["entropy"],
@@ -2821,14 +2898,41 @@ def main() -> None:
                 "train_actor_loss":    round(epoch_actor_loss / n_upd, 6),
                 "train_value_loss":    round(epoch_value_loss / n_upd, 6),
                 "train_entropy":       round(epoch_entropy / n_upd, 6),
+                "train_entropy_unmerge": round(epoch_entropy_unmerge / n_upd, 6),
+                "train_entropy_factor":  round(epoch_entropy_factor / n_upd, 6),
                 "val_avg_reward":      round(val_metrics.get("val_avg_reward", float("nan")), 6),
                 "val_avg_advantage":   round(val_metrics.get("val_avg_advantage", float("nan")), 6),
                 "val_samples":         val_metrics.get("val_samples", 0),
                 "val_missed":          val_metrics.get("val_missed", 0),
                 "entropy_coef":        round(agent.entropy_coef, 6),
+                "entropy_coef_unmerge": round(agent.entropy_coef_unmerge, 6),
             })
 
             epoch_val_reward = val_metrics.get("val_avg_reward", float("nan"))
+
+        # --- Optional live (fresh-measured) val for model selection ---
+        # By default epoch_val_reward is the cache-frozen greedy val reward,
+        # which is constant once the policy stops changing → best.pt pins to the
+        # first plateau. --live-val instead runs a fresh compile+measure val
+        # pass and selects on THAT. Deliberately does NOT write into
+        # reward_cache (use_reward_cache=False, and run_parallel_eval keeps its
+        # own local cache), so training data is untouched. Parallel path only —
+        # the sequential evaluate() has no cache-free mode.
+        if args.live_val and val_bmarks:
+            if args.num_workers > 1:
+                _val_assign = build_loop_assignments(val_bmarks, loop_records_map)
+                _lv = run_parallel_eval(
+                    agent, _val_assign, normalizer, baseline_cache,
+                    args.num_workers, args, label="liveval",
+                    use_reward_cache=False, postf_cache=postf_cache,
+                )
+                _lvr = _lv.get("liveval_avg_reward", float("nan"))
+                log.info("Live-val (fresh) avg_reward=%.4f (was cache-frozen "
+                         "%.4f)", _lvr, epoch_val_reward)
+                epoch_val_reward = _lvr
+            else:
+                log.warning("--live-val ignored: needs --num-workers > 1 "
+                            "(sequential evaluate() has no fresh-measure mode)")
 
         # --- Best-checkpoint tracking (both paths) ---
         # Greedy val reward decides "best"; NaN (empty val set) never wins.

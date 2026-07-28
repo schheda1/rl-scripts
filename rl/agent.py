@@ -18,16 +18,25 @@ Hyperparameters (all tunable via constructor):
   value_loss_coef  = 0.5   weight on critic MSE loss
   entropy_coef     = 0.01  weight on entropy bonus (encourages exploration)
 
-Entropy regularization:
-  Both actors have an entropy bonus subtracted from the total loss, weighted by
-  entropy_coef.  This prevents premature policy collapse to a deterministic
-  choice (e.g. always unmerge=0, or always factor=2) before the agent has seen
-  enough loops to know when each action is profitable.  The unmerge actor (binary)
-  is especially prone to early collapse given the small action space.
-  Entropy is computed from the CURRENT policy logits each batch, not the old
-  log-probs used in the clipped ratio — this is the standard PPO formulation.
-  Start with entropy_coef=0.01; increase if the no-op rate stays >80% early in
-  training, decrease if rewards plateau without improvement.
+Entropy regularization (PER HEAD):
+  Each actor has its own entropy-bonus coefficient, subtracted from the total
+  loss.  A SINGLE shared coefficient over entropy1+entropy2 let the 10-way
+  factor head (max entropy ln10=2.30) dominate the binary unmerge head (max
+  ln2=0.69), so the unmerge head — the one observed going extinct — got a
+  fraction of the exploration pressure.  entropy_coef_unmerge is separate and
+  defaults higher/flatter so unmerge cannot be starved out.  Entropy is
+  computed from the CURRENT policy logits each batch, not the old log-probs
+  used in the clipped ratio — the standard PPO formulation.
+
+Logit bound:
+  The actor heads pass their output through logit_cap * tanh(x / logit_cap),
+  bounding |logit| <= logit_cap.  Unbounded logit growth is the mechanism
+  behind schedule-independent entropy collapse; the cap floors the softmax
+  probabilities (for the binary head, p stays in [sigmoid(-2c), sigmoid(2c)]),
+  so no action — unmerge=1 in particular — can be driven to zero probability.
+  tanh is monotone, so greedy argmax selection and the bandit Q-argmax are
+  unchanged.  The Critic is NOT capped (logit_cap=0): it outputs a scalar
+  value, not logits.
 """
 
 import logging
@@ -92,7 +101,7 @@ def build_factor_mask(trip_known: bool, trip_count: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 class _MLP(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int) -> None:
+    def __init__(self, in_dim: int, out_dim: int, logit_cap: float = 0.0) -> None:
         super().__init__()
         # Hidden widths 128→64: the 93-dim input (18 structural + 75 IR2Vec)
         # needs more capacity than the 64→32 stack used for the 18-dim features.
@@ -102,6 +111,14 @@ class _MLP(nn.Module):
         # 2026-07 run's entropy collapsed 2.86→0.29 with neither in place.
         # NOTE: checkpoints from before LayerNorm cannot be loaded into this
         # architecture (missing-key error) — evaluate old runs with old code.
+        #
+        # logit_cap > 0: squash the OUTPUT through logit_cap*tanh(x/logit_cap)
+        # so |output| <= logit_cap.  Used by the actor heads to bound softmax
+        # logits (LayerNorm + weight-decay bound the hidden stack but leave the
+        # final projection — the layer that sets logit scale — uncontrolled).
+        # tanh adds no parameters, so this does NOT change state_dict keys:
+        # pre-cap checkpoints still load.  logit_cap=0 disables it (Critic).
+        self.logit_cap = logit_cap
         self.net = nn.Sequential(
             nn.Linear(in_dim, 128),
             nn.LayerNorm(128),
@@ -113,13 +130,16 @@ class _MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        out = self.net(x)
+        if self.logit_cap > 0:
+            out = self.logit_cap * torch.tanh(out / self.logit_cap)
+        return out
 
 
 class UnmergeActor(_MLP):
     """Policy 1: pre-unmerge features → P(unmerge ∈ {0, 1})."""
-    def __init__(self) -> None:
-        super().__init__(N_FEATURES, 2)
+    def __init__(self, logit_cap: float = 0.0) -> None:
+        super().__init__(N_FEATURES, 2, logit_cap=logit_cap)
 
     def log_prob(self, features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         logits = self.forward(features)
@@ -147,8 +167,8 @@ class FactorActor(_MLP):
     zero out invalid factor choices (e.g. factors exceeding a known trip count)
     before sampling.  Invalid actions receive -inf logit and zero probability.
     """
-    def __init__(self) -> None:
-        super().__init__(N_FEATURES, N_FACTORS)
+    def __init__(self, logit_cap: float = 0.0) -> None:
+        super().__init__(N_FEATURES, N_FACTORS, logit_cap=logit_cap)
 
     def log_prob(
         self,
@@ -261,6 +281,8 @@ class Agent:
         lr: float = 3e-4,
         value_loss_coef: float = 0.5,
         entropy_coef: float = 0.01,
+        entropy_coef_unmerge: Optional[float] = None,
+        logit_cap: float = 0.0,
         weight_decay: float = 0.01,
         max_grad_norm: float = 0.5,
         device: Optional[torch.device] = None,
@@ -269,14 +291,23 @@ class Agent:
         self.K = K
         self.batch_size = batch_size
         self.value_loss_coef = value_loss_coef
+        # entropy_coef applies to the FACTOR head; the UNMERGE head has its own
+        # coefficient so the binary head (max entropy ln2) is not swamped by the
+        # 10-way factor head (max entropy ln10) under one shared weight.  When
+        # unset it falls back to entropy_coef (exactly the old single-coef
+        # behaviour), so existing call sites are unchanged.
         self.entropy_coef = entropy_coef
+        self.entropy_coef_unmerge = (
+            entropy_coef if entropy_coef_unmerge is None else entropy_coef_unmerge)
+        self.logit_cap = logit_cap
         self.lr = lr
         self.weight_decay = weight_decay
         self.max_grad_norm = max_grad_norm
         self.device = device or torch.device("cpu")
 
-        self.unmerge_actor = UnmergeActor().to(self.device)
-        self.factor_actor = FactorActor().to(self.device)
+        # Only the actor heads are capped — the critic outputs a value, not logits.
+        self.unmerge_actor = UnmergeActor(logit_cap=logit_cap).to(self.device)
+        self.factor_actor = FactorActor(logit_cap=logit_cap).to(self.device)
         self.critic = Critic().to(self.device)
 
         # AdamW with decoupled weight decay.  Softmax-policy entropy collapse
@@ -345,6 +376,8 @@ class Agent:
         total_actor_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
+        total_entropy_unmerge = 0.0
+        total_entropy_factor = 0.0
         num_updates = 0
 
         # Pre-compute global advantage statistics for normalisation.
@@ -410,7 +443,10 @@ class Agent:
                 # Entropy bonus — from CURRENT policy logits (encourages
                 # exploration; tracked to watch for premature collapse).
                 # Unmerge entropy over all samples; factor entropy over active
-                # ones only, respecting the collection-time mask.
+                # ones only, respecting the collection-time mask.  Each head is
+                # weighted by its OWN coefficient (see __init__): a single
+                # shared weight let the 10-way factor head dominate the binary
+                # unmerge head and starve it toward extinction.
                 entropy1 = _policy_entropy(self.unmerge_actor.forward(s1))
                 if fa.any():
                     factor_logits = self.factor_actor.forward(s2[fa]).masked_fill(
@@ -418,7 +454,6 @@ class Agent:
                     entropy2 = _policy_entropy(factor_logits)
                 else:
                     entropy2 = torch.zeros((), device=self.device)
-                entropy = entropy1 + entropy2
 
                 # Critic (value) loss: MSE against actual rewards
                 value_loss = F.mse_loss(values, r)
@@ -426,7 +461,8 @@ class Agent:
                 loss = (
                     actor_loss
                     + self.value_loss_coef * value_loss
-                    - self.entropy_coef * entropy
+                    - self.entropy_coef_unmerge * entropy1
+                    - self.entropy_coef * entropy2
                 )
 
                 self.optimizer.zero_grad()
@@ -442,14 +478,23 @@ class Agent:
 
                 total_actor_loss += actor_loss.item()
                 total_value_loss += value_loss.item()
-                total_entropy += entropy.item()
+                _e1 = entropy1.item()
+                _e2 = entropy2.item()
+                total_entropy += _e1 + _e2
+                total_entropy_unmerge += _e1
+                total_entropy_factor += _e2
                 num_updates += 1
 
         n = max(num_updates, 1)
         return {
             "actor_loss": total_actor_loss / n,
             "value_loss": total_value_loss / n,
+            # "entropy" stays the SUM of both heads (unchanged meaning for the
+            # existing metric column); the per-head values are new keys the
+            # caller may log to watch the unmerge head specifically.
             "entropy": total_entropy / n,
+            "entropy_unmerge": total_entropy_unmerge / n,
+            "entropy_factor": total_entropy_factor / n,
         }
 
     def save(self, path: str) -> None:
