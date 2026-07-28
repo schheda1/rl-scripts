@@ -2,7 +2,10 @@
 Clipped Policy Gradient agent for the per-loop UU optimization pipeline.
 
 Two actor networks (UnmergeActor, FactorActor) and one critic network (Critic)
-share one Adam optimizer.  The critic provides a feature-conditioned baseline
+share one AdamW optimizer (decoupled weight decay on the 2-D weights only) with
+global-norm gradient clipping; hidden layers are LayerNorm'd.  Together these
+bound logit growth — the mechanism behind schedule-independent entropy
+collapse.  The critic provides a feature-conditioned baseline
 V(state1) for variance reduction — replacing the previous global EMA scalar.
 No-op actions (unmerge=0, factor=1) are handled by the environment returning
 reward=0 directly; the critic learns to predict 0 for those loop feature regions.
@@ -93,10 +96,18 @@ class _MLP(nn.Module):
         super().__init__()
         # Hidden widths 128→64: the 93-dim input (18 structural + 75 IR2Vec)
         # needs more capacity than the 64→32 stack used for the 18-dim features.
+        # LayerNorm on the hidden activations: inputs are z-scored, but hidden
+        # scale still drifts over long runs; normalisation keeps the effective
+        # step size stable and (with weight decay) bounds logit growth — the
+        # 2026-07 run's entropy collapsed 2.86→0.29 with neither in place.
+        # NOTE: checkpoints from before LayerNorm cannot be loaded into this
+        # architecture (missing-key error) — evaluate old runs with old code.
         self.net = nn.Sequential(
             nn.Linear(in_dim, 128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Linear(128, 64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, out_dim),
         )
@@ -250,6 +261,8 @@ class Agent:
         lr: float = 3e-4,
         value_loss_coef: float = 0.5,
         entropy_coef: float = 0.01,
+        weight_decay: float = 0.01,
+        max_grad_norm: float = 0.5,
         device: Optional[torch.device] = None,
     ) -> None:
         self.clip_eps = clip_eps
@@ -257,15 +270,30 @@ class Agent:
         self.batch_size = batch_size
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.max_grad_norm = max_grad_norm
         self.device = device or torch.device("cpu")
 
         self.unmerge_actor = UnmergeActor().to(self.device)
         self.factor_actor = FactorActor().to(self.device)
         self.critic = Critic().to(self.device)
-        self.optimizer = torch.optim.Adam(
-            list(self.unmerge_actor.parameters())
-            + list(self.factor_actor.parameters())
-            + list(self.critic.parameters()),
+
+        # AdamW with decoupled weight decay.  Softmax-policy entropy collapse
+        # is unbounded logit growth; L2 on the weight matrices bounds it
+        # directly.  Standard split: decay 2-D weights only, never biases or
+        # LayerNorm scales (1-D) — decaying LN parameters shrinks activations
+        # toward zero rather than regularising the function.
+        decay_params, no_decay_params = [], []
+        for module in (self.unmerge_actor, self.factor_actor, self.critic):
+            for p in module.parameters():
+                (decay_params if p.ndim >= 2 else no_decay_params).append(p)
+        self._all_params = decay_params + no_decay_params
+        self.optimizer = torch.optim.AdamW(
+            [
+                {"params": decay_params, "weight_decay": weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
             lr=lr,
         )
 
@@ -403,6 +431,13 @@ class Agent:
 
                 self.optimizer.zero_grad()
                 loss.backward()
+                # Global-norm clip across all three nets: single extreme
+                # advantages (a -1.0 penalty next to a +0.5 outlier cell in an
+                # 8-sample batch) otherwise produce the ±0.28 actor-loss spikes
+                # seen in the 2026-07 metrics.  0 disables.
+                if self.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self._all_params, self.max_grad_norm)
                 self.optimizer.step()
 
                 total_actor_loss += actor_loss.item()
@@ -427,10 +462,21 @@ class Agent:
 
     def load(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device)
+        # Strict net loads: an architecture mismatch (e.g. a pre-LayerNorm
+        # checkpoint) must fail loudly, not evaluate garbage.
         self.unmerge_actor.load_state_dict(ckpt["unmerge_actor"])
         self.factor_actor.load_state_dict(ckpt["factor_actor"])
         self.critic.load_state_dict(ckpt["critic"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
+        # load_state_dict restores param_groups WHOLESALE, including lr and
+        # weight_decay saved at checkpoint time — silently overriding this
+        # run's flags on a warm start.  Hyperparameters come from the flags;
+        # only momentum statistics come from the checkpoint.  Group order is
+        # construction order: [decay, no_decay].
+        for group, wd in zip(self.optimizer.param_groups,
+                             (self.weight_decay, 0.0)):
+            group["lr"] = self.lr
+            group["weight_decay"] = wd
 
 
 def _policy_entropy(logits: torch.Tensor) -> torch.Tensor:

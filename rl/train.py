@@ -163,6 +163,14 @@ def parse_args() -> argparse.Namespace:
                    help="Save a checkpoint every N epochs (default: every epoch)")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight-decay", type=float, default=0.01,
+                   help="AdamW decoupled weight decay on the networks' weight "
+                        "matrices (biases and LayerNorm params exempt). Bounds "
+                        "policy-logit growth — the mechanism of entropy "
+                        "collapse. 0 disables. (default: 0.01)")
+    p.add_argument("--max-grad-norm", type=float, default=0.5,
+                   help="Global gradient-norm clip across actor+critic per "
+                        "update. 0 disables. (default: 0.5)")
     p.add_argument("--clip-eps", type=float, default=0.2)
     p.add_argument("--K", type=int, default=2, dest="K",
                    help="PPO epochs per rollout update. K=2 with buffer=128 gives "
@@ -1054,6 +1062,8 @@ def _worker_fn(
             lr=hparams["lr"],
             value_loss_coef=hparams["value_loss_coef"],
             entropy_coef=hparams["entropy_coef"],
+            weight_decay=hparams["weight_decay"],
+            max_grad_norm=hparams["max_grad_norm"],
             device=device,
         )
         _load_weights(agent, initial_weights)
@@ -1524,6 +1534,8 @@ def run_parallel_eval(
         "lr":                      args.lr,
         "value_loss_coef":         args.value_loss_coef,
         "entropy_coef":            args.entropy_coef,
+        "weight_decay":            args.weight_decay,
+        "max_grad_norm":           args.max_grad_norm,
         "normalizer_state":        normalizer.state_dict(),
         "baseline_cache":          baseline_cache,
         "reward_cache":            dict(reward_cache or {}) if use_reward_cache else {},
@@ -1742,6 +1754,8 @@ def run_parallel_epoch(
         "lr":                      args.lr,
         "value_loss_coef":         args.value_loss_coef,
         "entropy_coef":            args.entropy_coef,
+        "weight_decay":            args.weight_decay,
+        "max_grad_norm":           args.max_grad_norm,
         "normalizer_state":        normalizer.state_dict(),
         "baseline_cache":          baseline_cache,
         # Read-only snapshots for the workers; main merges new results into
@@ -2202,6 +2216,8 @@ def main() -> None:
         lr=args.lr,
         value_loss_coef=args.value_loss_coef,
         entropy_coef=args.entropy_coef,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
         device=device,
     )
     if args.resume:
