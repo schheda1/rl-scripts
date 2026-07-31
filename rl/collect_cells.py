@@ -439,7 +439,13 @@ def main() -> None:
     p.add_argument("--compile-timeout-penalty", type=float, default=-1.0)
     # --- Measurement ---
     p.add_argument("--arch", default=ARCH)
-    p.add_argument("--n-runs", type=int, default=2)
+    p.add_argument("--n-runs", type=int, required=True,
+                   help="REQUIRED: must match the training run. "
+                        "measure_kernel_time returns the MEDIAN of this many "
+                        "nsys runs, and the baselines these cells are scored "
+                        "against were measured with the run's value — a "
+                        "mismatch mixes two noise levels into one table. "
+                        "train.py's default is 20.")
     p.add_argument("--nsys-timeout", type=int, default=300)
     p.add_argument("--tmp-dir", default=None)
     p.add_argument("--hecbench-src", default=None)
@@ -451,6 +457,20 @@ def main() -> None:
     elig_file = ckpt / "eligible_benchmarks.json"
     if not elig_file.exists():
         sys.exit(f"missing {elig_file} — point this at a real run directory")
+
+    # Post-unmerge feature extraction re-runs LoopCount, and every
+    # --enable-loopcount compile needs the IR2Vec vocabulary.  Without it each
+    # extraction raises and is caught per-loop, so the job would run for hours
+    # and quietly produce zero feature vectors.  Fail now instead.
+    from hecbench import IR2VEC_VOCAB
+    if not args.no_post_features and (
+            not IR2VEC_VOCAB or not Path(IR2VEC_VOCAB).exists()):
+        sys.exit(
+            f"IR2VEC_VOCAB is unset or missing ({IR2VEC_VOCAB!r}) but "
+            f"post-unmerge feature extraction is enabled.\n"
+            f"  export IR2VEC_VOCAB=$LLVM_SRC/llvm/lib/Analysis/models/"
+            f"seedEmbeddingVocab75D.json\n"
+            f"  (or pass --no-post-features to collect reward cells only)")
 
     # MIRROR: train.main — same discovery order feeds split_benchmarks, and the
     # split is only reproducible if that order matches.
