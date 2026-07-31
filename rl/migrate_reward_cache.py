@@ -39,6 +39,12 @@ Usage:
   python3 migrate_reward_cache.py reward_cache.json --revert
 
   python3 migrate_reward_cache.py reward_cache.json --dry-run
+
+  # repair sign-flip poisoning: cells written as +0.15 (a positive penalty
+  # flag somewhere in the cache lineage) are failures mislabelled as WINS.
+  # Rewrites every cell equal to VALUE exactly to --failure-penalty and
+  # records the keys so later re-tunes / reverts cover them too.
+  python3 migrate_reward_cache.py reward_cache.json --relabel 0.15 --failure-penalty -0.15
 """
 
 import argparse
@@ -62,6 +68,15 @@ def main() -> None:
                    help="Restore failure cells to 0.0 (undo the migration). "
                         "Deadzoned cells cannot be restored — their original "
                         "sub-threshold values were noise and are not retained.")
+    p.add_argument("--relabel", type=float, default=None, metavar="VALUE",
+                   help="Repair mode: every cell whose value equals VALUE "
+                        "EXACTLY (bit-equal float, e.g. 0.15 written by a "
+                        "sign-flipped penalty flag) is relabelled as a "
+                        "compile-failure cell: rewritten to --failure-penalty "
+                        "and its key recorded in migration.failure_keys. "
+                        "Cells already at exactly --failure-penalty but "
+                        "missing from failure_keys are adopted too, so future "
+                        "re-tunes move the whole failure population.")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -73,6 +88,58 @@ def main() -> None:
         return
 
     mig = data.get("migration")
+
+    if args.relabel is not None:
+        # --- Repair mode: adopt mislabelled failure cells by exact value ---
+        # Exact float equality is the identifier ON PURPOSE: a written literal
+        # (json.loads('0.15') == 0.15) matches, while a genuinely measured
+        # reward that happens to be near 0.15 is a computed double and will
+        # not be bit-equal.  The probability of a measurement colliding with
+        # the exact literal is ~0; 3475 collisions is a writer, not chance.
+        if args.revert:
+            sys.exit("--relabel and --revert are mutually exclusive")
+        mislabelled = [k for k, v in rewards.items() if v == args.relabel]
+        strays = [k for k, v in rewards.items()
+                  if v == args.failure_penalty
+                  and k not in set((mig or {}).get("failure_keys", []))]
+        if not mislabelled and not strays:
+            print(f"No cells equal {args.relabel} exactly and no unrecorded "
+                  f"cells at {args.failure_penalty} — nothing to repair.")
+            return
+        mig = mig or {"failure_keys": [], "deadzoned_keys": [], "history": []}
+        failure_keys = sorted(
+            set(mig.get("failure_keys", [])) | set(mislabelled) | set(strays))
+        print(f"relabel {args.relabel} -> {args.failure_penalty}:")
+        print(f"  mislabelled cells rewritten : {len(mislabelled)}")
+        print(f"  unrecorded penalty strays   : {len(strays)} (adopted)")
+        print(f"  failure_keys after          : {len(failure_keys)}")
+        if args.dry_run:
+            print("\nDry run — nothing written.")
+            return
+        for k in mislabelled:
+            rewards[k] = args.failure_penalty
+        backup = path.with_suffix(f".json.bak-{datetime.now():%Y%m%d-%H%M%S}")
+        shutil.copy2(path, backup)
+        mig.setdefault("history", []).append({
+            "at": datetime.now().isoformat(),
+            "relabeled_from": args.relabel,
+            "relabeled_count": len(mislabelled),
+            "adopted_strays": len(strays),
+            "failure_penalty": args.failure_penalty,
+        })
+        mig["failure_penalty"] = args.failure_penalty
+        mig["failure_keys"] = failure_keys
+        mig.setdefault("deadzone", args.deadzone)
+        mig.setdefault("deadzoned_keys", [])
+        data["rewards"] = rewards
+        data["migration"] = mig
+        path.write_text(json.dumps(data))
+        print(f"\nBackup : {backup}")
+        print(f"Written: {path}")
+        print("Keys recorded — the repaired cells now move with any future "
+              "--failure-penalty re-tune or --revert.")
+        return
+
     first_time = mig is None
 
     if first_time:
