@@ -156,6 +156,43 @@ def main() -> None:
     print("    distribution of oracle reward on benefiting loops:")
     hist([v for v in allv if v > 0], [0.01, 0.02, 0.05, 0.10, 0.20, 0.50])
 
+    # ---- the downside half: how bad it goes if you transform anyway ----
+    # Compile failures are excluded upstream (a broken build is a different
+    # failure mode from a slower one), so these are runtime regressions only.
+    if "worst_reward" not in rows[0]:
+        print("\n    DOWNSIDE — unavailable: this loop_labels.csv predates the "
+              "worst-case\n    columns. Re-run label_loops.py to regenerate it.")
+        worst_all = []
+    else:
+        print("\n    DOWNSIDE — worst configuration that still built\n")
+        worst_all = [w for w in (fnum(r["worst_reward"]) for r in lab)
+                     if w is not None]
+    if worst_all:
+        # ws is ascending, so the most negative is first; p10 is index 0.1*n.
+        ws = sorted(worst_all)
+        p10 = ws[min(int(0.1 * len(ws)), len(ws) - 1)]
+        print(f"    over all labelled loops: median {st.median(ws):+.4f}  "
+              f"mean {st.mean(ws):+.4f}  p10 {p10:+.4f}  min {ws[0]:+.4f}")
+        for c in CATEGORIES:
+            vals = [w for w in (fnum(r["worst_reward"]) for r in lab
+                                if r["category"] == c) if w is not None]
+            if not vals:
+                continue
+            vs = sorted(vals)
+            tag = ("cost of firing anyway" if c == "noop"
+                   else "cost of the wrong factor/arm")
+            print(f"      {LABEL[c]:<16} n={len(vs):4d}  median "
+                  f"{st.median(vs):+.4f}  min {vs[0]:+.4f}   ({tag})")
+        print("\n    how bad the worst case gets:")
+        hist([-w for w in worst_all if w < 0],
+             [0.02, 0.05, 0.10, 0.20, 0.50, 1.00])
+        clipped = sum(int(r.get("n_at_clip") or 0) for r in lab)
+        at_floor = sum(1 for w in worst_all if w <= -1.0)
+        print(f"\n    loops whose worst case is at the -1.0 floor: {at_floor}"
+              f"  {pct(at_floor, len(worst_all))}")
+        print(f"    cells sitting exactly at the floor: {clipped}  (timeout or a "
+              f"slowdown severe enough to clip — indistinguishable by value)")
+
     # --- 4. per benchmark ----------------------------------------------------
     print("\n4. PER-BENCHMARK — the variation the whole study rests on\n")
     table = []
@@ -163,12 +200,21 @@ def main() -> None:
         nb = len(v)
         ben = sum(1 for x in v if x["category"] != "noop")
         orc = [fnum(x["oracle_reward"]) or 0.0 for x in v]
+        per_cat = {c: sum(1 for x in v if x["category"] == c) for c in CATEGORIES}
+        # Benchmark-level sensitivity: which action this APPLICATION responds to.
+        # Benefit is strongly bimodal per benchmark, so a dominant category is a
+        # meaningful property of the application rather than an average over
+        # unrelated loops.
+        dominant = max(CATEGORIES, key=lambda c: per_cat[c])
         table.append({"benchmark": b, "loops": nb, "benefiting": ben,
                       "benefit_rate": round(ben / nb, 4),
                       "oracle_mean": round(st.mean(orc), 6),
                       "oracle_max": round(max(orc), 6),
-                      "unmerge_best": sum(1 for x in v
-                                          if x["category"] == "unmerge_unroll")})
+                      "n_noop": per_cat["noop"],
+                      "n_unroll_only": per_cat["unroll_only"],
+                      "n_unmerge_unroll": per_cat["unmerge_unroll"],
+                      "dominant": dominant,
+                      "purity": round(per_cat[dominant] / nb, 4)})
     table.sort(key=lambda t: -t["oracle_mean"])
     hdr = f"    {'benchmark':<32}{'loops':>6}{'benefit':>9}{'oracle_mean':>13}{'max':>9}"
     print(hdr)
@@ -188,6 +234,29 @@ def main() -> None:
           f"sd {st.stdev(rates) * 100:.0f}pp" if len(rates) > 1 else "")
     print(f"    benchmarks where NO loop benefits: {zero}/{len(table)} "
           f"({100 * zero / len(table):.0f}%)")
+
+    # Benchmark-level sensitivity. Worth its own view because benefit is
+    # bimodal per application, which also makes "predict the benchmark's
+    # dominant category for every loop in it" a strong baseline any per-loop
+    # model has to beat.
+    print("\n    Which action is each APPLICATION sensitive to?")
+    dom = {c: [t for t in table if t["dominant"] == c] for c in CATEGORIES}
+    for c in CATEGORIES:
+        g = dom[c]
+        if not g:
+            continue
+        loops = sum(t["loops"] for t in g)
+        print(f"      {LABEL[c]:<16} {len(g):3d} benchmarks  ({loops:4d} loops)  "
+              f"mean oracle {st.mean([t['oracle_mean'] for t in g]):+.4f}")
+    pure = sum(1 for t in table if t["purity"] == 1.0)
+    multi = [t for t in table if t["loops"] > 1]
+    pure_multi = sum(1 for t in multi if t["purity"] == 1.0)
+    print(f"      uniform benchmarks (every loop the same category): "
+          f"{pure}/{len(table)}")
+    if multi:
+        print(f"      ... restricted to benchmarks with >1 loop: "
+              f"{pure_multi}/{len(multi)} ({100 * pure_multi / len(multi):.0f}%)"
+              f"  <- how strong the benchmark-level baseline is")
 
     # --- 5. action-space cost ------------------------------------------------
     print("\n5. ACTION-SPACE COST — how hostile the search space is\n")

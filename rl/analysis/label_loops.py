@@ -59,6 +59,12 @@ _IDX_TRIP_COUNT = 11
 
 NOOP = (0, 1)
 CATEGORIES = ("noop", "unroll_only", "unmerge_unroll")
+# train.py clips rewards at this floor and also uses it as the compile-timeout
+# penalty, so a cell sitting exactly here is either a timeout or a slowdown so
+# severe it was clipped. The two are indistinguishable by value; `n_at_clip`
+# reports how many a loop has so a downside figure resting on them can be
+# discounted.
+CLIP = -1.0
 
 
 def valid_factors(raw: list) -> list:
@@ -84,8 +90,19 @@ def label_loop(raw: list, cells: dict, deadzone: float, ambiguity: float,
                    if f"{key_prefix}|{a[0]}|{a[1]}" in failure_keys)
     n_wins = sum(1 for r in measured.values() if r > deadzone)
 
+    # DOWNSIDE cells: successfully-built configurations only. A compile-failure
+    # penalty is an encoding, not a measured slowdown, and "the build broke" is
+    # a different failure mode from "it ran and was slower" — mixing them would
+    # make every loop's worst case look like the penalty value. Failures stay
+    # counted in n_failed.
+    ok = {a: r for a, r in measured.items()
+          if f"{key_prefix}|{a[0]}|{a[1]}" not in failure_keys}
+    n_at_clip = sum(1 for r in ok.values() if r == CLIP)
+
     unroll = {a: r for a, r in measured.items() if a[0] == 0}
     unmerge = {a: r for a, r in measured.items() if a[0] == 1}
+    unroll_ok = {a: r for a, r in ok.items() if a[0] == 0}
+    unmerge_ok = {a: r for a, r in ok.items() if a[0] == 1}
 
     def best(d):
         if not d:
@@ -93,8 +110,17 @@ def label_loop(raw: list, cells: dict, deadzone: float, ambiguity: float,
         a = max(d, key=lambda k: d[k])
         return a, d[a]
 
+    def worst(d):
+        if not d:
+            return None, None
+        a = min(d, key=lambda k: d[k])
+        return a, d[a]
+
     a_ur, r_ur = best(unroll)
     a_um, r_um = best(unmerge)
+    w_ur, wr_ur = worst(unroll_ok)
+    w_um, wr_um = worst(unmerge_ok)
+    w_all, wr_all = worst(ok)
 
     row = {
         "benchmark": key_prefix.split("|")[0],
@@ -103,11 +129,22 @@ def label_loop(raw: list, cells: dict, deadzone: float, ambiguity: float,
         "n_measured": len(measured),
         "fill": round(len(measured) / len(valid), 4) if valid else 0.0,
         "n_failed": n_failed,
+        "n_at_clip": n_at_clip,
         "n_wins": n_wins,
         "best_unroll": round(r_ur, 6) if r_ur is not None else "",
         "best_unroll_factor": a_ur[1] if a_ur else "",
         "best_unmerge": round(r_um, 6) if r_um is not None else "",
         "best_unmerge_factor": a_um[1] if a_um else "",
+        # Lower bound: the slowest configuration that still built. For a no-op
+        # loop this is what firing anyway would cost — the risk a mis-firing
+        # heuristic carries.
+        "worst_unroll": round(wr_ur, 6) if wr_ur is not None else "",
+        "worst_unroll_factor": w_ur[1] if w_ur else "",
+        "worst_unmerge": round(wr_um, 6) if wr_um is not None else "",
+        "worst_unmerge_factor": w_um[1] if w_um else "",
+        "worst_reward": round(wr_all, 6) if wr_all is not None else "",
+        "worst_arm": (("unmerge_unroll" if w_all[0] == 1 else "unroll_only")
+                      if w_all else ""),
     }
 
     if not measured:

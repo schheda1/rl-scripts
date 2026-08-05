@@ -20,7 +20,7 @@ Emits a tidy per-cell CSV ready for plotting the ablation figure: one row per
 
 Usage:
   python3 factor_response.py RUN_DIR --deadzone 0.005
-  python3 factor_response.py RUN_DIR --deadzone 0.005 --labels loop_labels.csv
+  python3 factor_response.py RUN_DIR --deadzone 0.005 --bands 0.01 0.02 0.05
 """
 
 import argparse
