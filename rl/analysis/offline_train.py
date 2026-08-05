@@ -414,7 +414,8 @@ def _report_baselines(data: dict, loops: list, folds: list, args) -> None:
         benchmark_dominant_picks(loops, tables, labels), tables, labels,
         args.deadzone, _mr(args))))
     log.info(format_report("oracle (ceiling)", score_decisions(
-        oracle_picks(loops, tables), tables, labels, args.deadzone, _mr(args))))
+        oracle_picks(loops, tables, args.deadzone), tables, labels,
+        args.deadzone, _mr(args))))
     log.info("\n  A reference beating the policy does NOT mean the policy lost to")
     log.info("  a real alternative: neither can be applied to unmeasured code.")
 
@@ -471,8 +472,8 @@ def run_score_ckpt(data: dict, args) -> None:
         marginal_picks(test_l, data["tables"], tr_keys), data["tables"],
         data["labels"], args.deadzone, _mr(args))))
     log.info(format_report("oracle (reference ceiling)", score_decisions(
-        oracle_picks(test_l, data["tables"]), data["tables"], data["labels"],
-        args.deadzone, _mr(args))))
+        oracle_picks(test_l, data["tables"], args.deadzone), data["tables"],
+        data["labels"], args.deadzone, _mr(args))))
 
 
 # ---------------------------------------------------------------------------
@@ -554,10 +555,23 @@ def main() -> None:
 
     data = load_run(args.run_dir, args.deadzone, args.labels)
     log.info("Loaded %d loops / %d benchmarks | %d labelled | "
-             "normalizer %s | post_features %d | dedup dropped %d",
-             len(data["loops"]), len(data["benchmarks"]), len(data["labels"]),
+             "normalizer %s | post_features %d",
+             len(data["loops"]), len(data["benchmarks"]),
+             data["n_labelled_loops"],
              "fitted" if data["normalizer_fitted"] else "IDENTITY (not fitted)",
-             len(data["postf"]), data["n_dropped_dedup"])
+             len(data["postf"]))
+    if data["n_dropped_invalid"]:
+        log.info("  dropped %d cell(s) whose factor exceeds a known trip count "
+                 "(MIRROR: label_loops.valid_factors) — unreachable by any "
+                 "policy, so they must not enter the ceiling",
+                 data["n_dropped_invalid"])
+    if data["n_labelled_loops"] != data["n_label_rows"]:
+        log.warning("  WARNING: loop_labels.csv has %d labelable rows but only "
+                    "%d match a loop here (dedup dropped %d). The scored "
+                    "population is NOT the published one — every denominator "
+                    "differs. Reconcile before using these numbers.",
+                    data["n_label_rows"], data["n_labelled_loops"],
+                    data["n_dropped_dedup"])
     # post_features are stored ALREADY NORMALISED under the normalizer that was
     # live at collection time. make_state falls back to s1 when one is absent,
     # which is legal but changes what the factor head sees on the unmerge

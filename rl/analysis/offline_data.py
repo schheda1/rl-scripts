@@ -41,12 +41,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from adapt_eval import NOOP, build_tables, oracle_of          # noqa: E402
+from adapt_eval import NOOP, build_tables                      # noqa: E402
 from train import _dedup_loop_records                          # noqa: E402
 
-CATEGORIES = ("noop", "unroll_only", "unmerge_unroll")
+# IMPORTED, never re-derived. Every bug found in review here came from
+# re-implementing one of label_loops' rules instead of reading it: the deadzone
+# gate on the oracle, and the trip-count restriction on which cells exist at all.
+# label_loops is the definition of ground truth, so anything that has to agree
+# with it comes from it.
+from label_loops import CATEGORIES, valid_factors               # noqa: E402
+
 LABEL = {"noop": "no-op", "unroll_only": "unroll-only",
          "unmerge_unroll": "unmerge+unroll"}
+assert set(LABEL) == set(CATEGORIES), "LABEL and label_loops.CATEGORIES differ"
 
 # MIRROR: agent.py:_IDX_TRIP_COUNT_KNOWN / _IDX_TRIP_COUNT (private, hence the
 # copy). Copies drift, so load_run() asserts these positions against
@@ -129,6 +136,25 @@ def load_run(run_dir: Path, deadzone: float,
     tables = build_tables(loops, rc.get("rewards", {}))
     postf = rc.get("post_features", {})
 
+    # Restrict every table to the TRIP-COUNT-VALID cells, exactly as
+    # label_loops.py:87-89 does before it computes anything. build_tables takes
+    # the cache wholesale, so without this a table can hold a cell whose factor
+    # exceeds a known trip count — one the oracle would happily pick and that
+    # build_factor_mask makes it impossible for any policy to select. That
+    # inflates the ceiling with unreachable reward and makes the derived oracle
+    # disagree with the stored label.
+    n_dropped_invalid = 0
+    by_key = {(l["benchmark_name"], l["loop_idx"]): l for l in loops}
+    for key, table in tables.items():
+        allowed = {(u, f) for u in (0, 1)
+                   for f in valid_factors(by_key[key]["pre_features_raw"])}
+        kept = {a: r for a, r in table.items() if a in allowed}
+        n_dropped_invalid += len(table) - len(kept)
+        # The free no-op is injected by build_tables and is always legal
+        # (factor 1 passes every mask), but re-assert rather than assume.
+        kept[NOOP] = 0.0
+        tables[key] = kept
+
     labels, oracle_mismatch = {}, []
     with open(lab_f) as fh:
         for r in csv.DictReader(fh):
@@ -163,8 +189,7 @@ def load_run(run_dir: Path, deadzone: float,
             # and no-op's 0.0 wins either way.
             stored = r.get("oracle_reward", "")
             if stored not in ("", None) and key in tables:
-                _, raw = oracle_of(tables[key])
-                derived = raw if raw > deadzone else 0.0
+                _, derived = oracle_of_gated(tables[key], deadzone)
                 # Stored values are round(x, 6); 2e-6 clears that comfortably
                 # while staying far below any real cache disagreement.
                 if abs(float(stored) - derived) > 2e-6:
@@ -183,8 +208,18 @@ def load_run(run_dir: Path, deadzone: float,
     from hecbench import FeatureNormalizer
     normalizer = FeatureNormalizer.from_state_dict(elig.get("normalizer", {}))
 
+    # label_loops.py does NOT dedup — it walks loop_records directly — while
+    # this loader does, mirroring train.precheck_benchmarks. In practice the
+    # stored cache was already deduped when precheck wrote it, so both see the
+    # same set and this is 0. If it ever is not, the scored population silently
+    # stops matching the published label counts and every denominator moves.
+    n_matched = sum(1 for l in loops
+                    if (l["benchmark_name"], l["loop_idx"]) in labels)
+
     present = {l["benchmark_name"] for l in loops}
     return {
+        "n_label_rows": len(labels),
+        "n_labelled_loops": n_matched,
         "loops": loops,
         "tables": tables,
         "normalizer": normalizer,
@@ -199,8 +234,36 @@ def load_run(run_dir: Path, deadzone: float,
         # silently produce a different, plausible-looking split.
         "eligible_order": [b for b in elig.get("eligible", []) if b in present],
         "n_dropped_dedup": dropped,
+        "n_dropped_invalid": n_dropped_invalid,
         "normalizer_fitted": normalizer._fitted,
     }
+
+
+def oracle_of_gated(table: dict, deadzone: float) -> tuple:
+    """
+    (best_action, best_reward) under LABEL_LOOPS' rule, not the raw cell maximum.
+
+    MIRROR: label_loops.py:165-167 — a transform must CLEAR the deadzone to beat
+    declining; below it, no-op wins and the oracle is exactly 0.0. Chasing a
+    +0.001 cell when the deadzone says that is noise is not optimal play, and
+    declining costs nothing.
+
+    This must be the single definition used by both the oracle reference policy
+    and the label cross-check. When they disagreed, the "oracle" scored 80% against
+    the very labels it is supposed to define — an incoherent ceiling.
+
+    Ties between categories go to the SIMPLER one, as label_loops' max() over the
+    ordered CATEGORIES tuple does. Exact ties are vanishingly unlikely in measured
+    data, but a rule that is only right by luck is not a rule.
+    """
+    best_a, best_r = NOOP, 0.0
+    for a, r in table.items():
+        if a == NOOP or r <= deadzone:
+            continue
+        if r > best_r or (r == best_r and CATEGORIES.index(category_of(a))
+                          < CATEGORIES.index(category_of(best_a))):
+            best_a, best_r = a, r
+    return best_a, best_r
 
 
 def labelled_loops(data: dict) -> list:
@@ -297,12 +360,18 @@ def marginal_picks(loops: list, tables: dict, train_keys: list) -> list:
     return picks
 
 
-def oracle_picks(loops: list, tables: dict) -> list:
-    """REFERENCE — requires the target to be measured. The ceiling, not a rival."""
+def oracle_picks(loops: list, tables: dict, deadzone: float) -> list:
+    """
+    REFERENCE — requires the target to be measured. The ceiling, not a rival.
+
+    Gated, so it agrees with the labels by construction: this policy must score
+    100% accuracy, and a drop below that means the ceiling and the ground truth
+    have come apart.
+    """
     picks = []
     for l in loops:
         key = (l["benchmark_name"], l["loop_idx"])
-        best, _ = oracle_of(tables[key])
+        best, _ = oracle_of_gated(tables[key], deadzone)
         picks.append((key[0], key[1], best))
     return picks
 
@@ -378,7 +447,11 @@ def score_decisions(picks: list, tables: dict, labels: dict,
         conf[truth][category_of(action)] += 1
 
         table = tables[key]
-        _, orc = oracle_of(table)
+        # Gated, so oracle_sum is exactly the sum of label_loops' stored
+        # oracle_reward. (Behaviourally identical to the raw maximum here —
+        # gating only zeroes values that already fail `orc > deadzone` below —
+        # but going through one definition is what stops the two from drifting.)
+        _, orc = oracle_of_gated(table, deadzone)
         if action not in table:
             n_unmeasured += 1
             if missing_reward is None:

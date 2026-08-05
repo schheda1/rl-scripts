@@ -149,6 +149,9 @@ def test_load(run: Path):
     for key, table in d["tables"].items():
         assert od.NOOP in table and table[od.NOOP] == 0.0, key
     assert d["tables"][("b1", 0)][(1, 2)] == 0.30
+    # No loop in this fixture has a known trip count, so every cell is legal.
+    assert d["n_dropped_invalid"] == 0, d["n_dropped_invalid"]
+    assert d["n_labelled_loops"] == d["n_label_rows"] == 5
     print("  load_run                   ok")
     return d
 
@@ -179,6 +182,49 @@ def test_dedup_fires(tmp: Path):
     assert len(d["loops"]) == 1 and d["loops"][0]["loop_idx"] == 0, \
         "dedup must keep the LOWEST loop_idx"
     print("  dedup                      ok")
+
+
+def test_invalid_cells_dropped(tmp: Path):
+    """
+    Cells whose factor exceeds a KNOWN trip count must not be in the table.
+
+    MIRROR: label_loops.py:87-89 restricts to valid_factors before computing
+    anything, and agent.build_factor_mask makes such a cell impossible for any
+    policy to select. Left in, it would be a ceiling nothing can reach and would
+    make the derived oracle disagree with the stored label.
+
+    Fixture: trip count 3, so factors {1,2,3} are legal. The cache also holds
+    (1,5) at +0.90 — the highest-valued cell — so an unfiltered table would give
+    it as the oracle.
+    """
+    run = tmp / "trip"
+    run.mkdir(parents=True)
+    (run / "eligible_benchmarks.json").write_text(json.dumps({
+        "eligible": ["bt"],
+        "loop_records": {"bt": [{"loop_idx": 0, "filename": "t.cu",
+                                 "triple": "t",
+                                 "pre_features_raw": _features(
+                                     0, trip_known=1, trip_count=3)}]},
+        "normalizer": {},
+    }))
+    (run / "reward_cache.json").write_text(json.dumps({
+        "rewards": {"bt|0|1|2": 0.20, "bt|0|1|5": 0.90, "bt|0|0|3": 0.05},
+    }))
+    with open(run / "loop_labels.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["benchmark", "loop_idx", "category", "oracle_reward",
+                    "labelable"])
+        # label_loops would exclude (1,5) too, so its oracle is (1,2) = +0.20.
+        w.writerow(["bt", 0, "unmerge_unroll", 0.20, 1])
+
+    d = od.load_run(run, DZ)
+    table = d["tables"][("bt", 0)]
+    assert (1, 5) not in table, "factor 5 exceeds trip count 3 but survived"
+    assert (1, 2) in table and (0, 3) in table
+    assert d["n_dropped_invalid"] == 1, d["n_dropped_invalid"]
+    best, val = od.oracle_of_gated(table, DZ)
+    assert best == (1, 2) and approx(val, 0.20), (best, val)
+    print("  trip-count cell filter     ok")
 
 
 def test_oracle_crosscheck_is_deadzone_gated(tmp: Path):
@@ -261,17 +307,28 @@ def test_always_noop(d: dict):
 
 def test_oracle(d: dict):
     """
-    Hand-computed. The oracle picks the best cell everywhere:
+    Hand-computed. The oracle picks the best cell that CLEARS the deadzone:
       accuracy 5/5 = 1.0, capture 0.90/0.90 = 1.0
       mean = (0.30 + 0 + 0.20 + 0.40 + 0) / 5 = 0.18
+
+    Accuracy 1.0 is a structural invariant, not a lucky fixture: the oracle
+    reference and the labels are defined by the same gated rule, so anything
+    below 1.0 means the ceiling and the ground truth have come apart. b1|1 is
+    the case that catches it — its best transform is +0.001, so an UNGATED
+    oracle would answer unroll_only against a noop label and score 0.8.
     """
     loops = od.labelled_loops(d)
-    m = od.score_decisions(od.oracle_picks(loops, d["tables"]), d["tables"],
+    m = od.score_decisions(od.oracle_picks(loops, d["tables"], DZ), d["tables"],
                            d["labels"], DZ)
-    assert approx(m["accuracy"], 1.0), m["accuracy"]
+    assert approx(m["accuracy"], 1.0), \
+        f"oracle scored {m['accuracy']} against the labels it defines"
     assert approx(m["capture"], 1.0), m["capture"]
     assert approx(m["mean_realized"], 0.18), m["mean_realized"]
     assert m["n_regress"] == 0
+    # The gated pick for b1|1 must be the free no-op, not the +0.001 cell.
+    assert od.oracle_of_gated(d["tables"][("b1", 1)], DZ) == (od.NOOP, 0.0)
+    # ...and oracle_sum must equal the sum of label_loops' stored oracle_reward.
+    assert approx(m["oracle_sum"], 0.90), m["oracle_sum"]
     print("  oracle ceiling             ok")
 
 
@@ -460,6 +517,7 @@ def main() -> None:
         test_category_of()
         d = test_load(run)
         test_dedup_fires(tmp)
+        test_invalid_cells_dropped(tmp)
         test_oracle_crosscheck_is_deadzone_gated(tmp)
         test_kfold()
         test_fold_seed_and_init_seed_are_independent()
