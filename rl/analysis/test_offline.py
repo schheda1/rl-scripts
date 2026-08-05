@@ -137,7 +137,7 @@ def test_category_of():
 
 
 def test_load(run: Path):
-    d = od.load_run(run)
+    d = od.load_run(run, DZ)
     assert len(d["loops"]) == 5, d["loops"]
     assert len(d["labels"]) == 5
     assert d["benchmarks"] == ["b1", "b2", "b3", "b4"]
@@ -174,11 +174,49 @@ def test_dedup_fires(tmp: Path):
         w.writerow(["benchmark", "loop_idx", "category", "oracle_reward",
                     "labelable"])
         w.writerow(["bx", 0, "noop", 0.0, 1])
-    d = od.load_run(run)
+    d = od.load_run(run, DZ)
     assert d["n_dropped_dedup"] == 1, d["n_dropped_dedup"]
     assert len(d["loops"]) == 1 and d["loops"][0]["loop_idx"] == 0, \
         "dedup must keep the LOWEST loop_idx"
     print("  dedup                      ok")
+
+
+def test_oracle_crosscheck_is_deadzone_gated(tmp: Path):
+    """
+    The label/cache cross-check must compare DEADZONE-GATED oracles.
+
+    label_loops stores scores[category] (label_loops.py:185) after gating every
+    transform that fails to clear the deadzone to -inf (:165-167). So b1|1,
+    whose best transform is +0.001 against a 0.005 deadzone, is labelled no-op
+    and stores 0.0 — NOT 0.001. Comparing against the raw cell maximum flags
+    every such loop as a cache mismatch that is not one, and those loops exist
+    throughout the real table.
+
+    Both halves matter: the legitimate case must pass, and a genuine mismatch
+    must still fail. Deleting the check would satisfy the first alone.
+    """
+    ok = od.load_run(tmp / "run", DZ)
+    assert ok["labels"][("b1", 1)] == "noop"
+
+    # Same fixture, one oracle_reward corrupted -> must be rejected.
+    bad = tmp / "bad"
+    shutil.copytree(tmp / "run", bad)
+    rows = list(csv.DictReader(open(bad / "loop_labels.csv")))
+    for r in rows:
+        if r["benchmark"] == "b3":
+            r["oracle_reward"] = "0.99"      # cache says +0.40
+    with open(bad / "loop_labels.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    try:
+        od.load_run(bad, DZ)
+    except SystemExit as e:
+        assert "oracle" in str(e), str(e)
+        print("  oracle cross-check         ok  (gated; still catches real "
+              "mismatches)")
+        return
+    raise AssertionError("a corrupted oracle_reward was NOT detected")
 
 
 def test_kfold():
@@ -422,6 +460,7 @@ def main() -> None:
         test_category_of()
         d = test_load(run)
         test_dedup_fires(tmp)
+        test_oracle_crosscheck_is_deadzone_gated(tmp)
         test_kfold()
         test_fold_seed_and_init_seed_are_independent()
         test_always_noop(d)

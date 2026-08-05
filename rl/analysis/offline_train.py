@@ -552,7 +552,7 @@ def main() -> None:
         p.error("--mode score-ckpt requires --checkpoint")
     torch.set_num_threads(max(1, args.threads))
 
-    data = load_run(args.run_dir, args.labels)
+    data = load_run(args.run_dir, args.deadzone, args.labels)
     log.info("Loaded %d loops / %d benchmarks | %d labelled | "
              "normalizer %s | post_features %d | dedup dropped %d",
              len(data["loops"]), len(data["benchmarks"]), len(data["labels"]),

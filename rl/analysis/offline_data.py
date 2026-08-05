@@ -73,7 +73,8 @@ def category_of(action) -> str:
 # Loading
 # ---------------------------------------------------------------------------
 
-def load_run(run_dir: Path, labels_file: "Path | None" = None) -> dict:
+def load_run(run_dir: Path, deadzone: float,
+             labels_file: "Path | None" = None) -> dict:
     """
     Everything the offline experiment needs, from cache alone.
 
@@ -145,22 +146,39 @@ def load_run(run_dir: Path, labels_file: "Path | None" = None) -> dict:
                     f"loop_labels.csv against this cache.")
             labels[key] = cat
             # Cross-check: label_loops' stored oracle and the oracle derived
-            # from this cache must agree. They disagree exactly when the labels
-            # were generated against a DIFFERENT reward cache, which would make
-            # every accuracy number describe one table and every performance
-            # number another — invisible in the output, fatal to the result.
+            # from this cache must agree, or accuracy would describe one table
+            # while performance describes another — invisible in the output.
+            #
+            # It must be compared DEADZONE-GATED. label_loops stores
+            # scores[category] (label_loops.py:185), and scores sets every
+            # transform category to -inf when it fails to clear the deadzone
+            # (:165-167) — so a loop whose best transform is +0.001 against a
+            # 0.005 deadzone is labelled no-op and stores 0.0, not 0.001.
+            # Comparing against the raw cell maximum flags every such loop as a
+            # cache mismatch that is not one.
+            #
+            # Gating the global max is equivalent to label_loops' per-category
+            # gating: if the best cell clears the deadzone it is also its own
+            # category's best, and if it does not, every category is gated away
+            # and no-op's 0.0 wins either way.
             stored = r.get("oracle_reward", "")
             if stored not in ("", None) and key in tables:
-                _, derived = oracle_of(tables[key])
-                if abs(float(stored) - derived) > 1e-6:
+                _, raw = oracle_of(tables[key])
+                derived = raw if raw > deadzone else 0.0
+                # Stored values are round(x, 6); 2e-6 clears that comfortably
+                # while staying far below any real cache disagreement.
+                if abs(float(stored) - derived) > 2e-6:
                     oracle_mismatch.append((key, float(stored), derived))
     if oracle_mismatch:
         head = "; ".join(f"{k}: labels {a:+.4f} vs cache {b:+.4f}"
                          for k, a, b in oracle_mismatch[:5])
         raise SystemExit(
             f"{len(oracle_mismatch)} loop(s) where loop_labels.csv disagrees "
-            f"with reward_cache.json about the oracle — the labels were built "
-            f"from a different cache. Regenerate them. Examples: {head}")
+            f"with reward_cache.json about the deadzone-gated oracle.\n"
+            f"  Either the labels were built from a different cache, or they "
+            f"were built with a different --deadzone than the {deadzone} passed "
+            f"here. Regenerate loop_labels.csv against this cache, at this "
+            f"deadzone.\n  Examples: {head}")
 
     from hecbench import FeatureNormalizer
     normalizer = FeatureNormalizer.from_state_dict(elig.get("normalizer", {}))
