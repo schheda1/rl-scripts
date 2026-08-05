@@ -1,0 +1,448 @@
+"""
+Offline data plane for the UU study — features, rewards, folds and scoring.
+
+Everything here is a table lookup. No compiles, no GPU, no HeCBench source tree,
+no toolchain: the three cached artifacts hold the whole experiment.
+
+    eligible_benchmarks.json   loop_records[bench] -> pre_features_raw (93-dim,
+                               RAW), filename, triple, loop_idx; plus the fitted
+                               normalizer.
+    reward_cache.json          rewards["bench|loop|unmerge|factor"] -> float,
+                               and post_features["bench|loop"] (ALREADY
+                               NORMALISED — see make_state in adapt_eval.py).
+    loop_labels.csv            ground-truth category per loop, from label_loops.py.
+
+WHY THIS MODULE EXISTS SEPARATELY
+---------------------------------
+The live pipeline is not modified. This mirrors the parts of it that decide what
+an action *is* and what it *earns*, so the offline runs stay comparable to the
+online ones — but it reads those decisions from cache instead of measuring them.
+Every mirrored rule is marked MIRROR with its source, because a silent drift here
+would make offline numbers look valid while describing a different experiment.
+
+EVALUATION — TWO LEVELS, ALWAYS REPORTED TOGETHER
+-------------------------------------------------
+  1. DECISION QUALITY   per-category accuracy against loop_labels.csv: did the
+                        policy pick the action the oracle says is correct?
+  2. PERFORMANCE        what the chosen cell actually earned — capture ratio,
+                        regressions, realized vs oracle reward.
+
+Accuracy alone misleads in both directions on this population: "always
+unmerge+unroll" scores the best accuracy of any fixed rule and is reward-
+catastrophic, while "always no-op" scores poorly and beats the published
+heuristic outright. Neither number is reported without the other.
+"""
+
+import csv
+import json
+import random
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from adapt_eval import NOOP, build_tables, oracle_of          # noqa: E402
+from train import _dedup_loop_records                          # noqa: E402
+
+CATEGORIES = ("noop", "unroll_only", "unmerge_unroll")
+LABEL = {"noop": "no-op", "unroll_only": "unroll-only",
+         "unmerge_unroll": "unmerge+unroll"}
+
+# MIRROR: agent.py:_IDX_TRIP_COUNT_KNOWN / _IDX_TRIP_COUNT (private, hence the
+# copy). Copies drift, so load_run() asserts these positions against
+# FEATURE_COLUMNS rather than trusting them: if the schema ever gains a column
+# at the front, the mask silently starts reading a different feature and every
+# factor decision is made against a fabricated trip count.
+IDX_TRIP_KNOWN = 10
+IDX_TRIP_COUNT = 11
+
+
+def category_of(action) -> str:
+    """
+    MIRROR: the three-action space. (0,1) declines, (0,f>1) unrolls only,
+    (1,f) unmerges and unrolls. Any factor with unmerge=1 is the unmerge
+    category — including factor 1, which still pays for path duplication.
+    """
+    unmerge, factor = action
+    if unmerge == 0:
+        return "noop" if factor == 1 else "unroll_only"
+    return "unmerge_unroll"
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+def load_run(run_dir: Path, labels_file: "Path | None" = None) -> dict:
+    """
+    Everything the offline experiment needs, from cache alone.
+
+    Returns keys:
+      loops       list of assignment dicts (MIRROR: train.build_loop_assignments,
+                  minus benchmark_path — nothing offline opens the source tree)
+      tables      {(bench, loop_idx): {(unmerge, factor): reward}}, no-op at 0.0
+      normalizer  the FITTED normalizer from the cache, used as-is
+      postf       post-unmerge feature vectors, normalised
+      labels      {(bench, loop_idx): category} from loop_labels.csv
+      benchmarks  sorted benchmark names that have at least one loop
+    """
+    elig_f = run_dir / "eligible_benchmarks.json"
+    rc_f = run_dir / "reward_cache.json"
+    lab_f = labels_file or (run_dir / "loop_labels.csv")
+    for f in (elig_f, rc_f, lab_f):
+        if not f.exists():
+            raise SystemExit(f"missing {f}")
+
+    elig = json.loads(elig_f.read_text())
+    records = elig.get("loop_records", {})
+    if not records:
+        raise SystemExit(f"{elig_f} has no loop_records")
+
+    # MIRROR: train.precheck_benchmarks applies dedup at LOAD time, so a run
+    # trained on the deduped set. Skipping it here would train offline on loops
+    # the online pipeline never saw, and the two would stop being comparable.
+    records, dropped = _dedup_loop_records(records)
+
+    # Feature-space guard. The trip-count mask reads fixed indices out of the
+    # raw vector; if the schema ever grows a column at the front, the mask
+    # silently starts reading the wrong feature and every factor decision is
+    # made against a fabricated trip count.
+    from hecbench import FEATURE_COLUMNS
+    assert FEATURE_COLUMNS[IDX_TRIP_KNOWN] == "tripCountKnown", \
+        f"feature layout moved: index {IDX_TRIP_KNOWN} is not tripCountKnown"
+    assert FEATURE_COLUMNS[IDX_TRIP_COUNT] == "tripCount", \
+        f"feature layout moved: index {IDX_TRIP_COUNT} is not tripCount"
+
+    loops = []
+    for bench in sorted(records):
+        for rec in records[bench]:
+            loops.append({
+                "benchmark_name":   bench,
+                "loop_idx":         int(rec["loop_idx"]),
+                "filename":         rec.get("filename", ""),
+                "triple":           rec.get("triple", ""),
+                "pre_features_raw": rec["pre_features_raw"],
+            })
+
+    rc = json.loads(rc_f.read_text())
+    tables = build_tables(loops, rc.get("rewards", {}))
+    postf = rc.get("post_features", {})
+
+    labels, oracle_mismatch = {}, []
+    with open(lab_f) as fh:
+        for r in csv.DictReader(fh):
+            if r.get("labelable") != "1":
+                continue
+            key = (r["benchmark"], int(r["loop_idx"]))
+            cat = r["category"]
+            # Fail fast rather than KeyError deep inside a sweep's confusion
+            # matrix. A category outside the three-action space means the labels
+            # were produced by a different label_loops than this scorer expects.
+            if cat not in CATEGORIES:
+                raise SystemExit(
+                    f"{lab_f}: loop {key} has category {cat!r}, which is not one "
+                    f"of {CATEGORIES}. Labels and scorer disagree — regenerate "
+                    f"loop_labels.csv against this cache.")
+            labels[key] = cat
+            # Cross-check: label_loops' stored oracle and the oracle derived
+            # from this cache must agree. They disagree exactly when the labels
+            # were generated against a DIFFERENT reward cache, which would make
+            # every accuracy number describe one table and every performance
+            # number another — invisible in the output, fatal to the result.
+            stored = r.get("oracle_reward", "")
+            if stored not in ("", None) and key in tables:
+                _, derived = oracle_of(tables[key])
+                if abs(float(stored) - derived) > 1e-6:
+                    oracle_mismatch.append((key, float(stored), derived))
+    if oracle_mismatch:
+        head = "; ".join(f"{k}: labels {a:+.4f} vs cache {b:+.4f}"
+                         for k, a, b in oracle_mismatch[:5])
+        raise SystemExit(
+            f"{len(oracle_mismatch)} loop(s) where loop_labels.csv disagrees "
+            f"with reward_cache.json about the oracle — the labels were built "
+            f"from a different cache. Regenerate them. Examples: {head}")
+
+    from hecbench import FeatureNormalizer
+    normalizer = FeatureNormalizer.from_state_dict(elig.get("normalizer", {}))
+
+    present = {l["benchmark_name"] for l in loops}
+    return {
+        "loops": loops,
+        "tables": tables,
+        "normalizer": normalizer,
+        "postf": postf,
+        "labels": labels,
+        "benchmarks": sorted(present),
+        # UNSORTED, as stored. train.split_benchmarks shuffles whatever list it
+        # is handed, so the permutation — and therefore which benchmarks landed
+        # in test — depends on the INPUT ORDER, not just the seed. precheck
+        # wrote this list in the order it processed them, so it is the only
+        # order that reproduces a training run's split. Sorting here would
+        # silently produce a different, plausible-looking split.
+        "eligible_order": [b for b in elig.get("eligible", []) if b in present],
+        "n_dropped_dedup": dropped,
+        "normalizer_fitted": normalizer._fitted,
+    }
+
+
+def labelled_loops(data: dict) -> list:
+    """
+    Loops that carry a ground-truth category.
+
+    label_loops.py marks a loop unlabelable when it has no measured cells, so
+    these are exactly the loops on which BOTH accuracy and performance can be
+    computed. Scoring the rest would mix "the policy was wrong" with "we do not
+    know what was right".
+    """
+    return [l for l in data["loops"]
+            if (l["benchmark_name"], l["loop_idx"]) in data["labels"]]
+
+
+# ---------------------------------------------------------------------------
+# Grouped K-fold
+# ---------------------------------------------------------------------------
+
+def grouped_kfold(benchmarks: list, k: int, seed: int) -> list:
+    """
+    [(train_benchmarks, test_benchmarks)] — grouped by BENCHMARK, never by loop.
+
+    A benchmark's loops share kernels, source, and often the reward itself, so
+    splitting one across folds leaks the answer. Grouping also matches how the
+    result is used: the deployment question is "a new application", not "another
+    loop in an application already measured".
+
+    Every benchmark is in the test fold exactly once, so the union of held-out
+    predictions covers the whole population, each loop predicted by a model that
+    never saw it.
+    """
+    if k < 2:
+        raise ValueError("k must be >= 2")
+    shuffled = list(benchmarks)
+    random.Random(seed).shuffle(shuffled)
+    folds = [shuffled[i::k] for i in range(k)]
+    out = []
+    for i in range(k):
+        test = folds[i]
+        train = [b for j, f in enumerate(folds) if j != i for b in f]
+        out.append((train, test))
+    return out
+
+
+def holdout_split(benchmarks: list, frac: float, seed: int) -> tuple:
+    """(fit, holdout) inside a training fold — for early stopping only."""
+    shuffled = list(benchmarks)
+    random.Random(seed).shuffle(shuffled)
+    n_hold = max(1, round(len(shuffled) * frac))
+    return shuffled[n_hold:], shuffled[:n_hold]
+
+
+def loops_for(loops: list, benchmarks) -> list:
+    names = set(benchmarks)
+    return [l for l in loops if l["benchmark_name"] in names]
+
+
+# ---------------------------------------------------------------------------
+# Reference policies
+# ---------------------------------------------------------------------------
+# Split into two groups that are NOT peers, and must never be tabulated as if
+# they were:
+#
+#   DEPLOYABLE      a function of features alone — can be applied to an
+#                   application nobody has measured. Learned policy,
+#                   marginal-best, always-no-op.
+#   REFERENCE       requires measuring the target first, so it cannot be
+#                   shipped. Oracle, benchmark-dominant. Useful as a ceiling;
+#                   beating a policy does NOT make it a better alternative.
+
+def always_noop_picks(loops: list) -> list:
+    return [(l["benchmark_name"], l["loop_idx"], NOOP) for l in loops]
+
+
+def marginal_picks(loops: list, tables: dict, train_keys: list) -> list:
+    """
+    DEPLOYABLE. The single action with the best mean reward on TRAIN, applied to
+    every loop regardless of features. A feature-conditioned policy that only
+    matches this has learned a global prior and nothing about the loop.
+
+    Falls back per loop to the best action that EXISTS in that loop's table:
+    the global winner may be masked out by trip count or simply unmeasured, and
+    scoring it as unmeasured would flatter the learned policy by comparison.
+    """
+    from adapt_eval import marginal_policy
+    ranked = marginal_policy(tables, train_keys)
+    picks = []
+    for l in loops:
+        key = (l["benchmark_name"], l["loop_idx"])
+        table = tables[key]
+        chosen = next((a for a in ranked if a in table), NOOP)
+        picks.append((key[0], key[1], chosen))
+    return picks
+
+
+def oracle_picks(loops: list, tables: dict) -> list:
+    """REFERENCE — requires the target to be measured. The ceiling, not a rival."""
+    picks = []
+    for l in loops:
+        key = (l["benchmark_name"], l["loop_idx"])
+        best, _ = oracle_of(tables[key])
+        picks.append((key[0], key[1], best))
+    return picks
+
+
+def benchmark_dominant_picks(loops: list, tables: dict, labels: dict) -> list:
+    """
+    REFERENCE — requires measuring the target application. Predicts each
+    benchmark's most common ground-truth category for every loop in it, using
+    the best available cell of that category.
+
+    Included because benefit is bimodal per benchmark (median benefit rate 100%,
+    26% of benchmarks at exactly 0%): if this matches the learned policy, the
+    policy has learned the application and not the loop.
+    """
+    by_bench: dict = {}
+    for l in loops:
+        key = (l["benchmark_name"], l["loop_idx"])
+        cat = labels.get(key)
+        if cat:
+            by_bench.setdefault(key[0], []).append(cat)
+    # max() over a set() would depend on set iteration order, which for strings
+    # varies with hash randomisation between processes — the same run would give
+    # different baselines on different invocations. Ranking over the fixed
+    # CATEGORIES tuple is reproducible, and ties go to the SIMPLER action, which
+    # is label_loops' own tie rule.
+    dominant = {b: max(CATEGORIES,
+                       key=lambda c, cs=cs: (cs.count(c), -CATEGORIES.index(c)))
+                for b, cs in by_bench.items()}
+    picks = []
+    for l in loops:
+        key = (l["benchmark_name"], l["loop_idx"])
+        table = tables[key]
+        want = dominant.get(key[0], "noop")
+        cands = [(r, a) for a, r in table.items() if category_of(a) == want]
+        chosen = max(cands)[1] if cands else NOOP
+        picks.append((key[0], key[1], chosen))
+    return picks
+
+
+# ---------------------------------------------------------------------------
+# Scoring — decision quality AND performance
+# ---------------------------------------------------------------------------
+
+def score_decisions(picks: list, tables: dict, labels: dict,
+                    deadzone: float, missing_reward: "float | None" = None) -> dict:
+    """
+    Both evaluation levels over one set of (bench, loop_idx, action) picks.
+
+    A cell with no row in the cache always counts against ACCURACY — picking it
+    is a real decision. What it earns is `missing_reward`:
+
+      float (default in the runner: the failure penalty)
+            After exhaustive collection an absent row means the cell FAILED, so
+            charging it is the honest reading. It also removes a bias: the
+            oracle, always-no-op and marginal-best all pick from cells that
+            exist by construction, so excluding absences would discount only the
+            learned policy's bad choices.
+      None  Exclude from performance and report the count separately. Use to
+            measure how much of a result rides on those cells.
+    """
+    conf = {t: {p: 0 for p in CATEGORIES} for t in CATEGORIES}
+    realized_sum = oracle_sum = 0.0
+    n = n_scored = n_unmeasured = n_regress = n_headroom = 0
+    realized_all: list = []
+    per_bench: dict = {}
+
+    for bench, li, action in picks:
+        key = (bench, li)
+        truth = labels.get(key)
+        if truth is None:
+            continue
+        n += 1
+        conf[truth][category_of(action)] += 1
+
+        table = tables[key]
+        _, orc = oracle_of(table)
+        if action not in table:
+            n_unmeasured += 1
+            if missing_reward is None:
+                continue
+            r = float(missing_reward)
+        else:
+            r = table[action]
+        n_scored += 1
+        realized_all.append(r)
+        if r < -deadzone:
+            n_regress += 1
+        b = per_bench.setdefault(bench, {"realized": 0.0, "oracle": 0.0,
+                                         "loops": 0, "regress": 0})
+        b["loops"] += 1
+        b["regress"] += int(r < -deadzone)
+        # MIRROR: adapt_eval.score — only loops with headroom enter the capture
+        # ratio. A loop whose oracle is 0 has nothing to capture, and including
+        # it leaves the denominator reward-free while the numerator can still go
+        # negative.
+        if orc > deadzone:
+            n_headroom += 1
+            realized_sum += r
+            oracle_sum += orc
+            b["realized"] += r
+            b["oracle"] += orc
+
+    correct = sum(conf[t][t] for t in CATEGORIES)
+    per_cat = {}
+    for t in CATEGORIES:
+        tot = sum(conf[t].values())
+        per_cat[t] = {"n": tot, "correct": conf[t][t],
+                      "acc": conf[t][t] / tot if tot else float("nan")}
+
+    return {
+        "loops": n,
+        "loops_scored": n_scored,
+        "loops_unmeasured": n_unmeasured,
+        "loops_with_headroom": n_headroom,
+        "accuracy": correct / n if n else float("nan"),
+        "per_category": per_cat,
+        "confusion": conf,
+        "capture": realized_sum / oracle_sum if oracle_sum > 0 else float("nan"),
+        "oracle_sum": oracle_sum,
+        "realized_sum": realized_sum,
+        # Mean over EVERY scored loop, not only those with headroom: this is the
+        # number that must be compared against always-no-op's exact 0.0, and
+        # restricting it to headroom loops would hide the cost of firing on
+        # loops that had nothing to gain.
+        "mean_realized": (sum(realized_all) / len(realized_all)
+                          if realized_all else 0.0),
+        "regression_rate": n_regress / n_scored if n_scored else 0.0,
+        "n_regress": n_regress,
+        "n_benchmarks": len(per_bench),
+        "per_bench": per_bench,
+    }
+
+
+def format_report(name: str, m: dict) -> str:
+    lines = [f"  {name}"]
+    lines.append(f"    loops {m['loops']:<5} scored {m['loops_scored']:<5} "
+                 f"unmeasured {m['loops_unmeasured']}")
+    lines.append(f"    accuracy        {100 * m['accuracy']:5.1f}%")
+    for t in CATEGORIES:
+        c = m["per_category"][t]
+        acc = "    - " if c["n"] == 0 else f"{100 * c['acc']:5.1f}%"
+        lines.append(f"      {LABEL[t]:<16} {c['correct']:>4}/{c['n']:<5} {acc}")
+    lines.append(f"    capture         {100 * m['capture']:5.1f}%"
+                 f"   (realized {m['realized_sum']:+.3f}"
+                 f" of {m['oracle_sum']:+.3f})")
+    lines.append(f"    mean realized   {m['mean_realized']:+.4f}"
+                 f"   <- always-no-op scores exactly +0.0000")
+    lines.append(f"    regressions     {m['n_regress']:>4}"
+                 f"   ({100 * m['regression_rate']:.1f}% of scored)")
+    return "\n".join(lines)
+
+
+def format_confusion(m: dict) -> str:
+    corner = "truth \\ pred"
+    head = f"  {corner:<18}" + "".join(f"{LABEL[p]:>16}" for p in CATEGORIES)
+    lines = [head]
+    for t in CATEGORIES:
+        row = f"  {LABEL[t]:<18}" + "".join(
+            f"{m['confusion'][t][p]:>16}" for p in CATEGORIES)
+        lines.append(row)
+    return "\n".join(lines)
