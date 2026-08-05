@@ -63,13 +63,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import torch                                                    # noqa: E402
 
-from offline_data import (IDX_TRIP_COUNT, IDX_TRIP_KNOWN,       # noqa: E402
-                          always_noop_picks, benchmark_dominant_picks,
+from offline_data import (_RULE, IDX_TRIP_COUNT, IDX_TRIP_KNOWN,  # noqa: E402
+                          NOOP, always_noop_picks, benchmark_dominant_picks,
                           format_confusion, format_report, grouped_kfold,
                           holdout_split, labelled_loops, load_run, loops_for,
-                          marginal_picks, oracle_picks, score_decisions)
+                          marginal_picks, marginal_ranking, oracle_picks,
+                          score_decisions, table_header, table_row)
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+# force=True is load-bearing: importing offline_data pulls in adapt_eval and
+# train, both of which call basicConfig with a timestamped format at import
+# time. basicConfig is a no-op once handlers exist, so without force the whole
+# report comes out prefixed "HH:MM:SS INFO" — and only on the first line of each
+# multi-line block, which is worse than useless.
+logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 log = logging.getLogger("offline")
 # The trip-count mask logs one INFO line per masked loop per epoch — thousands of
 # lines in a sweep, and it says nothing the summary does not.
@@ -337,18 +343,30 @@ def run_cv(data: dict, args) -> None:
                 "n_missing_cells_in_training": info["n_missing_cells"],
             })
 
-    # --- the headline: pooled over the union of held-out predictions ---
-    log.info("\n" + "=" * 74)
-    log.info("  POOLED — union of held-out predictions (every loop, unseen)")
-    log.info("=" * 74)
-    pooled = []
-    for s, picks in sorted(union.items()):
-        m = score_decisions(picks, data["tables"], data["labels"],
-                            args.deadzone, _mr(args))
-        pooled.append(m)
-        log.info(format_report(f"init seed {s}", m))
-        log.info("")
-    log.info("  confusion (init seed %d)", sorted(union)[0])
+    # --- the headline: one table, policy and baselines side by side ---
+    pooled = [score_decisions(picks, data["tables"], data["labels"],
+                              args.deadzone, _mr(args))
+              for _, picks in sorted(union.items())]
+
+    log.info("\n" + "=" * 92)
+    log.info("  RESULTS — %d loops, every one predicted by a model that never "
+             "saw it", pooled[0]["loops"])
+    log.info("  (union of %d held-out folds; baselines scored on the same "
+             "population)", args.folds)
+    log.info("=" * 92)
+    log.info(table_header())
+    for s, m in zip(sorted(union), pooled):
+        log.info(table_row(f"{args.agent} (init seed {s})", m))
+    _baseline_rows(data, loops, folds, args)
+
+    log.info("\n  Read across the row, not down the column: 'capture' means "
+             "nothing without the")
+    log.info("  oracle's 100%% and always-no-op's 0%% on the same table. "
+             "'mean' is the one number")
+    log.info("  directly comparable to doing nothing, which scores exactly "
+             "+0.0000.")
+    log.info("\n  confusion, %s init seed %d (rows = truth, cols = predicted)",
+             args.agent, sorted(union)[0])
     log.info(format_confusion(pooled[0]))
 
     # --- the two spreads, which mean different things ---
@@ -373,9 +391,6 @@ def run_cv(data: dict, args) -> None:
         _spread(vals, f"across folds (seed {args.base_seed + s})",
                 "data heterogeneity")
 
-    # --- baselines, in two groups that are not peers ---
-    _report_baselines(data, loops, folds, args)
-
     if args.csv_out:
         with open(args.csv_out, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(fold_rows[0].keys()))
@@ -384,40 +399,52 @@ def run_cv(data: dict, args) -> None:
         log.info("\n  per-fold: %s", args.csv_out)
 
 
-def _report_baselines(data: dict, loops: list, folds: list, args) -> None:
+def _baseline_rows(data: dict, loops: list, folds: list, args) -> None:
     """
-    Baselines over the SAME labelled population.
+    Baseline rows for the results table, over the SAME labelled population.
 
     marginal-best is fitted per fold on that fold's training benchmarks and
     applied to its held-out ones, exactly like the policy — fitting it on
     everything would hand it test information the policy never had.
     """
     tables, labels = data["tables"], data["labels"]
-    log.info("\n" + "=" * 74)
-    log.info("  BASELINES")
-    log.info("=" * 74)
-    log.info("  DEPLOYABLE — a function of features; works on unmeasured code")
-    log.info(format_report("always-no-op", score_decisions(
-        always_noop_picks(loops), tables, labels, args.deadzone, _mr(args))))
 
     marg: list = []
     for tr_b, te_b in folds:
         tr_keys = [(l["benchmark_name"], l["loop_idx"])
                    for l in loops_for(loops, tr_b)]
         marg.extend(marginal_picks(loops_for(loops, te_b), tables, tr_keys))
-    log.info(format_report("marginal-best (per-fold, held out)",
-                           score_decisions(marg, tables, labels,
-                                           args.deadzone, _mr(args))))
 
-    log.info("\n  REFERENCE — needs the target measured first; NOT a rival")
-    log.info(format_report("benchmark-dominant category", score_decisions(
-        benchmark_dominant_picks(loops, tables, labels), tables, labels,
-        args.deadzone, _mr(args))))
-    log.info(format_report("oracle (ceiling)", score_decisions(
-        oracle_picks(loops, tables, args.deadzone), tables, labels,
-        args.deadzone, _mr(args))))
-    log.info("\n  A reference beating the policy does NOT mean the policy lost to")
-    log.info("  a real alternative: neither can be applied to unmeasured code.")
+    def _row(name, picks):
+        log.info(table_row(name, score_decisions(picks, tables, labels,
+                                                 args.deadzone, _mr(args))))
+
+    log.info(_RULE)
+    log.info("  DEPLOYABLE — a function of features; works on unmeasured code")
+    _row("always-no-op", always_noop_picks(loops))
+    _row("marginal-best", marg)
+    log.info(_RULE)
+    log.info("  REFERENCE — needs the target measured first; NOT deployable")
+    _row("benchmark-dominant", benchmark_dominant_picks(loops, tables, labels))
+    _row("oracle (ceiling)", oracle_picks(loops, tables, args.deadzone))
+    log.info(_RULE)
+    log.info("  A reference beating the policy does NOT mean the policy lost to "
+             "a real\n  alternative: neither can be applied to unmeasured code.")
+
+    # marginal-best collapsing onto the no-op is a RESULT, not a duplicated row,
+    # and without the means printed it just looks like one. Show the ranking so
+    # the reason is on the page.
+    all_keys = [(l["benchmark_name"], l["loop_idx"]) for l in loops]
+    ranking = marginal_ranking(tables, all_keys)
+    if ranking and ranking[0][0] == NOOP:
+        log.info("\n  NOTE: the best FEATURE-BLIND action is to decline — no-op "
+                 "is exactly 0.0 on\n  every loop, so every transform arm has a "
+                 "NEGATIVE mean over the population.\n  That is why "
+                 "marginal-best and always-no-op are the same row. Top arms by "
+                 "mean:")
+        for a, mean, n in ranking[:5]:
+            tag = "no-op" if a == NOOP else f"unmerge={a[0]} factor={a[1]}"
+            log.info("    %-24s mean %+.4f over %d loops", tag, mean, n)
 
 
 def run_score_ckpt(data: dict, args) -> None:

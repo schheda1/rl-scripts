@@ -432,9 +432,15 @@ def test_training_smoke(d: dict):
         assert len(picks) == len(loops)
         for _, _, (u, f) in picks:
             assert u in (0, 1) and 1 <= f <= 10, (u, f)
+        # Deliberately NOT printing the hold score. It is meaningless here and
+        # reads like a result: the fixture measures 13 of 100 cells, so ~87% of
+        # the action space is absent and a barely-trained policy is charged the
+        # failure penalty almost every time (PPO's score came out at exactly
+        # -0.161, the penalty itself, on all 5 loops). The real table is ~99%
+        # filled. This test asserts liveness only.
         print(f"  training smoke [{kind:6}]    ok  "
-              f"(best epoch {info['best_epoch']}, "
-              f"hold mean {info['best_hold_mean_realized']:+.4f})")
+              f"({info['epochs_run']} epochs ran, "
+              f"{info['n_missing_cells']} absent-cell samples charged)")
 
 
 def test_trip_count_mask_is_respected(d: dict):
@@ -456,6 +462,43 @@ def test_trip_count_mask_is_respected(d: dict):
             seen.add(f)
     assert seen <= {1, 2, 3}, f"factor above the trip count was selected: {seen}"
     print(f"  trip-count mask            ok  (factors seen: {sorted(seen)})")
+
+
+def test_marginal_ranking_and_table(d: dict):
+    """
+    marginal_ranking's means, hand-computed over the fixture:
+
+      (1,4)  +0.40 / 1 loop     (0,2)  (0.10 + 0.001 - 0.10)/3 = +0.000333
+      (0,3)  +0.20 / 1          NOOP    0.0 on all 5 loops
+      (1,2)  (0.30 - 0.20)/2 = +0.05    (1,5)  -0.50 / 1
+
+    so the ranking is (1,4) > (0,3) > (1,2) > (0,2) > NOOP > (1,5). NOOP is NOT
+    first here — the fixture exercises the NON-degenerate path, so the real
+    run's "marginal-best == always-no-op" collapse is a property of that data
+    (every transform arm negative), not of this code.
+
+    Also renders the table, which must stay one line per policy and line up
+    with its own header.
+    """
+    loops = od.labelled_loops(d)
+    keys = [(l["benchmark_name"], l["loop_idx"]) for l in loops]
+    rank = od.marginal_ranking(d["tables"], keys)
+    assert rank[0][0] == (1, 4) and approx(rank[0][1], 0.40), rank[0]
+    assert rank[-1][0] == (1, 5) and approx(rank[-1][1], -0.50), rank[-1]
+    means = dict((a, m) for a, m, _ in rank)
+    assert approx(means[od.NOOP], 0.0), means[od.NOOP]
+    assert approx(means[(1, 2)], 0.05), means[(1, 2)]
+    # The ranking shown must be the ranking used.
+    from adapt_eval import marginal_policy
+    assert [a for a, _, _ in rank] == marginal_policy(d["tables"], keys)
+
+    m = od.score_decisions(od.oracle_picks(loops, d["tables"], DZ), d["tables"],
+                           d["labels"], DZ)
+    row = od.table_row("oracle (ceiling)", m)
+    hdr = od.table_header().splitlines()
+    assert "\n" not in row, "a table row must be exactly one line"
+    assert len(row) == len(hdr[-1]), (len(row), len(hdr[-1]))
+    print("  marginal ranking / table   ok")
 
 
 def test_determinism(d: dict):
@@ -526,6 +569,7 @@ def main() -> None:
         test_absent_cell_scoring(d)
         test_regression_and_deadzone(d)
         test_marginal_is_deployable(d)
+        test_marginal_ranking_and_table(d)
         test_split_reproduction_uses_stored_order(d)
         test_trip_count_mask_is_respected(d)
         test_training_smoke(d)

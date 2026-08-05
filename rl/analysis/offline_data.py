@@ -339,6 +339,30 @@ def always_noop_picks(loops: list) -> list:
     return [(l["benchmark_name"], l["loop_idx"], NOOP) for l in loops]
 
 
+def marginal_ranking(tables: dict, train_keys: list) -> list:
+    """
+    [(action, mean_reward, n_loops)], best mean first — the display companion to
+    marginal_picks.
+
+    Worth printing, because this baseline degenerating to the no-op is a result,
+    not a bug: no-op is exactly 0.0 on every loop, so if it ranks first then
+    EVERY transform arm has a negative mean over the population. Without seeing
+    the means, "marginal-best is identical to always-no-op" just looks like a
+    duplicated row.
+
+    The ORDER comes from adapt_eval.marginal_policy, so the ranking shown and
+    the ranking used cannot disagree; only the means are computed here.
+    """
+    from adapt_eval import marginal_policy
+    tot: dict = {}
+    cnt: dict = {}
+    for k in train_keys:
+        for a, r in tables[k].items():
+            tot[a] = tot.get(a, 0.0) + r
+            cnt[a] = cnt.get(a, 0) + 1
+    return [(a, tot[a] / cnt[a], cnt[a]) for a in marginal_policy(tables, train_keys)]
+
+
 def marginal_picks(loops: list, tables: dict, train_keys: list) -> list:
     """
     DEPLOYABLE. The single action with the best mean reward on TRAIN, applied to
@@ -509,7 +533,35 @@ def score_decisions(picks: list, tables: dict, labels: dict,
     }
 
 
+_HDR = (f"  {'':<26}{'all':>7}{'no-op':>8}{'unroll':>8}{'unmerge':>9}"
+        f"  |{'capture':>9}{'mean':>9}{'slower':>8}{'unmeas':>8}")
+_RULE = "  " + "-" * (len(_HDR) - 2)
+
+
+def table_header() -> str:
+    """
+    One table instead of a block per policy. These numbers only mean anything
+    against each other — 'capture 88.7%' says nothing until you can see the
+    oracle's 100% and always-no-op's 0% on the lines above and below it.
+    """
+    return (f"  {'':<26}{'-- ACCURACY ------------------':^32}"
+            f"  |{'-- PERFORMANCE ----------------':^34}\n"
+            + _HDR + "\n" + _RULE)
+
+
+def table_row(name: str, m: dict) -> str:
+    def _a(t):
+        c = m["per_category"][t]
+        return "     -" if c["n"] == 0 else f"{100 * c['acc']:6.1f}%"
+    return (f"  {name:<26}{100 * m['accuracy']:6.1f}%"
+            f"{_a('noop'):>8}{_a('unroll_only'):>8}{_a('unmerge_unroll'):>9}"
+            f"  |{100 * m['capture']:8.1f}%{m['mean_realized']:+9.4f}"
+            f"{m['n_regress']:>8}{m['loops_unmeasured']:>8}")
+
+
 def format_report(name: str, m: dict) -> str:
+    """Verbose single-policy block. Kept for the checkpoint mode, where there is
+    only one policy and the counts matter more than the comparison."""
     lines = [f"  {name}"]
     lines.append(f"    loops {m['loops']:<5} scored {m['loops_scored']:<5} "
                  f"unmeasured {m['loops_unmeasured']}")
@@ -521,8 +573,7 @@ def format_report(name: str, m: dict) -> str:
     lines.append(f"    capture         {100 * m['capture']:5.1f}%"
                  f"   (realized {m['realized_sum']:+.3f}"
                  f" of {m['oracle_sum']:+.3f})")
-    lines.append(f"    mean realized   {m['mean_realized']:+.4f}"
-                 f"   <- always-no-op scores exactly +0.0000")
+    lines.append(f"    mean realized   {m['mean_realized']:+.4f}")
     lines.append(f"    regressions     {m['n_regress']:>4}"
                  f"   ({100 * m['regression_rate']:.1f}% of scored)")
     return "\n".join(lines)
