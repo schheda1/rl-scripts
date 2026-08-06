@@ -599,3 +599,42 @@ def format_confusion(m: dict) -> str:
             f"{m['confusion'][t][p]:>16}" for p in CATEGORIES)
         lines.append(row)
     return "\n".join(lines)
+
+# ---------------------------------------------------------------------------
+# Run fingerprint
+# ---------------------------------------------------------------------------
+
+# Every flag that feeds the TRAINED agent. --adapt-steps / --adapt-lr /
+# --adapt-unfreeze are deliberately absent: they act only on a deepcopy made
+# after zero-shot is scored, so they cannot move a zero-shot number. If two runs
+# disagree on a zero-shot row, the cause is in this list.
+TRAINING_ARGS = (
+    "agent", "min_fill", "deadzone", "folds", "fold_seed", "base_seed", "seeds",
+    "holdout_frac", "epochs", "buffer_size", "batch_size", "lr", "K",
+    "weight_decay", "max_grad_norm", "patience", "bandit_epsilon",
+    "bandit_epsilon_final", "bandit_warm_epochs", "q_pessimism", "logit_cap",
+    "entropy_coef", "entropy_coef_final", "entropy_coef_unmerge", "missing",
+    "compile_failure_penalty", "score_missing", "threads",
+)
+
+
+def fingerprint(loops: list, args) -> list:
+    """
+    Lines identifying exactly what this run trains on, so two logs can be diffed.
+
+    Zero-shot numbers are a deterministic function of (population, TRAINING_ARGS,
+    seed) — `test_determinism` proves the seeded path is reproducible. So when
+    two runs disagree on a zero-shot row, something in one of those two inputs
+    differed, and reading it back off the logs beats guessing. Emitting this cost
+    one confusing afternoon; not emitting it cost the same afternoon.
+    """
+    import hashlib
+    keys = sorted((l["benchmark_name"], l["loop_idx"]) for l in loops)
+    h = hashlib.sha1(repr(keys).encode()).hexdigest()[:12]
+    benches = len({k[0] for k in keys})
+    out = [f"  population {h}  ({len(keys)} loops / {benches} benchmarks)"]
+    vals = " ".join(f"{n}={getattr(args, n, '-')}" for n in TRAINING_ARGS)
+    for i in range(0, len(vals), 88):
+        out.append(("  training args: " if i == 0 else "                 ")
+                   + vals[i:i + 88])
+    return out

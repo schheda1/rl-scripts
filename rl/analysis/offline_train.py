@@ -65,8 +65,8 @@ import torch                                                    # noqa: E402
 
 from offline_data import (_RULE, IDX_TRIP_COUNT, IDX_TRIP_KNOWN,  # noqa: E402
                           NOOP, always_noop_picks, benchmark_dominant_picks,
-                          format_confusion, format_report, grouped_kfold,
-                          holdout_split, labelled_loops, load_run, loops_for,
+                          fingerprint, format_confusion, format_report, grouped_kfold,
+                          holdout_split, fingerprint, labelled_loops, load_run, loops_for,
                           marginal_picks, marginal_ranking, oracle_picks,
                           score_decisions, table_header, table_row)
 
@@ -522,6 +522,8 @@ def run_cv(data: dict, args) -> None:
     loops = labelled_loops(data)
     benches = sorted({l["benchmark_name"] for l in loops})
     folds = grouped_kfold(benches, args.folds, args.fold_seed)
+    for _l in fingerprint(loops, args):
+        log.info(_l)
 
     log.info("Grouped %d-fold over %d benchmarks (%d labelled loops), "
              "%d init seed(s) — %d runs total",

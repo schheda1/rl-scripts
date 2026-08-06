@@ -59,10 +59,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import torch                                                     # noqa: E402
 
-from offline_data import (grouped_kfold, holdout_split,          # noqa: E402
-                          labelled_loops, load_run, loops_for,
-                          oracle_of_gated, score_decisions, table_header,
-                          table_row)
+from offline_data import (always_noop_picks, fingerprint,        # noqa: E402
+                          grouped_kfold, holdout_split, labelled_loops,
+                          load_run, loops_for, oracle_of_gated, oracle_picks,
+                          score_decisions, table_header, table_row)
 from offline_train import (_mr, build_parser, greedy_picks,      # noqa: E402
                            train_agent)
 
@@ -71,10 +71,35 @@ log = logging.getLogger("adapt")
 logging.getLogger("agent").setLevel(logging.WARNING)
 
 
-def _freeze_for_adaptation(agent, n_layers: int) -> list:
+def _unfreeze_spec(text: str) -> tuple:
+    """`--adapt-unfreeze N` -> (N, N); `--adapt-unfreeze CAT,FACTOR` -> (CAT, FACTOR)."""
+    parts = [p.strip() for p in str(text).split(",")]
+    if len(parts) == 1:
+        parts *= 2
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("expected N or CAT,FACTOR")
+    try:
+        vals = tuple(int(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not integers: {text!r}")
+    for v in vals:
+        if v not in (1, 2, 3):
+            raise argparse.ArgumentTypeError(f"layers must be 1, 2 or 3 (got {v})")
+    return vals
+
+
+def _freeze_for_adaptation(agent, n_cat: int, n_fac: int) -> list:
     """
-    Make the last `n_layers` PARAMETERISED layers of each actor head trainable,
-    freeze everything else, and return the trainable parameters.
+    Make the last `n_cat` parameterised layers of the FIRST head and the last
+    `n_fac` of the FACTOR head trainable, freeze the rest, and return the
+    trainable parameters.
+
+    The two are separate because the diagnosis says they are not symmetric: the
+    category is what adaptation demonstrably learns (accuracy +21pp, unmerge
+    recall +27pp) while the factor is what stays stuck (mean at or below zero
+    every time). Giving the factor head more capacity than the category head
+    targets the arm that is actually failing, instead of loosening both and
+    inviting the category head to memorise the 20-40 adaptation examples.
 
     Local rather than adapt_eval.freeze_trunk, which hardcodes net[6]; that file
     stays untouched. The _MLP stack is
@@ -100,9 +125,10 @@ def _freeze_for_adaptation(agent, n_layers: int) -> list:
     nothing reads it, and saying "frozen" would overstate what is done.)
     """
     groups = {1: [6], 2: [3, 4, 6], 3: [0, 1, 3, 4, 6]}
-    if n_layers not in groups:
-        raise ValueError(f"--adapt-unfreeze must be 1, 2 or 3 (got {n_layers})")
-    idx = groups[n_layers]
+    for n in (n_cat, n_fac):
+        if n not in groups:
+            raise ValueError(f"--adapt-unfreeze layers must be 1, 2 or 3 (got {n})")
+    idx = sorted(set(groups[n_cat]) | set(groups[n_fac]))
     # The indices above are a hardcoded read of agent._MLP's Sequential. If that
     # stack is ever reordered, this would silently fine-tune the wrong layers
     # and every adaptation number would be quietly wrong — so assert the shape
@@ -116,10 +142,10 @@ def _freeze_for_adaptation(agent, n_layers: int) -> list:
                 f"agent._MLP layout changed: net[{i}] is {type(got).__name__}, "
                 f"expected {expect[i].__name__} — --adapt-unfreeze indices are stale")
     trainable = []
-    for module in (agent.unmerge_actor, agent.factor_actor):
+    for module, n in ((agent.unmerge_actor, n_cat), (agent.factor_actor, n_fac)):
         for prm in module.parameters():
             prm.requires_grad = False
-        for i in idx:
+        for i in groups[n]:
             for prm in module.net[i].parameters():
                 prm.requires_grad = True
                 trainable.append(prm)
@@ -127,7 +153,7 @@ def _freeze_for_adaptation(agent, n_layers: int) -> list:
 
 
 def adapt_in_place(agent, loops: list, data: dict, kind: str, lr: float,
-                   steps: int, unfreeze: int = 1):
+                   steps: int, unfreeze=(1, 1)):
     """
     Fine-tune `agent` on the measured cells of `loops`. Mutates and returns it.
 
@@ -153,7 +179,7 @@ def adapt_in_place(agent, loops: list, data: dict, kind: str, lr: float,
     from agent import (FACTOR_VALUES, _IDX_TRIP_COUNT, _IDX_TRIP_COUNT_KNOWN,
                        build_factor_mask)
 
-    trainable = _freeze_for_adaptation(agent, unfreeze)
+    trainable = _freeze_for_adaptation(agent, *unfreeze)
     if not loops or not trainable:
         return agent
 
@@ -435,11 +461,13 @@ def run(data: dict, args) -> None:
                  args.min_fill, dropped)
     benches = sorted({l["benchmark_name"] for l in loops})
     folds = grouped_kfold(benches, args.folds, args.fold_seed)
+    for _l in fingerprint(loops, args):
+        log.info(_l)
 
     log.info("Few-shot adaptation | %d-fold x %d init seed(s) | agent=%s | "
-             "adapt lr=%g steps=%d unfreeze=%d layer(s)/head",
+             "adapt lr=%g steps=%d unfreeze cat=%d factor=%d",
              args.folds, args.seeds, args.agent, args.adapt_lr,
-             args.adapt_steps, args.adapt_unfreeze)
+             args.adapt_steps, args.adapt_unfreeze[0], args.adapt_unfreeze[1])
     log.info("Adaptation loops per benchmark: >=3 loops -> 2, 2 -> 1, 1 -> 0 "
              "(control)")
     log.info("Each row below is one fold x seed: %d epochs of training, then "
@@ -459,6 +487,11 @@ def run(data: dict, args) -> None:
     zero: dict = {}
     adapt: dict = {}
     ctrl: dict = {}
+    # The eval LOOPS per seed, kept alongside the picks so the oracle and
+    # always-no-op can be scored on exactly the same set. The adapt/eval split
+    # is drawn from a per-(fold,seed) rng, so these differ by seed and a single
+    # global ceiling would be the wrong denominator.
+    ev: dict = {}
     rows, leaks = [], 0
 
     def _sc(picks):
@@ -501,6 +534,7 @@ def run(data: dict, args) -> None:
                 if adapt_l:
                     zero.setdefault(seed, []).extend(zs)
                     adapt.setdefault(seed, []).extend(ad)
+                    ev.setdefault(seed, []).extend(eval_l)
                     fz.extend(zs); fa.extend(ad)
                 else:
                     ctrl.setdefault(seed, []).extend(zs)
@@ -554,10 +588,20 @@ def run(data: dict, args) -> None:
     log.info("=" * 92)
     log.info(table_header())
     deltas_acc, deltas_mean = [], []
+    heads = []
     for seed in sorted(zero):
         z, a = _sc(zero[seed]), _sc(adapt[seed])
+        # The ceiling ON THESE LOOPS. Without it, "+0.0129" is unreadable: it
+        # could be 5% of what was available or 60%. Scored on ev[seed], the same
+        # loops the two policy rows above are scored on.
+        o = _sc(oracle_picks(ev[seed], data["tables"], args.deadzone))
+        n = _sc(always_noop_picks(ev[seed]))
         log.info(table_row(f"seed {seed} zero-shot", z))
         log.info(table_row(f"seed {seed} + {args.adapt_steps} adapt steps", a))
+        log.info(table_row(f"seed {seed} oracle (ceiling)", o))
+        log.info(table_row(f"seed {seed} always-no-op", n))
+        log.info("")
+        heads.append((o["mean_realized"], a["mean_realized"], z["mean_realized"]))
         deltas_acc.append(a["accuracy"] - z["accuracy"])
         deltas_mean.append(a["mean_realized"] - z["mean_realized"])
     if ctrl:
@@ -573,6 +617,20 @@ def run(data: dict, args) -> None:
         else:
             log.info("    %-22s %s +- %s   [%s, %s]", label, f(st.mean(vals)),
                      f(st.stdev(vals)).lstrip("+"), f(min(vals)), f(max(vals)))
+
+    om = st.mean([h[0] for h in heads])
+    am = st.mean([h[1] for h in heads])
+    zm2 = st.mean([h[2] for h in heads])
+    log.info("  HEADROOM ON THE EVALUATION LOOPS")
+    log.info("    oracle mean %+.4f   always-no-op +0.0000   zero-shot %+.4f"
+             "   few-shot %+.4f", om, zm2, am)
+    log.info("    few-shot recovers %.0f%% of the gap from no-op to the ceiling"
+             "   (%.0f%% zero-shot)",
+             100 * am / om if om else float("nan"),
+             100 * zm2 / om if om else float("nan"))
+    log.info("    Read the mean against the ORACLE on these loops, not against "
+             "the\n    population's +0.0989 — this subset excludes every "
+             "single-loop benchmark.")
 
     log.info("\n  DELTA FROM ADAPTATION, across %d init seed(s)", len(deltas_acc))
     _spread(deltas_acc, "accuracy", True)
@@ -600,13 +658,14 @@ def main() -> None:
     g.add_argument("--adapt-lr", type=float, default=1e-3)
     g.add_argument("--adapt-steps", type=int, default=50,
                    help="Gradient steps per target application.")
-    g.add_argument("--adapt-unfreeze", type=int, default=1, choices=(1, 2, 3),
-                   help="How many trailing parameterised layers of EACH actor "
-                        "head to fine-tune. 1 = the output projection only "
-                        "(~845 params, the previous behaviour); 2 also unfreezes "
-                        "Linear(128,64) and its LayerNorm (~17.6k); 3 is the "
-                        "whole stack (~42k). Two adaptation loops give ~20-40 "
-                        "examples, so higher values can memorise them outright.")
+    g.add_argument("--adapt-unfreeze", type=_unfreeze_spec, default=(1, 1),
+                   help="Trailing parameterised layers to fine-tune, as N or "
+                        "CAT,FACTOR. 1 = output projection only; 2 adds "
+                        "Linear(128,64)+LayerNorm; 3 is the whole stack. "
+                        "'1,2' gives the factor head more capacity than the "
+                        "category head, which is where the evidence says the "
+                        "bottleneck is. Two adaptation loops give ~20-40 "
+                        "examples, so loosening both invites memorisation.")
     g.add_argument("--min-fill", type=float, default=0.0,
                    help="Drop loops whose measured-cell fraction is below this. "
                         "An adaptation loop with partial coverage teaches the "
