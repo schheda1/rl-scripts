@@ -386,6 +386,41 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
 # Modes
 # ---------------------------------------------------------------------------
 
+# Header and data rows share ONE template. Two hand-aligned format strings drift
+# apart the moment a column changes width; with a single template they cannot.
+# Field widths must fit the HEADER LABEL as well as the data — a label wider
+# than its field silently pushes every later column right, which is how the
+# first hand-aligned version drifted.
+_FOLD_ROW = ("  {fold:>5} {seed:>5} | {loops:>5} /{bench:>4} |"
+             "{a_noop:>8}{a_fit:>8}{a_val:>8}{a_test:>8} |"
+             "{m_fit:>9}{m_val:>9}{m_test:>9} | {cap:>7} | {ep:>4}")
+
+
+def fold_header() -> list:
+    """The two header lines and the rule, measured off _FOLD_ROW itself."""
+    h2 = _FOLD_ROW.format(fold="fold", seed="seed", loops="loops", bench="bn",
+                          a_noop="no-op", a_fit="fit", a_val="val",
+                          a_test="TEST", m_fit="fit", m_val="val",
+                          m_test="TEST", cap="capt", ep="ep")
+    blank = _FOLD_ROW.format(fold="", seed="", loops="", bench="", a_noop="",
+                             a_fit="", a_val="", a_test="", m_fit="", m_val="",
+                             m_test="", cap="", ep="")
+    # Centre the group labels over their own column blocks, located by the
+    # separators in the blank row.
+    bars = [i for i, c in enumerate(blank) if c == "|"]
+    h1 = list(" " * len(blank))
+    for label, lo, hi in (("held out", bars[0], bars[1]),
+                          ("ACCURACY", bars[1], bars[2]),
+                          ("MEAN REALIZED", bars[2], bars[3]),
+                          ("test", bars[3], bars[4]),
+                          ("best", bars[4], len(blank))):
+        start = lo + 1 + max(0, (hi - lo - 1 - len(label)) // 2)
+        h1[start:start + len(label)] = label
+    for b in bars:
+        h1[b] = "|"
+    return ["".join(h1), h2, "  " + "-" * (len(h2) - 2)]
+
+
 def run_cv(data: dict, args) -> None:
     loops = labelled_loops(data)
     benches = sorted({l["benchmark_name"] for l in loops})
@@ -399,11 +434,8 @@ def run_cv(data: dict, args) -> None:
              args.agent, args.epochs, args.patience, args.buffer_size,
              args.batch_size, args.missing)
     log.info("")
-    log.info("             held out |  ACCURACY (test) | test  |"
-             "   MEAN REALIZED           | best")
-    log.info("  fold  seed | loops/bn |   no-op   policy | captr |"
-             "     fit      val     TEST | ep")
-    log.info("  " + "-" * 82)
+    for _h in fold_header():
+        log.info(_h)
 
     union: dict = {}          # seed -> list of held-out picks
     fold_rows, per_fold_scores = [], {s: [] for s in range(args.seeds)}
@@ -443,13 +475,17 @@ def run_cv(data: dict, args) -> None:
             # IS the margin over doing nothing; only its ACCURACY varies by fold.
             base = score_decisions(always_noop_picks(test_l), data["tables"],
                                    data["labels"], args.deadzone, _mr(args))
-            log.info("  %d/%d  %4d | %3d /%3d | %6.1f%% %8.1f%% |%5.0f%% |"
-                     " %+8.4f %+8.4f %+8.4f | %4d",
-                     k + 1, args.folds, seed, len(test_l), len(te_b),
-                     100 * base["accuracy"], 100 * m["accuracy"],
-                     100 * m["capture"], m_fit["mean_realized"],
-                     m_val["mean_realized"], m["mean_realized"],
-                     info["best_epoch"])
+            def _p(x):
+                return f"{100 * x:.1f}%"
+            log.info(_FOLD_ROW.format(
+                fold=f"{k + 1}/{args.folds}", seed=str(seed),
+                loops=str(len(test_l)), bench=str(len(te_b)),
+                a_noop=_p(base["accuracy"]), a_fit=_p(m_fit["accuracy"]),
+                a_val=_p(m_val["accuracy"]), a_test=_p(m["accuracy"]),
+                m_fit=f"{m_fit['mean_realized']:+.4f}",
+                m_val=f"{m_val['mean_realized']:+.4f}",
+                m_test=f"{m['mean_realized']:+.4f}",
+                cap=_p(m["capture"]), ep=str(info["best_epoch"])))
             fold_rows.append({
                 "fold": k + 1, "seed": seed, "n_test_benchmarks": len(te_b),
                 "n_test_loops": len(test_l), "n_fit_loops": len(fit_l),
@@ -470,7 +506,7 @@ def run_cv(data: dict, args) -> None:
                 "n_missing_cells_in_training": info["n_missing_cells"],
             })
 
-    log.info("  " + "-" * 82)
+    log.info(fold_header()[2])
     log.info("  always-no-op scores exactly +0.0000 on every split, so each "
              "MEAN REALIZED figure\n  IS its own margin over doing nothing: "
              "negative means the policy made that split\n  SLOWER. Negative "
@@ -479,7 +515,17 @@ def run_cv(data: dict, args) -> None:
     log.info("  fit = the training loops, not held out — it separates 'cannot "
              "fit' from 'cannot\n  transfer'. val chose the epoch, so it is "
              "optimistically biased. Only TEST is an\n  estimate of deployment "
-             "quality.")
+             "quality. 'no-op' is always-no-op's accuracy on the TEST\n  loops "
+             "of this fold — the trivial classifier the policy has to beat.")
+
+    _acc = [(r["accuracy_fit"], r["accuracy_val"], r["accuracy"],
+             r["noop_accuracy_test"]) for r in fold_rows]
+    log.info("\n  accuracy over %d runs: fit %.1f%% -> val %.1f%% -> test "
+             "%.1f%%   (always-no-op on test: %.1f%%)",
+             len(_acc), 100 * st.mean([a for a, _, _, _ in _acc]),
+             100 * st.mean([b for _, b, _, _ in _acc]),
+             100 * st.mean([c for _, _, c, _ in _acc]),
+             100 * st.mean([d for _, _, _, d in _acc]))
 
     _gap = [(r["mean_realized_fit"], r["mean_realized"]) for r in fold_rows]
     log.info("\n  generalization gap over %d runs: fit %+.4f -> test %+.4f "
