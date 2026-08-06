@@ -64,7 +64,7 @@ from offline_data import (always_noop_picks, fingerprint,        # noqa: E402
                           load_run, loops_for, oracle_of_gated, oracle_picks,
                           score_decisions, table_header, table_row)
 from offline_train import (_mr, build_parser, greedy_picks,      # noqa: E402
-                           train_agent, warn_ignored_flags)
+                           train_agent, warn_ignored_flags, write_csv)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 log = logging.getLogger("adapt")
@@ -646,9 +646,7 @@ def run(data: dict, args) -> None:
              "as if it were a peer.")
 
     if args.csv_out:
-        with open(args.csv_out, "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
-            w.writeheader(); w.writerows(rows)
+        write_csv(args.csv_out, rows)
         log.info("\n  per-benchmark: %s", args.csv_out)
 
 

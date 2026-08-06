@@ -475,11 +475,16 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
     observed: dict = {}
     n_supcon = n_labelled = 0
     n_missing = n_updates = 0
+    # Same keys as the per-epoch rows below. This row is built BEFORE the loop,
+    # so any field added to the loop's history entry must be mirrored here or
+    # the curve CSV takes its fieldnames from an incomplete first row and dies
+    # at the very end of the run.
     history = [{"epoch": 0, "hold_mean_realized": float("nan"),
                 "hold_accuracy": float("nan"),
                 "fit_accuracy": pre["accuracy"],
                 "fit_mean_realized": pre["mean_realized"],
-                "actor_loss": float("nan")}]
+                "actor_loss": float("nan"),
+                "supcon_loss": float("nan"), "supcon_labelled": 0}]
     buf = RolloutBuffer(capacity=args.buffer_size)
 
     for epoch in range(1, args.epochs + 1):
@@ -822,15 +827,10 @@ def run_cv(data: dict, args) -> None:
                 "data heterogeneity")
 
     if args.csv_out:
-        with open(args.csv_out, "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=list(fold_rows[0].keys()))
-            w.writeheader()
-            w.writerows(fold_rows)
+        write_csv(args.csv_out, fold_rows)
         log.info("\n  per-fold: %s", args.csv_out)
     if args.curve_out and curve_rows:
-        with open(args.curve_out, "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=list(curve_rows[0].keys()))
-            w.writeheader(); w.writerows(curve_rows)
+        write_csv(args.curve_out, curve_rows)
         log.info("  learning curves: %s", args.curve_out)
 
 
@@ -939,6 +939,26 @@ def run_score_ckpt(data: dict, args) -> None:
 
 
 # ---------------------------------------------------------------------------
+
+def write_csv(path, rows: list) -> None:
+    """
+    Write rows whose schemas may differ, using the UNION of keys.
+
+    csv.DictWriter takes its fieldnames from whatever you hand it, so deriving
+    them from rows[0] means one row with an extra key raises at write time —
+    after the whole run has completed. Union + restval="" degrades to a blank
+    cell instead of throwing away the work.
+    """
+    fields = []
+    for r in rows:
+        for k in r:
+            if k not in fields:
+                fields.append(k)
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields, restval="")
+        w.writeheader()
+        w.writerows(rows)
+
 
 def warn_ignored_flags(args) -> None:
     """
