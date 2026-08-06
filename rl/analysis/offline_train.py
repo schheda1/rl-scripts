@@ -451,12 +451,6 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
     # NOT applied to the category agents: build_warm_start_entries emits
     # action1 as an unmerge BIT, which a 3-way head would read as a category
     # index — silently training "unmerge=1" as "unroll_only".
-    if kind.startswith("category") and args.bandit_warm_epochs > 0:
-        log.warning("    --bandit-warm-epochs %d IGNORED for %s: "
-                    "build_warm_start_entries encodes action1 as an unmerge BIT, "
-                    "which a 3-way head reads as a category index. Setting it to "
-                    "0 changes nothing — this agent never warm-starts.",
-                    args.bandit_warm_epochs, kind)
     if kind == "bandit" and args.bandit_warm_epochs > 0:
         from train import build_warm_start_entries
         ws, n_ws_cells, _ = build_warm_start_entries(
@@ -946,6 +940,24 @@ def run_score_ckpt(data: dict, args) -> None:
 
 # ---------------------------------------------------------------------------
 
+def warn_ignored_flags(args) -> None:
+    """
+    Flags the chosen agent silently ignores. Emitted ONCE at startup: these are
+    properties of the invocation, and printing them per fold buries the results
+    table. A silently-ignored flag costs a whole run to discover.
+    """
+    if args.agent.startswith("category") and args.bandit_warm_epochs > 0:
+        log.warning("NOTE --bandit-warm-epochs %d is IGNORED for %s: "
+                    "build_warm_start_entries encodes\n     action1 as an "
+                    "unmerge BIT, which a 3-way head reads as a category index. "
+                    "This agent\n     never warm-starts, so setting it to 0 "
+                    "changes nothing.", args.bandit_warm_epochs, args.agent)
+    if args.supcon_coef > 0 and args.supcon_warmup >= args.epochs:
+        log.warning("NOTE --supcon-warmup %d >= --epochs %d: the contrastive "
+                    "term can never\n     activate.", args.supcon_warmup,
+                    args.epochs)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """
     Separate from main() so the tests can construct args from the REAL defaults
@@ -1118,6 +1130,7 @@ def main() -> None:
         p.error("--supcon-coef needs a 3-way head: use --agent category or "
                 "category-bandit")
 
+    warn_ignored_flags(args)
     data = load_run(args.run_dir, args.deadzone, args.labels)
     log.info("Loaded %d loops / %d benchmarks | %d labelled | "
              "normalizer %s | post_features %d",

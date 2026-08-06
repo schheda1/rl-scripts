@@ -64,7 +64,7 @@ from offline_data import (always_noop_picks, fingerprint,        # noqa: E402
                           load_run, loops_for, oracle_of_gated, oracle_picks,
                           score_decisions, table_header, table_row)
 from offline_train import (_mr, build_parser, greedy_picks,      # noqa: E402
-                           train_agent)
+                           train_agent, warn_ignored_flags)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 log = logging.getLogger("adapt")
@@ -673,6 +673,7 @@ def main() -> None:
                         "mean fill is 0.992, so 0.95 costs almost nothing.")
     args = p.parse_args()
     torch.set_num_threads(max(1, args.threads))
+    warn_ignored_flags(args)
 
     data = load_run(args.run_dir, args.deadzone, args.labels)
     # adapt_in_place needs the deadzone to gate its cloning target; carrying it
