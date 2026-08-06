@@ -71,8 +71,63 @@ log = logging.getLogger("adapt")
 logging.getLogger("agent").setLevel(logging.WARNING)
 
 
+def _freeze_for_adaptation(agent, n_layers: int) -> list:
+    """
+    Make the last `n_layers` PARAMETERISED layers of each actor head trainable,
+    freeze everything else, and return the trainable parameters.
+
+    Local rather than adapt_eval.freeze_trunk, which hardcodes net[6]; that file
+    stays untouched. The _MLP stack is
+        0 Linear(93,128)  1 LayerNorm  2 ReLU
+        3 Linear(128,64)  4 LayerNorm  5 ReLU
+        6 Linear(64,out)
+    so "layers" counts LINEARs and each one's LayerNorm travels with it. ReLU
+    holds no parameters.
+
+        n=1  -> net[6]                     780 / 845 params across both heads
+        n=2  -> net[3], net[4], net[6]     ~17.6k
+        n=3  -> the whole stack            ~42k
+    (the first pair is 2-head / 3-way: the first head has 2 vs 3 outputs.)
+
+    The tradeoff is sharp and worth watching: two adaptation loops supply
+    roughly 20-40 examples. At n=1 that is ~800 parameters and the fit is
+    constrained; at n=2 it is ~17.6k and the head can memorise the adaptation
+    loops outright. If accuracy on the ADAPTATION loops climbs while the
+    evaluation loops do not follow, that is what happened.
+
+    The critic is never trained — it is absent from every adaptation loss and
+    from the optimizer. (Its requires_grad is left alone rather than cleared;
+    nothing reads it, and saying "frozen" would overstate what is done.)
+    """
+    groups = {1: [6], 2: [3, 4, 6], 3: [0, 1, 3, 4, 6]}
+    if n_layers not in groups:
+        raise ValueError(f"--adapt-unfreeze must be 1, 2 or 3 (got {n_layers})")
+    idx = groups[n_layers]
+    # The indices above are a hardcoded read of agent._MLP's Sequential. If that
+    # stack is ever reordered, this would silently fine-tune the wrong layers
+    # and every adaptation number would be quietly wrong — so assert the shape
+    # rather than trust it.
+    expect = {0: torch.nn.Linear, 1: torch.nn.LayerNorm, 3: torch.nn.Linear,
+              4: torch.nn.LayerNorm, 6: torch.nn.Linear}
+    for i in idx:
+        got = agent.unmerge_actor.net[i]
+        if not isinstance(got, expect[i]):
+            raise AssertionError(
+                f"agent._MLP layout changed: net[{i}] is {type(got).__name__}, "
+                f"expected {expect[i].__name__} — --adapt-unfreeze indices are stale")
+    trainable = []
+    for module in (agent.unmerge_actor, agent.factor_actor):
+        for prm in module.parameters():
+            prm.requires_grad = False
+        for i in idx:
+            for prm in module.net[i].parameters():
+                prm.requires_grad = True
+                trainable.append(prm)
+    return trainable
+
+
 def adapt_in_place(agent, loops: list, data: dict, kind: str, lr: float,
-                   steps: int):
+                   steps: int, unfreeze: int = 1):
     """
     Fine-tune `agent` on the measured cells of `loops`. Mutates and returns it.
 
@@ -84,10 +139,9 @@ def adapt_in_place(agent, loops: list, data: dict, kind: str, lr: float,
     declining is correct, and then scored against labels that say so.
     (adapt_eval.py is left untouched; it is the pinned checkpoint-driven study.)
 
-    freeze_trunk is imported rather than reimplemented: two adaptation loops
-    give ~20-40 examples against ~60k parameters, so only each actor head's
-    final projection is trainable. The critic stays frozen — it plays no part in
-    greedy selection.
+    How much of each head is tunable is set by --adapt-unfreeze; see
+    _freeze_for_adaptation. The critic stays frozen throughout — it plays no
+    part in greedy selection.
 
     The signal matches each agent's native one, so both consume the same cells:
       ppo    — cross-entropy toward the gated oracle-best action.
@@ -95,16 +149,16 @@ def adapt_in_place(agent, loops: list, data: dict, kind: str, lr: float,
     """
     import torch.nn.functional as F
 
-    from adapt_eval import freeze_trunk, make_state
+    from adapt_eval import make_state
     from agent import (FACTOR_VALUES, _IDX_TRIP_COUNT, _IDX_TRIP_COUNT_KNOWN,
                        build_factor_mask)
 
-    trainable = freeze_trunk(agent)
+    trainable = _freeze_for_adaptation(agent, unfreeze)
     if not loops or not trainable:
         return agent
 
-    # freeze_trunk works unchanged on the 3-way head: CategoryActor is an _MLP
-    # with the same net structure, so net[6] is still its final projection.
+    # The unfreeze works unchanged on the 3-way head: CategoryActor is an _MLP
+    # with the same net stack, so the same layer indices apply.
     fit = {"ppo": _fit_ppo, "bandit": _fit_bandit,
            "category": _fit_category_ppo,
            "category-bandit": _fit_category_bandit}.get(kind)
@@ -383,8 +437,9 @@ def run(data: dict, args) -> None:
     folds = grouped_kfold(benches, args.folds, args.fold_seed)
 
     log.info("Few-shot adaptation | %d-fold x %d init seed(s) | agent=%s | "
-             "adapt lr=%g steps=%d", args.folds, args.seeds, args.agent,
-             args.adapt_lr, args.adapt_steps)
+             "adapt lr=%g steps=%d unfreeze=%d layer(s)/head",
+             args.folds, args.seeds, args.agent, args.adapt_lr,
+             args.adapt_steps, args.adapt_unfreeze)
     log.info("Adaptation loops per benchmark: >=3 loops -> 2, 2 -> 1, 1 -> 0 "
              "(control)")
     log.info("Each row below is one fold x seed: %d epochs of training, then "
@@ -439,7 +494,8 @@ def run(data: dict, args) -> None:
                 tuned = copy.deepcopy(base_agent)
                 if adapt_l:
                     adapt_in_place(tuned, adapt_l, data, args.agent,
-                                   args.adapt_lr, args.adapt_steps)
+                                   args.adapt_lr, args.adapt_steps,
+                                   args.adapt_unfreeze)
                 ad = greedy_picks(tuned, eval_l, data["normalizer"],
                                   data["postf"])
                 if adapt_l:
@@ -542,7 +598,15 @@ def main() -> None:
     p = build_parser()
     g = p.add_argument_group("few-shot adaptation")
     g.add_argument("--adapt-lr", type=float, default=1e-3)
-    g.add_argument("--adapt-steps", type=int, default=50)
+    g.add_argument("--adapt-steps", type=int, default=50,
+                   help="Gradient steps per target application.")
+    g.add_argument("--adapt-unfreeze", type=int, default=1, choices=(1, 2, 3),
+                   help="How many trailing parameterised layers of EACH actor "
+                        "head to fine-tune. 1 = the output projection only "
+                        "(~845 params, the previous behaviour); 2 also unfreezes "
+                        "Linear(128,64) and its LayerNorm (~17.6k); 3 is the "
+                        "whole stack (~42k). Two adaptation loops give ~20-40 "
+                        "examples, so higher values can memorise them outright.")
     g.add_argument("--min-fill", type=float, default=0.0,
                    help="Drop loops whose measured-cell fraction is below this. "
                         "An adaptation loop with partial coverage teaches the "
