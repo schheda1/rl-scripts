@@ -112,54 +112,114 @@ def adapt_in_place(agent, loops: list, data: dict, kind: str, lr: float,
     if not loops or not trainable:
         return agent
 
-    samples = []
+    if kind == "ppo":
+        _fit_ppo(agent, loops, data, trainable, lr, steps)
+    else:
+        _fit_bandit(agent, loops, data, trainable, lr, steps)
+    return agent
+
+
+def _fit_ppo(agent, loops, data, trainable, lr, steps) -> None:
+    """Behaviour cloning toward the DEADZONE-GATED oracle action."""
+    import torch.nn.functional as F
+
+    from adapt_eval import make_state
+    from agent import (FACTOR_VALUES, _IDX_TRIP_COUNT, _IDX_TRIP_COUNT_KNOWN,
+                       build_factor_mask)
+
+    rows = []
     for l in loops:
         table = data["tables"][(l["benchmark_name"], l["loop_idx"])]
         raw = l["pre_features_raw"]
-        known = raw[_IDX_TRIP_COUNT_KNOWN] > 0.5
-        trip = int(raw[_IDX_TRIP_COUNT])
-        if kind == "ppo":
-            (u, f), _ = oracle_of_gated(table, data["deadzone"])
-            s1, s2 = make_state(l, data["normalizer"], data["postf"], u)
-            samples.append((s1, s2, u, FACTOR_VALUES.index(f), 0.0, known, trip))
-        else:
-            for (u, f), r in table.items():
-                if f not in FACTOR_VALUES:
-                    continue
-                s1, s2 = make_state(l, data["normalizer"], data["postf"], u)
-                samples.append((s1, s2, u, FACTOR_VALUES.index(f), r, known,
-                                trip))
-    if not samples:
-        return agent
-
-    s1b = torch.stack([s[0] for s in samples])
-    s2b = torch.stack([s[1] for s in samples])
-    a1b = torch.tensor([s[2] for s in samples], dtype=torch.long)
-    a2b = torch.tensor([s[3] for s in samples], dtype=torch.long)
-    rb = torch.tensor([s[4] for s in samples], dtype=torch.float32)
-    # The same trip-count mask the policy uses at selection time. Without it,
-    # cloning spends probability mass on factors that are masked out at
-    # evaluation.
-    m2b = torch.stack([build_factor_mask(s[5], s[6]) for s in samples])
+        (u, f), _ = oracle_of_gated(table, data["deadzone"])
+        s1, s2 = make_state(l, data["normalizer"], data["postf"], u)
+        rows.append((s1, s2, u, FACTOR_VALUES.index(f),
+                     raw[_IDX_TRIP_COUNT_KNOWN] > 0.5, int(raw[_IDX_TRIP_COUNT])))
+    if not rows:
+        return
+    s1b = torch.stack([x[0] for x in rows])
+    s2b = torch.stack([x[1] for x in rows])
+    a1b = torch.tensor([x[2] for x in rows], dtype=torch.long)
+    a2b = torch.tensor([x[3] for x in rows], dtype=torch.long)
+    # The same trip-count mask the policy uses at selection time; without it,
+    # cloning spends probability mass on factors masked out at evaluation.
+    m2b = torch.stack([build_factor_mask(x[4], x[5]) for x in rows])
 
     opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0)
     for _ in range(steps):
         opt.zero_grad()
-        if kind == "ppo":
-            f_logits = agent.factor_actor.forward(s2b).masked_fill(
-                ~m2b, float("-inf"))
-            loss = (F.cross_entropy(agent.unmerge_actor.forward(s1b), a1b)
-                    + F.cross_entropy(f_logits, a2b))
-        else:
-            q1 = agent.unmerge_actor.forward(s1b).gather(
-                1, a1b.unsqueeze(1)).squeeze(1)
-            q2 = agent.factor_actor.forward(s2b).gather(
-                1, a2b.unsqueeze(1)).squeeze(1)
-            loss = F.mse_loss(q1, rb) + F.mse_loss(q2, rb)
+        f_logits = agent.factor_actor.forward(s2b).masked_fill(
+            ~m2b, float("-inf"))
+        loss = (F.cross_entropy(agent.unmerge_actor.forward(s1b), a1b)
+                + F.cross_entropy(f_logits, a2b))
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, 0.5)
         opt.step()
-    return agent
+
+
+def _fit_bandit(agent, loops, data, trainable, lr, steps) -> None:
+    """
+    Q-regression, with Q1's target the MAX over the branch's valid cells.
+
+    adapt_eval.adapt regresses Q1 against every cell on the branch, so it
+    converges to the branch MEAN. agent.BanditAgent.ppo_update deliberately does
+    the opposite — a max backup — and its docstring calls the mean target "the
+    extinction bug, in the target itself": the unmerge branch has the fattest
+    negative tail, so its mean sinks below unroll and argmax_u stops choosing
+    it. Fine-tuning toward the mean pulls the policy at exactly the target
+    training was fixed to avoid.
+
+    Training must BOOTSTRAP that max through Q2, having no table online.
+    Adaptation has one — the adaptation loops were measured, which is the whole
+    premise — so the max is taken over MEASURED rewards: same quantity, without
+    the max-of-noise inflation.
+    """
+    import torch.nn.functional as F
+
+    from adapt_eval import make_state
+    from agent import (FACTOR_VALUES, _IDX_TRIP_COUNT, _IDX_TRIP_COUNT_KNOWN,
+                       build_factor_mask)
+
+    q1_rows, q2_rows = [], []
+    for l in loops:
+        table = data["tables"][(l["benchmark_name"], l["loop_idx"])]
+        raw = l["pre_features_raw"]
+        valid = build_factor_mask(raw[_IDX_TRIP_COUNT_KNOWN] > 0.5,
+                                  int(raw[_IDX_TRIP_COUNT]))
+        for u in (0, 1):
+            cells = [(f, r) for (uu, f), r in table.items()
+                     if uu == u and f in FACTOR_VALUES
+                     and bool(valid[FACTOR_VALUES.index(f)])]
+            if not cells:
+                continue
+            s1, s2 = make_state(l, data["normalizer"], data["postf"], u)
+            # u=0 includes the free no-op at 0.0 (build_tables injects it), so
+            # Q1(s,0) is "decline or unroll, whichever is better" — exactly what
+            # argmax_u compares at inference.
+            q1_rows.append((s1, u, max(r for _, r in cells)))
+            for f, r in cells:
+                q2_rows.append((s2, FACTOR_VALUES.index(f), r))
+    if not q1_rows:
+        return
+
+    s1b = torch.stack([x[0] for x in q1_rows])
+    u_b = torch.tensor([x[1] for x in q1_rows], dtype=torch.long)
+    t1b = torch.tensor([x[2] for x in q1_rows], dtype=torch.float32)
+    s2b = torch.stack([x[0] for x in q2_rows])
+    f_b = torch.tensor([x[1] for x in q2_rows], dtype=torch.long)
+    r_b = torch.tensor([x[2] for x in q2_rows], dtype=torch.float32)
+
+    opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0)
+    for _ in range(steps):
+        opt.zero_grad()
+        q1 = agent.unmerge_actor.forward(s1b).gather(
+            1, u_b.unsqueeze(1)).squeeze(1)
+        q2 = agent.factor_actor.forward(s2b).gather(
+            1, f_b.unsqueeze(1)).squeeze(1)
+        loss = F.mse_loss(q1, t1b) + F.mse_loss(q2, r_b)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable, 0.5)
+        opt.step()
 
 
 def split_for_adaptation(loops: list, rng: random.Random) -> tuple:
@@ -191,7 +251,16 @@ def run(data: dict, args) -> None:
              "adapt lr=%g steps=%d", args.folds, args.seeds, args.agent,
              args.adapt_lr, args.adapt_steps)
     log.info("Adaptation loops per benchmark: >=3 loops -> 2, 2 -> 1, 1 -> 0 "
-             "(control)\n")
+             "(control)")
+    log.info("Each row below is one fold x seed: %d epochs of training, then "
+             "one\nadaptation per held-out benchmark. The first row takes as "
+             "long as a full\ntraining run — nothing is wrong if it sits there "
+             "for a while.\n", args.epochs)
+    log.info("               benchmarks | eval  |   ZERO-SHOT   |   FEW-SHOT    "
+             "|   DELTA")
+    log.info("  fold  seed |  k>0   k=0 | loops |    acc    mean |    acc    "
+             "mean |    acc    mean")
+    log.info("  " + "-" * 84)
 
     # Keyed BY SEED, not pooled. Pooling all seeds reports 3x the population as
     # one number with no spread — and the whole quantity of interest here is a
@@ -215,6 +284,7 @@ def run(data: dict, args) -> None:
                                         seed)
             rng = random.Random(seed * 1000 + k)
             first = None
+            fz, fa, n_k0 = [], [], 0
             for bench in te_b:
                 b_loops = [l for l in loops if l["benchmark_name"] == bench]
                 if not b_loops:
@@ -237,12 +307,13 @@ def run(data: dict, args) -> None:
                                    args.adapt_lr, args.adapt_steps)
                 ad = greedy_picks(tuned, eval_l, data["normalizer"],
                                   data["postf"])
-                bucket = ctrl if not adapt_l else None
-                if bucket is None:
+                if adapt_l:
                     zero.setdefault(seed, []).extend(zs)
                     adapt.setdefault(seed, []).extend(ad)
+                    fz.extend(zs); fa.extend(ad)
                 else:
                     ctrl.setdefault(seed, []).extend(zs)
+                    n_k0 += 1
                 mz, ma = _sc(zs), _sc(ad)
                 rows.append({
                     "fold": k + 1, "seed": seed, "benchmark": bench,
@@ -265,6 +336,23 @@ def run(data: dict, args) -> None:
                                      data["postf"])
                 if again != first[1]:
                     leaks += 1
+
+            # Progress, one line per fold x seed. Without it the whole run is
+            # silent from the banner to the final table — 15 trainings and ~400
+            # adaptations with no indication it is alive.
+            if fz:
+                mz, ma = _sc(fz), _sc(fa)
+                log.info("  %2d/%-2d %4d | %4d  %4d | %5d | %6.1f%% %+7.4f | "
+                         "%6.1f%% %+7.4f | %+5.1fpp %+7.4f",
+                         k + 1, args.folds, seed, len(te_b) - n_k0, n_k0,
+                         len(fz), 100 * mz["accuracy"], mz["mean_realized"],
+                         100 * ma["accuracy"], ma["mean_realized"],
+                         100 * (ma["accuracy"] - mz["accuracy"]),
+                         ma["mean_realized"] - mz["mean_realized"])
+            else:
+                log.info("  %2d/%-2d %4d | %4d  %4d | %5d | (no benchmark in "
+                         "this fold had >1 loop)",
+                         k + 1, args.folds, seed, 0, n_k0, 0)
 
     if not rows:
         log.error("no benchmark produced an evaluation set — nothing to report")
