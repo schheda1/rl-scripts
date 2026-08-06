@@ -155,7 +155,7 @@ def load_run(run_dir: Path, deadzone: float,
         kept[NOOP] = 0.0
         tables[key] = kept
 
-    labels, oracle_mismatch = {}, []
+    labels, oracle_mismatch, fill = {}, [], {}
     with open(lab_f) as fh:
         for r in csv.DictReader(fh):
             if r.get("labelable") != "1":
@@ -171,6 +171,13 @@ def load_run(run_dir: Path, deadzone: float,
                     f"of {CATEGORIES}. Labels and scorer disagree — regenerate "
                     f"loop_labels.csv against this cache.")
             labels[key] = cat
+            # Measured-cell fraction, straight from label_loops. Consumers that
+            # fine-tune on a loop need it: a half-measured loop is a half-known
+            # table, not a known one.
+            try:
+                fill[key] = float(r.get("fill", 1.0) or 1.0)
+            except ValueError:
+                fill[key] = 1.0
             # Cross-check: label_loops' stored oracle and the oracle derived
             # from this cache must agree, or accuracy would describe one table
             # while performance describes another — invisible in the output.
@@ -228,6 +235,7 @@ def load_run(run_dir: Path, deadzone: float,
         "normalizer": normalizer,
         "postf": postf,
         "labels": labels,
+        "fill": fill,
         "benchmarks": sorted(present),
         # UNSORTED, as stored. train.split_benchmarks shuffles whatever list it
         # is handed, so the permutation — and therefore which benchmarks landed
