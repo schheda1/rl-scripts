@@ -617,6 +617,9 @@ TRAINING_ARGS = (
     "compile_failure_penalty", "score_missing", "threads",
     "supcon_coef", "supcon_warmup", "supcon_min_cells", "supcon_batch",
     "supcon_steps", "supcon_temp",
+    # PPO-only, but they reach make_agent for every kind, so a run that varies
+    # them is a different training run and must fingerprint differently.
+    "clip_eps", "value_loss_coef",
 )
 
 

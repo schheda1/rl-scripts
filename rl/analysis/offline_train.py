@@ -398,19 +398,29 @@ def supcon_step(agent, fit_loops: list, observed: dict, data: dict,
 
     pool = [l for l in fit_loops
             if (l["benchmark_name"], l["loop_idx"]) in labels]
-    if len(pool) > args.supcon_batch:
-        pool = random.sample(pool, args.supcon_batch)
-    states = torch.stack([
+    # States for the WHOLE labelled pool, built once per epoch; each step then
+    # indexes a fresh random subset. Sampling one batch and stepping on it
+    # --supcon-steps times is not N steps of contrastive learning, it is N
+    # steps of memorising one batch — and with a fixed batch the negatives
+    # never change, which is the one thing the loss depends on.
+    all_states = torch.stack([
         make_state(l, data["normalizer"], data["postf"], 0)[0] for l in pool])
-    y = torch.tensor([labels[(l["benchmark_name"], l["loop_idx"])] for l in pool],
-                     dtype=torch.long)
+    all_y = torch.tensor(
+        [labels[(l["benchmark_name"], l["loop_idx"])] for l in pool],
+        dtype=torch.long)
+    n_pool = all_states.size(0)
+    bs = min(args.supcon_batch, n_pool)
 
     total, taken = 0.0, 0
     for _ in range(max(1, args.supcon_steps)):
+        idx = torch.randperm(n_pool)[:bs]
+        states, y = all_states[idx], all_y[idx]
         loss = args.supcon_coef * supcon_loss(embed(agent, states), y,
                                               args.supcon_temp)
         if float(loss) == 0.0:
-            break
+            # This draw had no same-label pair. Resample rather than abandon
+            # the epoch's remaining steps.
+            continue
         agent.optimizer.zero_grad()
         loss.backward()
         if agent.max_grad_norm > 0:
@@ -469,6 +479,7 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                           _mr(args))
 
     best_score, best_snap, best_epoch, since = -float("inf"), _snapshot(agent), 0, 0
+    bestfit_score, bestfit_snap, bestfit_epoch = -float("inf"), _snapshot(agent), 0
     # Cells the agent has paid for, accumulated across epochs. Grows toward the
     # full table as epsilon decays, so the contrastive labels sharpen over the
     # run without ever reading a cell that was not sampled.
@@ -530,6 +541,12 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                         # separating (loss falling) and is coverage growing
                         # enough for the labels to mean anything (n_labelled).
                         "supcon_loss": sc_loss, "supcon_labelled": n_lab})
+        # Best-FIT checkpoint, tracked independently of val. Selecting on ~17
+        # held-out benchmarks is a noisy criterion, and there is no reason to
+        # assume the epoch that maximises a small val slice is the one that
+        # transfers — that is an assumption worth measuring, not inheriting.
+        if fit_a == fit_a and fit_a > bestfit_score:
+            bestfit_score, bestfit_snap, bestfit_epoch = fit_a, _snapshot(agent), epoch
         if m["mean_realized"] > best_score:
             best_score, best_snap, best_epoch, since = (
                 m["mean_realized"], _snapshot(agent), epoch, 0)
@@ -552,6 +569,22 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                           data["tables"], data["labels"], args.deadzone,
                           _mr(args))
 
+    # Three checkpoints, three selection rules. The agent is returned on the
+    # val rule (unchanged default); the others are handed back so the caller can
+    # score the SAME held-out loops under each and see whether the rule matters.
+    final_snap = _snapshot(agent)
+    if bestfit_epoch == 0:
+        # fit is only sampled every --curve-every epochs, so with 0 (sampling
+        # off) or a --patience break before the first sample, bestfit_snap is
+        # still the RANDOM INITIALISATION. Scoring the test fold with that and
+        # labelling it "bestfit" would be a plausible-looking wrong number.
+        bestfit_snap = final_snap
+        log.warning("    fit was never sampled (--curve-every %d, ran %d "
+                    "epochs) — 'bestfit' falls back to the final epoch",
+                    args.curve_every, len(history) - 1)
+    snapshots = {"val": best_snap, "final": final_snap,
+                 "bestfit": bestfit_snap}
+
     _restore(agent, best_snap)
     for mod in (agent.unmerge_actor, agent.factor_actor, agent.critic):
         mod.eval()
@@ -563,6 +596,7 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                    "n_updates": n_updates, "n_warm_start_cells": n_ws_cells,
                    "n_supcon_steps": n_supcon,
                    "n_supcon_labelled": n_labelled,
+                   "snapshots": snapshots, "bestfit_epoch": bestfit_epoch,
                    "n_observed_cells": sum(len(v) for v in observed.values()),
                    "final_fit_accuracy": fin["accuracy"],
                    "final_fit_mean_realized": fin["mean_realized"],
@@ -638,8 +672,16 @@ def run_cv(data: dict, args) -> None:
         for s in range(args.seeds):
             seed = args.base_seed + s
             agent, info = train_agent(args.agent, fit_l, hold_l, data, args, seed)
+            # Score the SAME held-out loops under each selection rule, then
+            # put the agent back on the val rule so everything below is
+            # unchanged. Restoring is cheap; retraining would not be.
+            for rule, snap in info["snapshots"].items():
+                _restore(agent, snap)
+                union.setdefault((rule, seed), []).extend(
+                    greedy_picks(agent, test_l, data["normalizer"],
+                                 data["postf"]))
+            _restore(agent, info["snapshots"]["val"])
             picks = greedy_picks(agent, test_l, data["normalizer"], data["postf"])
-            union.setdefault(seed, []).extend(picks)
             def _sc(ls):
                 return score_decisions(
                     greedy_picks(agent, ls, data["normalizer"], data["postf"]),
@@ -702,6 +744,7 @@ def run_cv(data: dict, args) -> None:
                 "regression_rate": round(m["regression_rate"], 6),
                 "loops_unmeasured": m["loops_unmeasured"],
                 "n_missing_cells_in_training": info["n_missing_cells"],
+                "bestfit_epoch": info["bestfit_epoch"],
                 "n_supcon_steps": info["n_supcon_steps"],
                 "n_supcon_labelled": info["n_supcon_labelled"],
                 # fit at the LAST epoch vs at the val-SELECTED epoch. If the
@@ -772,9 +815,13 @@ def run_cv(data: dict, args) -> None:
              st.mean([a - b for a, b in _gap]))
 
     # --- the headline: one table, policy and baselines side by side ---
-    pooled = [score_decisions(picks, data["tables"], data["labels"],
-                              args.deadzone, _mr(args))
-              for _, picks in sorted(union.items())]
+    rules = ("val", "final", "bestfit")
+    pooled_by_rule = {
+        r: [score_decisions(union[(r, s_)], data["tables"], data["labels"],
+                            args.deadzone, _mr(args))
+            for s_ in sorted({k[1] for k in union})]
+        for r in rules}
+    pooled = pooled_by_rule["val"]
 
     log.info("\n" + "=" * 92)
     log.info("  RESULTS — %d loops, every one predicted by a model that never "
@@ -783,8 +830,18 @@ def run_cv(data: dict, args) -> None:
              "population)", args.folds)
     log.info("=" * 92)
     log.info(table_header())
-    for s, m in zip(sorted(union), pooled):
-        log.info(table_row(f"{args.agent} (init seed {s})", m))
+    seeds_sorted = sorted({k[1] for k in union})
+    _RULE_NOTE = {"val": "epoch chosen on the val slice (~17 benchmarks)",
+                  "final": "last epoch, no selection at all",
+                  "bestfit": "epoch with the highest FIT accuracy"}
+    for r in rules:
+        for s_, m in zip(seeds_sorted, pooled_by_rule[r]):
+            log.info(table_row(f"{r:<8} seed {s_}", m))
+        log.info(_RULE)
+    log.info("  Selection rules, same training runs and same held-out loops:")
+    for r in rules:
+        log.info("    %-8s %s", r, _RULE_NOTE[r])
+    log.info("  If they agree, selection is not what limits transfer.")
     _baseline_rows(data, loops, folds, args)
 
     log.info("\n  Read across the row, not down the column: 'capture' means "
@@ -793,10 +850,10 @@ def run_cv(data: dict, args) -> None:
              "'mean' is the one number")
     log.info("  directly comparable to doing nothing, which scores exactly "
              "+0.0000.")
-    log.info("\n  confusion, %s init seed %d (rows = truth, cols = predicted)",
-             args.agent, sorted(union)[0])
+    log.info("\n  confusion, %s VAL-selected, init seed %d "
+             "(rows = truth, cols = predicted)", args.agent, seeds_sorted[0])
     log.info(format_confusion(pooled[0]))
-    for s_, mm in zip(sorted(union), pooled):
+    for s_, mm in zip(seeds_sorted, pooled):
         acc2, n2 = pairwise_accuracy(mm)
         log.info("  seed %d | no-op vs unmerge+unroll alone: %.1f%% of %d loops"
                  "  (chance = 50%%)", s_, 100 * acc2, n2)
@@ -818,6 +875,9 @@ def run_cv(data: dict, args) -> None:
 
     _spread([m["mean_realized"] for m in pooled], "across init seeds (pooled)",
             "optimization stability")
+    for r in ("final", "bestfit"):
+        _spread([m["mean_realized"] for m in pooled_by_rule[r]],
+                f"  same, {r}-selected", "")
     fold_means = [st.mean([m["mean_realized"] for m in per_fold_scores[s]])
                   for s in range(args.seeds)]
     _spread(fold_means, "fold means, per init seed", "")

@@ -670,6 +670,14 @@ def main() -> None:
                         "model from a table that does not exist; the population "
                         "mean fill is 0.992, so 0.95 costs almost nothing.")
     args = p.parse_args()
+    if args.supcon_coef > 0 and not args.agent.startswith("category"):
+        # Same guard offline_train applies: the term clusters THREE categories
+        # on the first head's embedding, and the 2-head agents' first head is a
+        # binary unmerge bit. Missing here, --supcon-coef would silently do
+        # nothing to the base agent and the adaptation numbers would be
+        # attributed to a pretraining that never happened.
+        p.error("--supcon-coef needs a 3-way head: use --agent category or "
+                "category-bandit")
     torch.set_num_threads(max(1, args.threads))
     warn_ignored_flags(args)
 
