@@ -507,9 +507,17 @@ def run_cv(data: dict, args) -> None:
             log.info(_FOLD_ROW.format(
                 fold=f"{k + 1}/{args.folds}", seed=str(seed),
                 loops=str(len(test_l)), bench=str(len(te_b)),
-                a_noop=_p(base["accuracy"]), a_fit=_p(m_fit["accuracy"]),
+                # The displayed fit is the FINAL epoch's, not the val-selected
+                # epoch's: fit answers "can this model represent the mapping at
+                # all", which is a property of the training run. Scoring it on
+                # whichever checkpoint happened to maximise val answers a
+                # different question. The selected-epoch fit is kept in the CSV
+                # (accuracy_fit / mean_realized_fit) because the fit-vs-test GAP
+                # must compare one and the same model.
+                a_noop=_p(base["accuracy"]),
+                a_fit=_p(info["final_fit_accuracy"]),
                 a_val=_p(m_val["accuracy"]), a_test=_p(m["accuracy"]),
-                m_fit=f"{m_fit['mean_realized']:+.4f}",
+                m_fit=f"{info['final_fit_mean_realized']:+.4f}",
                 m_val=f"{m_val['mean_realized']:+.4f}",
                 m_test=f"{m['mean_realized']:+.4f}",
                 cap=_p(m["capture"]), ep=str(info["best_epoch"])))
@@ -548,11 +556,12 @@ def run_cv(data: dict, args) -> None:
              "negative means the policy made that split\n  SLOWER. Negative "
              "capture means the picks on loops that HAD headroom netted a\n"
              "  slowdown, not merely a failure to capture the upside.")
-    log.info("  fit = the training loops, not held out — it separates 'cannot "
-             "fit' from 'cannot\n  transfer'. val chose the epoch, so it is "
-             "optimistically biased. Only TEST is an\n  estimate of deployment "
-             "quality. 'no-op' is always-no-op's accuracy on the TEST\n  loops "
-             "of this fold — the trivial classifier the policy has to beat.")
+    log.info("  fit = the training loops at the FINAL epoch — it answers "
+             "'can the model represent\n  the mapping at all', so it must not "
+             "be gated on a val-selected checkpoint.\n  val chose the epoch, so "
+             "val is optimistically biased. Only TEST estimates\n  deployment "
+             "quality. 'no-op' is always-no-op's accuracy on this fold's TEST "
+             "loops\n  — the trivial classifier the policy has to beat.")
 
     _ff = [(r["accuracy_fit"], r["accuracy_fit_final"]) for r in fold_rows]
     log.info("\n  fit accuracy at the SELECTED epoch %.1f%% vs at the FINAL "
@@ -562,7 +571,7 @@ def run_cv(data: dict, args) -> None:
              100 * st.mean([a for a, _ in _ff]),
              100 * st.mean([b for _, b in _ff]))
 
-    _acc = [(r["accuracy_fit"], r["accuracy_val"], r["accuracy"],
+    _acc = [(r["accuracy_fit_final"], r["accuracy_val"], r["accuracy"],
              r["noop_accuracy_test"]) for r in fold_rows]
     log.info("\n  accuracy over %d runs: fit %.1f%% -> val %.1f%% -> test "
              "%.1f%%   (always-no-op on test: %.1f%%)",
@@ -571,9 +580,12 @@ def run_cv(data: dict, args) -> None:
              100 * st.mean([c for _, _, c, _ in _acc]),
              100 * st.mean([d for _, _, _, d in _acc]))
 
+    # The GAP uses the selected-epoch fit deliberately — it is the same model
+    # that produced the test number, so the difference is generalization. The
+    # table's fit column is the final epoch, which answers capacity instead.
     _gap = [(r["mean_realized_fit"], r["mean_realized"]) for r in fold_rows]
-    log.info("\n  generalization gap over %d runs: fit %+.4f -> test %+.4f "
-             " (gap %+.4f)",
+    log.info("\n  generalization gap over %d runs (same checkpoint both sides): "
+             "fit %+.4f -> test %+.4f  (gap %+.4f)",
              len(_gap), st.mean([a for a, _ in _gap]),
              st.mean([b for _, b in _gap]),
              st.mean([a - b for a, b in _gap]))
