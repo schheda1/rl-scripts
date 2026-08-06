@@ -395,8 +395,15 @@ def run_cv(data: dict, args) -> None:
              "%d init seed(s) — %d runs total",
              args.folds, len(benches), len(loops), args.seeds,
              args.folds * args.seeds)
-    log.info("agent=%s  epochs<=%d  patience=%d  missing=%s\n",
-             args.agent, args.epochs, args.patience, args.missing)
+    log.info("agent=%s  epochs=%d  patience=%d  buffer=%d  batch=%d  missing=%s",
+             args.agent, args.epochs, args.patience, args.buffer_size,
+             args.batch_size, args.missing)
+    log.info("")
+    log.info("             held out |  ACCURACY (test) | test  |"
+             "   MEAN REALIZED           | best")
+    log.info("  fold  seed | loops/bn |   no-op   policy | captr |"
+             "     fit      val     TEST | ep")
+    log.info("  " + "-" * 82)
 
     union: dict = {}          # seed -> list of held-out picks
     fold_rows, per_fold_scores = [], {s: [] for s in range(args.seeds)}
@@ -411,26 +418,75 @@ def run_cv(data: dict, args) -> None:
             agent, info = train_agent(args.agent, fit_l, hold_l, data, args, seed)
             picks = greedy_picks(agent, test_l, data["normalizer"], data["postf"])
             union.setdefault(seed, []).extend(picks)
+            def _sc(ls):
+                return score_decisions(
+                    greedy_picks(agent, ls, data["normalizer"], data["postf"]),
+                    data["tables"], data["labels"], args.deadzone, _mr(args))
+
             m = score_decisions(picks, data["tables"], data["labels"],
                                 args.deadzone, _mr(args))
             per_fold_scores[s].append(m)
-            log.info("  fold %d/%d seed %d | test %3d loops / %2d benches | "
-                     "acc %5.1f%%  capture %6.1f%%  mean %+.4f  "
-                     "(best epoch %d)",
+            # FIT and VAL are reported alongside TEST because they answer
+            # different questions, and the remedy differs by which one fails:
+            #   fit  — the loops it trained on, deliberately NOT held out. If
+            #          the policy scores badly even here it cannot represent
+            #          the mapping at all: a capacity/optimisation problem,
+            #          not a generalization one.
+            #   val  — the slice held out of training to pick the epoch. The
+            #          reported checkpoint was SELECTED on it, so it is
+            #          optimistically biased and is not a deployment estimate.
+            #   test — the fold, unseen in every capacity. The only estimate.
+            # fit >> test is a generalization gap; fit ~ test ~ bad is underfitting.
+            m_fit, m_val = _sc(fit_l), _sc(hold_l)
+            # always-no-op on THIS fold's test loops. Its mean is 0.0000 by
+            # construction on every split, so each MEAN REALIZED column already
+            # IS the margin over doing nothing; only its ACCURACY varies by fold.
+            base = score_decisions(always_noop_picks(test_l), data["tables"],
+                                   data["labels"], args.deadzone, _mr(args))
+            log.info("  %d/%d  %4d | %3d /%3d | %6.1f%% %8.1f%% |%5.0f%% |"
+                     " %+8.4f %+8.4f %+8.4f | %4d",
                      k + 1, args.folds, seed, len(test_l), len(te_b),
-                     100 * m["accuracy"], 100 * m["capture"],
-                     m["mean_realized"], info["best_epoch"])
+                     100 * base["accuracy"], 100 * m["accuracy"],
+                     100 * m["capture"], m_fit["mean_realized"],
+                     m_val["mean_realized"], m["mean_realized"],
+                     info["best_epoch"])
             fold_rows.append({
                 "fold": k + 1, "seed": seed, "n_test_benchmarks": len(te_b),
-                "n_test_loops": len(test_l), "best_epoch": info["best_epoch"],
-                "epochs_run": info["epochs_run"],
+                "n_test_loops": len(test_l), "n_fit_loops": len(fit_l),
+                "n_val_loops": len(hold_l), "best_epoch": info["best_epoch"],
+                "epochs_run": info["epochs_run"], "n_updates": info["n_updates"],
+                "n_warm_start_cells": info["n_warm_start_cells"],
                 "accuracy": round(m["accuracy"], 6),
+                "accuracy_fit": round(m_fit["accuracy"], 6),
+                "accuracy_val": round(m_val["accuracy"], 6),
                 "capture": round(m["capture"], 6),
+                "capture_fit": round(m_fit["capture"], 6),
+                "mean_realized_fit": round(m_fit["mean_realized"], 6),
+                "mean_realized_val": round(m_val["mean_realized"], 6),
                 "mean_realized": round(m["mean_realized"], 6),
+                "noop_accuracy_test": round(base["accuracy"], 6),
                 "regression_rate": round(m["regression_rate"], 6),
                 "loops_unmeasured": m["loops_unmeasured"],
                 "n_missing_cells_in_training": info["n_missing_cells"],
             })
+
+    log.info("  " + "-" * 82)
+    log.info("  always-no-op scores exactly +0.0000 on every split, so each "
+             "MEAN REALIZED figure\n  IS its own margin over doing nothing: "
+             "negative means the policy made that split\n  SLOWER. Negative "
+             "capture means the picks on loops that HAD headroom netted a\n"
+             "  slowdown, not merely a failure to capture the upside.")
+    log.info("  fit = the training loops, not held out — it separates 'cannot "
+             "fit' from 'cannot\n  transfer'. val chose the epoch, so it is "
+             "optimistically biased. Only TEST is an\n  estimate of deployment "
+             "quality.")
+
+    _gap = [(r["mean_realized_fit"], r["mean_realized"]) for r in fold_rows]
+    log.info("\n  generalization gap over %d runs: fit %+.4f -> test %+.4f "
+             " (gap %+.4f)",
+             len(_gap), st.mean([a for a, _ in _gap]),
+             st.mean([b for _, b in _gap]),
+             st.mean([a - b for a, b in _gap]))
 
     # --- the headline: one table, policy and baselines side by side ---
     pooled = [score_decisions(picks, data["tables"], data["labels"],
