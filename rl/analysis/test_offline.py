@@ -434,7 +434,7 @@ def test_training_smoke(d: dict):
     """
     args = _args(epochs=EPOCHS_SMOKE, patience=0, batch_size=4)
     loops = od.labelled_loops(d)
-    for kind in ("ppo", "bandit"):
+    for kind in ("ppo", "bandit", "category", "category-bandit"):
         agent, info = ot.train_agent(kind, loops, loops, d, args, seed=0)
         assert info["epochs_run"] == 2, (kind, info)
         assert info["best_epoch"] >= 1, (kind, info)
@@ -627,6 +627,116 @@ def test_bandit_warm_start_uses_fit_loops_only(d: dict):
     print("  warm start (fit-only)      ok  (%d cells, not %d)" % (n_fit, n_all))
 
 
+def test_category_round_trip():
+    """
+    to_pipeline_action must be inverted EXACTLY by offline_data.category_of over
+    every action each category can emit.
+
+    This is what lets the 3-way head reuse the entire scorer unchanged: picks
+    are handed to score_decisions in pipeline (unmerge, factor) space, and the
+    confusion matrix re-derives the category from them. If the two ever
+    disagree, the head optimises one thing and the report measures another.
+    """
+    from category_agent import (NOOP, UNMERGE_UNROLL, UNROLL_ONLY,
+                                to_pipeline_action)
+    from agent import FACTOR_VALUES
+    emittable = {
+        NOOP: [1],
+        UNROLL_ONLY: [f for f in FACTOR_VALUES if f > 1],
+        UNMERGE_UNROLL: list(FACTOR_VALUES),
+    }
+    names = {NOOP: "noop", UNROLL_ONLY: "unroll_only",
+             UNMERGE_UNROLL: "unmerge_unroll"}
+    for cat, factors in emittable.items():
+        for f in factors:
+            a = to_pipeline_action(cat, f)
+            assert od.category_of(a) == names[cat], (names[cat], f, a)
+    # And the reason factor 1 is masked out of unroll_only: it would collide.
+    assert od.category_of(to_pipeline_action(UNROLL_ONLY, 1)) == "noop"
+    print("  category round-trip        ok")
+
+
+def test_category_masks():
+    """
+    A known trip count of 1 leaves unroll_only no legal factor, so the CATEGORY
+    mask must exclude it. Otherwise selection softmaxes over all -inf (NaN), or
+    hits the assertion in select_factor.
+    """
+    from category_agent import (UNMERGE_UNROLL, UNROLL_ONLY, category_mask,
+                                category_factor_mask)
+    from agent import FACTOR_VALUES
+    m = category_mask(True, 1)
+    assert m.tolist() == [True, False, True], m.tolist()
+    assert category_mask(True, 4).tolist() == [True, True, True]
+    assert category_mask(False, 0).tolist() == [True, True, True]
+    # unroll_only never offers factor 1; unmerge_unroll always does.
+    i1 = FACTOR_VALUES.index(1)
+    assert not category_factor_mask(UNROLL_ONLY, False, 0)[i1]
+    assert category_factor_mask(UNMERGE_UNROLL, False, 0)[i1]
+    # trip count still binds on top of the category rule.
+    assert not category_factor_mask(UNROLL_ONLY, True, 3)[FACTOR_VALUES.index(5)]
+    print("  category masks             ok")
+
+
+def test_category_entry_carries_category(d: dict):
+    """
+    REGRESSION: RolloutEntry.action1 must be the CATEGORY index for a 3-way
+    head, not the unmerge bit. Storing the bit makes index 2 unreachable by
+    gather(), so unmerge_unroll is silently untrainable while every metric
+    still prints. The entry must also carry mask1, or PPO's ratio compares
+    distributions with different supports.
+    """
+    from category_agent import CategoryRolloutEntry, UNMERGE_UNROLL
+    args = _args(epochs=1, patience=0)
+    agent = ot.make_agent("category-bandit", args)
+    seen_cats, seen_unmerge = set(), set()
+    for _ in range(80):
+        for l in od.labelled_loops(d):
+            e, _ = ot.rollout_one(agent, l, d, args)
+            if e is None:
+                continue
+            assert isinstance(e, CategoryRolloutEntry), type(e)
+            assert e.mask1 is not None, "category mask not carried"
+            assert 0 <= e.action1 <= 2, e.action1
+            seen_cats.add(e.action1)
+            if e.action1 == UNMERGE_UNROLL:
+                seen_unmerge.add(e.action1)
+        if len(seen_cats) == 3:
+            break
+    assert seen_cats == {0, 1, 2}, f"not all categories reachable: {seen_cats}"
+    assert seen_unmerge, "unmerge_unroll never selected — index 2 unreachable"
+    print(f"  category entry encoding    ok  (all 3 categories reached)")
+
+
+def test_category_noop_target_is_exact_zero(d: dict):
+    """
+    The design change: Q1(s, noop) regresses to exactly 0.0 rather than
+    bootstrapping through max_f Q2. Verified behaviourally — train only on
+    no-op entries and Q1(noop) must approach 0 even though the factor head is
+    random, which could not happen under a bootstrapped target.
+    """
+    import torch
+    from agent import RolloutBuffer
+    from category_agent import NOOP, CategoryRolloutEntry
+    args = _args(epochs=1, patience=0)
+    agent = ot.make_agent("category-bandit", args)
+    loop = od.labelled_loops(d)[0]
+    s1 = torch.tensor(loop["pre_features_raw"], dtype=torch.float32)
+    buf = RolloutBuffer(capacity=64)
+    for _ in range(32):
+        buf.append(CategoryRolloutEntry(
+            state1=s1, state2=s1, action1=NOOP, action2=0,
+            log_prob1=torch.zeros(()), log_prob2=torch.zeros(()),
+            reward=0.0, mask2=None, factor_active=False,
+            mask1=torch.ones(3, dtype=torch.bool)))
+    for _ in range(60):
+        agent.ppo_update(buf)
+    with torch.no_grad():
+        q_noop = agent.unmerge_actor.forward(s1.unsqueeze(0))[0, NOOP].item()
+    assert abs(q_noop) < 0.05, f"Q1(noop) = {q_noop:+.4f}, expected ~0"
+    print(f"  no-op Q target exact       ok  (Q1(noop) = {q_noop:+.4f})")
+
+
 def test_determinism(d: dict):
     """
     Same seed -> identical agent. This is the property the whole sweep rests on:
@@ -639,7 +749,7 @@ def test_determinism(d: dict):
     """
     args = _args(epochs=EPOCHS_SMOKE, patience=0, batch_size=4)
     loops = od.labelled_loops(d)
-    for kind in ("ppo", "bandit"):
+    for kind in ("ppo", "bandit", "category", "category-bandit"):
         a1, i1 = ot.train_agent(kind, loops, loops, d, args, seed=7)
         a2, i2 = ot.train_agent(kind, loops, loops, d, args, seed=7)
         p1 = ot.greedy_picks(a1, loops, d["normalizer"], d["postf"])
@@ -691,6 +801,10 @@ def main() -> None:
         test_regression_and_deadzone(d)
         test_marginal_is_deployable(d)
         test_marginal_ranking_and_table(d)
+        test_category_round_trip()
+        test_category_masks()
+        test_category_entry_carries_category(d)
+        test_category_noop_target_is_exact_zero(d)
         test_agent_construction_matches_pipeline()
         test_schedules_match_pipeline()
         test_update_cadence(d)

@@ -112,24 +112,55 @@ def act(agent, loop: dict, normalizer, postf: dict, greedy: bool):
     features, never from the z-scored tensor. Identical for Agent and
     BanditAgent: both expose the same two selectors.
 
-    Returns (unmerge, factor, factor_idx, log_p1, log_p2, mask, s1, s2).
+    Returns (unmerge, factor, factor_idx, log_p1, log_p2, mask, s1, s2,
+             head_action, head_mask).
+
+    head_action is the index into the FIRST head — the unmerge bit for the
+    2-head agents, the CATEGORY for the 3-way one. RolloutEntry.action1 must be
+    that, not the unmerge bit: a 3-way head gathered at {0,1} could never be
+    trained on unmerge_unroll at all.
+
+    head_mask is the collection-time mask over that first head (None for the
+    2-head agents, whose unmerge bit is never masked). PPO's ratio is only a
+    ratio if the update reapplies it.
     """
     from adapt_eval import make_state
     from agent import FACTOR_VALUES
 
     raw = loop["pre_features_raw"]
+    known, trip = raw[IDX_TRIP_KNOWN] > 0.5, int(raw[IDX_TRIP_COUNT])
+
+    if hasattr(agent, "select_category"):
+        # 3-way head (analysis/category_agent.py). action1 is a CATEGORY index,
+        # not an unmerge bit — RolloutEntry stores it unchanged, which is what
+        # lets this share every other piece of the runner.
+        from category_agent import NOOP, to_pipeline_action
+        s1, _ = make_state(loop, normalizer, postf, 0)
+        cat, log_p1, cat_mask = agent.select_category(
+            s1, trip_known=known, trip_count=trip, greedy=greedy)
+        if cat == NOOP:
+            # No factor decision exists. s2 = s1 and the factor index is a
+            # placeholder the update masks out via factor_active=False.
+            return 0, 1, 0, log_p1, torch.zeros(()), None, s1, s1, cat, cat_mask
+        unmerge, _ = to_pipeline_action(cat, 1)
+        _, s2 = make_state(loop, normalizer, postf, unmerge)
+        f_idx, log_p2, mask = agent.select_factor(
+            s2, cat, trip_known=known, trip_count=trip, greedy=greedy)
+        u, f = to_pipeline_action(cat, FACTOR_VALUES[f_idx])
+        return u, f, f_idx, log_p1, log_p2, mask, s1, s2, cat, cat_mask
+
     s1, _ = make_state(loop, normalizer, postf, 0)
     unmerge, log_p1 = agent.select_unmerge(s1, greedy=greedy)
     _, s2 = make_state(loop, normalizer, postf, unmerge)
     factor_idx, log_p2, mask = agent.select_factor(
         s2,
-        trip_known=raw[IDX_TRIP_KNOWN] > 0.5,
-        trip_count=int(raw[IDX_TRIP_COUNT]),
+        trip_known=known,
+        trip_count=trip,
         loop_idx=loop["loop_idx"],
         greedy=greedy,
     )
     return (int(unmerge), FACTOR_VALUES[factor_idx], factor_idx,
-            log_p1, log_p2, mask, s1, s2)
+            log_p1, log_p2, mask, s1, s2, int(unmerge), None)
 
 
 def reward_for(tables: dict, loop: dict, unmerge: int, factor: int):
@@ -185,7 +216,7 @@ def rollout_one(agent, loop: dict, data: dict, args):
     """
     from agent import RolloutEntry
 
-    u, f, f_idx, lp1, lp2, mask, s1, s2 = act(
+    u, f, f_idx, lp1, lp2, mask, s1, s2, head, head_mask = act(
         agent, loop, data["normalizer"], data["postf"], greedy=False)
     r, factor_active, measured = reward_for(data["tables"], loop, u, f)
     if not measured:
@@ -197,14 +228,24 @@ def rollout_one(agent, loop: dict, data: dict, args):
     # Rebuilt here in the same shapes and dtypes: a log-prob still carrying
     # grad_fn would make the PPO ratio differentiable through the
     # COLLECTION-time policy, which is meant to be a fixed reference.
-    return RolloutEntry(
+    fields = dict(
         state1=s1.detach(), state2=s2.detach(),
-        action1=int(u), action2=int(f_idx),
+        action1=int(head), action2=int(f_idx),
         log_prob1=torch.tensor(float(lp1), dtype=torch.float32),
         log_prob2=torch.tensor(float(lp2), dtype=torch.float32),
         reward=float(r),
-        mask2=mask.detach().to(torch.bool),
-        factor_active=factor_active), (not measured)
+        # None on the 3-way head's no-op branch: there is no factor decision.
+        # RolloutEntry treats None as all-valid, which is what the update wants
+        # for an entry whose factor head is masked out anyway.
+        mask2=None if mask is None else mask.detach().to(torch.bool),
+        factor_active=factor_active)
+    if head_mask is None:
+        return RolloutEntry(**fields), (not measured)
+    # 3-way head: carry the category mask so ppo_update can reapply it.
+    from category_agent import CategoryRolloutEntry
+    return (CategoryRolloutEntry(mask1=head_mask.detach().to(torch.bool),
+                                 **fields),
+            (not measured))
 
 
 def run_epoch(agent, order: list, buf, data: dict, args) -> tuple:
@@ -280,6 +321,16 @@ def make_agent(kind: str, args):
         max_grad_norm=args.max_grad_norm,
         device=DEVICE,
     )
+    if kind in ("category", "category-bandit"):
+        from category_agent import CategoryAgent, CategoryBanditAgent
+        common["q_pessimism"] = args.q_pessimism
+        if kind == "category-bandit":
+            return CategoryBanditAgent(epsilon=args.bandit_epsilon,
+                                       logit_cap=args.logit_cap, **common)
+        return CategoryAgent(logit_cap=args.logit_cap,
+                             entropy_coef_category=args.entropy_coef_unmerge,
+                             **common)
+    common.pop("q_pessimism", None)
     if kind == "bandit":
         return BanditAgent(epsilon=args.bandit_epsilon, **common)
     return Agent(logit_cap=args.logit_cap,
@@ -297,7 +348,7 @@ def _schedules(agent, kind: str, epoch: int, args) -> None:
     """
     n = args.epochs
     frac = (epoch - 1) / (n - 1) if n > 1 else 0.0
-    if kind == "bandit":
+    if kind in ("bandit", "category-bandit"):
         agent.epsilon = (args.bandit_epsilon
                          + frac * (args.bandit_epsilon_final - args.bandit_epsilon))
     else:
@@ -332,6 +383,9 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
     # takes the assignment list, so passing only this fold's training loops is
     # what keeps the held-out fold out of the warm start.
     n_ws_cells = 0
+    # NOT applied to the category agents: build_warm_start_entries emits
+    # action1 as an unmerge BIT, which a 3-way head would read as a category
+    # index — silently training "unmerge=1" as "unroll_only".
     if kind == "bandit" and args.bandit_warm_epochs > 0:
         from train import build_warm_start_entries
         ws, n_ws_cells, _ = build_warm_start_entries(
@@ -339,9 +393,23 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
         if n_ws_cells:
             agent.warm_start(ws, args.bandit_warm_epochs)
 
+    # Fit BEFORE any rollout — for the bandit this is the warm start alone.
+    # Recorded as epoch 0 so the curve shows how much of the final fit was
+    # already there before a single gradient step from experience. Without it,
+    # "fit is 69%" cannot be attributed between the cached-cell regression and
+    # the RL loop, and the two imply completely different next steps.
+    pre = score_decisions(greedy_picks(agent, fit_loops, data["normalizer"],
+                                       data["postf"]),
+                          data["tables"], data["labels"], args.deadzone,
+                          _mr(args))
+
     best_score, best_snap, best_epoch, since = -float("inf"), _snapshot(agent), 0, 0
     n_missing = n_updates = 0
-    history = []
+    history = [{"epoch": 0, "hold_mean_realized": float("nan"),
+                "hold_accuracy": float("nan"),
+                "fit_accuracy": pre["accuracy"],
+                "fit_mean_realized": pre["mean_realized"],
+                "actor_loss": float("nan")}]
     buf = RolloutBuffer(capacity=args.buffer_size)
 
     for epoch in range(1, args.epochs + 1):
@@ -383,7 +451,7 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
             if args.patience and since >= args.patience:
                 break
 
-    if not history:
+    if n_updates == 0:
         log.warning("    WARNING: no training samples in any epoch — the agent "
                     "is UNTRAINED. Check --missing and the table's coverage.")
 
@@ -401,7 +469,10 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
     for mod in (agent.unmerge_actor, agent.factor_actor, agent.critic):
         mod.eval()
     return agent, {"best_epoch": best_epoch, "best_hold_mean_realized": best_score,
-                   "epochs_run": len(history), "n_missing_cells": n_missing,
+                   "epochs_run": len(history) - 1,   # epoch 0 is the pre-rollout probe
+                   "n_missing_cells": n_missing,
+                   "warm_fit_accuracy": pre["accuracy"],
+                   "warm_fit_mean_realized": pre["mean_realized"],
                    "n_updates": n_updates, "n_warm_start_cells": n_ws_cells,
                    "final_fit_accuracy": fin["accuracy"],
                    "final_fit_mean_realized": fin["mean_realized"],
@@ -542,6 +613,11 @@ def run_cv(data: dict, args) -> None:
                 # fit at the LAST epoch vs at the val-SELECTED epoch. If the
                 # first keeps rising with --epochs and the second does not, the
                 # limit is selection, not capacity.
+                # Fit BEFORE any rollout (bandit: the warm start alone).
+                # final minus this is what the RL loop actually contributed.
+                "accuracy_fit_prerollout": round(info["warm_fit_accuracy"], 6),
+                "mean_realized_fit_prerollout": round(
+                    info["warm_fit_mean_realized"], 6),
                 "accuracy_fit_final": round(info["final_fit_accuracy"], 6),
                 "mean_realized_fit_final": round(
                     info["final_fit_mean_realized"], 6),
@@ -562,6 +638,17 @@ def run_cv(data: dict, args) -> None:
              "val is optimistically biased. Only TEST estimates\n  deployment "
              "quality. 'no-op' is always-no-op's accuracy on this fold's TEST "
              "loops\n  — the trivial classifier the policy has to beat.")
+
+    _pr = [(r["accuracy_fit_prerollout"], r["accuracy_fit_final"])
+           for r in fold_rows]
+    log.info("\n  fit accuracy BEFORE any rollout %.1f%% -> after training "
+             "%.1f%%  (RL contributed %+.1fpp).\n  For the bandit the first "
+             "figure is the warm start alone; if the two are close, the\n"
+             "  cached-cell regression is the model and the rollout loop is "
+             "decorative.",
+             100 * st.mean([a for a, _ in _pr]),
+             100 * st.mean([b for _, b in _pr]),
+             100 * st.mean([b - a for a, b in _pr]))
 
     _ff = [(r["accuracy_fit"], r["accuracy_fit_final"]) for r in fold_rows]
     log.info("\n  fit accuracy at the SELECTED epoch %.1f%% vs at the FINAL "
@@ -766,7 +853,18 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("run_dir", type=Path)
     p.add_argument("--mode", choices=["cv", "score-ckpt"], default="cv")
-    p.add_argument("--agent", choices=["ppo", "bandit"], default="bandit")
+    p.add_argument("--agent",
+                   choices=["ppo", "bandit", "category", "category-bandit"],
+                   default="bandit",
+                   help="'category*' use the 3-way head in "
+                        "analysis/category_agent.py — an isolated test of the "
+                        "2-head no-op defect. Nothing in the pipeline changes.")
+    p.add_argument("--q-pessimism", type=float, default=0.0,
+                   help="category-bandit only: subtract this from the "
+                        "BOOTSTRAPPED transform Q-targets. The no-op target is "
+                        "exact (0.0) while the transform arms bootstrap through "
+                        "a max, so >0 offsets the max-of-noise advantage the "
+                        "wider unmerge branch gets.")
     p.add_argument("--deadzone", type=float, required=True,
                    help="REQUIRED: must match the cache (0.005).")
     p.add_argument("--labels", type=Path, default=None,
@@ -878,6 +976,13 @@ def main() -> None:
     args = p.parse_args()
     if args.mode == "score-ckpt" and args.checkpoint is None:
         p.error("--mode score-ckpt requires --checkpoint")
+    if args.mode == "score-ckpt" and args.agent.startswith("category"):
+        # adapt_eval.fresh_agent only knows the 2-head agents; it would build a
+        # 2-way head and fail on a size mismatch inside load(). Refuse clearly
+        # instead. The existing checkpoints are all 2-head anyway.
+        p.error("--mode score-ckpt does not support the 3-way head: "
+                "fresh_agent builds a 2-head agent and the checkpoint's "
+                "category layer is 3-wide. Use --mode cv.")
     torch.set_num_threads(max(1, args.threads))
 
     data = load_run(args.run_dir, args.deadzone, args.labels)
