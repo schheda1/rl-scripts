@@ -99,23 +99,18 @@ def adapt_in_place(agent, loops: list, data: dict, kind: str, lr: float,
     from agent import (FACTOR_VALUES, _IDX_TRIP_COUNT, _IDX_TRIP_COUNT_KNOWN,
                        build_factor_mask)
 
-    if hasattr(agent, "select_category"):
-        # The sample builder below stores the unmerge BIT as the first-head
-        # action. A 3-way head would read that as a category index, training
-        # "unmerge=1" as "unroll_only". Refuse rather than fine-tune on
-        # mislabelled targets.
-        raise NotImplementedError(
-            "few-shot adaptation is not wired for the 3-way category head — "
-            "the cloning target uses the 2-head (unmerge, factor) encoding")
-
     trainable = freeze_trunk(agent)
     if not loops or not trainable:
         return agent
 
-    if kind == "ppo":
-        _fit_ppo(agent, loops, data, trainable, lr, steps)
-    else:
-        _fit_bandit(agent, loops, data, trainable, lr, steps)
+    # freeze_trunk works unchanged on the 3-way head: CategoryActor is an _MLP
+    # with the same net structure, so net[6] is still its final projection.
+    fit = {"ppo": _fit_ppo, "bandit": _fit_bandit,
+           "category": _fit_category_ppo,
+           "category-bandit": _fit_category_bandit}.get(kind)
+    if fit is None:
+        raise ValueError(f"unknown agent kind for adaptation: {kind!r}")
+    fit(agent, loops, data, trainable, lr, steps)
     return agent
 
 
@@ -217,6 +212,146 @@ def _fit_bandit(agent, loops, data, trainable, lr, steps) -> None:
         q2 = agent.factor_actor.forward(s2b).gather(
             1, f_b.unsqueeze(1)).squeeze(1)
         loss = F.mse_loss(q1, t1b) + F.mse_loss(q2, r_b)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable, 0.5)
+        opt.step()
+
+
+def _category_rows(loops, data):
+    """
+    Per-category Q1 targets and the factor cells that back them.
+
+    ((s1, category, target), (s2, factor_idx, reward)) rows.
+
+    The no-op's target is the constant 0.0 — its value is KNOWN, so unlike the
+    two transform arms it is never estimated. That is the whole point of the
+    3-way head: the arm that is correct on 40% of loops stops being inferred
+    from a noisy max.
+
+    The transform arms take the max over their own MEASURED cells, restricted to
+    the category's legal factors — unroll_only excludes factor 1, because (0,1)
+    IS the no-op and letting it in would give the two arms an identical target.
+    """
+    from adapt_eval import make_state
+    from agent import (FACTOR_VALUES, _IDX_TRIP_COUNT, _IDX_TRIP_COUNT_KNOWN)
+    from category_agent import (NOOP, UNMERGE_UNROLL, UNROLL_ONLY,
+                                category_factor_mask)
+
+    q1_rows, q2_rows = [], []
+    for l in loops:
+        table = data["tables"][(l["benchmark_name"], l["loop_idx"])]
+        raw = l["pre_features_raw"]
+        known = raw[_IDX_TRIP_COUNT_KNOWN] > 0.5
+        trip = int(raw[_IDX_TRIP_COUNT])
+        s1, _ = make_state(l, data["normalizer"], data["postf"], 0)
+        # Known exactly; never estimated.
+        q1_rows.append((s1, NOOP, 0.0))
+        for cat, u in ((UNROLL_ONLY, 0), (UNMERGE_UNROLL, 1)):
+            m = category_factor_mask(cat, known, trip)
+            cells = [(f, r) for (uu, f), r in table.items()
+                     if uu == u and f in FACTOR_VALUES
+                     and bool(m[FACTOR_VALUES.index(f)])]
+            if not cells:
+                continue
+            _, s2 = make_state(l, data["normalizer"], data["postf"], u)
+            q1_rows.append((s1, cat, max(r for _, r in cells)))
+            for f, r in cells:
+                q2_rows.append((s2, FACTOR_VALUES.index(f), r))
+    return q1_rows, q2_rows
+
+
+def _fit_category_bandit(agent, loops, data, trainable, lr, steps) -> None:
+    """Q-regression for the 3-way head: Q1 over categories, Q2 over factors."""
+    import torch.nn.functional as F
+
+    q1_rows, q2_rows = _category_rows(loops, data)
+    if not q1_rows:
+        return
+    s1b = torch.stack([x[0] for x in q1_rows])
+    c_b = torch.tensor([x[1] for x in q1_rows], dtype=torch.long)
+    t1b = torch.tensor([x[2] for x in q1_rows], dtype=torch.float32)
+    # q2_rows can be empty (a loop with no measured transform cell) while q1_rows
+    # is not — _category_rows always emits the no-op target, whose value is known
+    # exactly. Returning early here would throw that away, which is the one piece
+    # of supervision the 3-way head exists to provide.
+    if q2_rows:
+        s2b = torch.stack([x[0] for x in q2_rows])
+        f_b = torch.tensor([x[1] for x in q2_rows], dtype=torch.long)
+        r_b = torch.tensor([x[2] for x in q2_rows], dtype=torch.float32)
+    else:
+        s2b = f_b = r_b = None
+
+    opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0)
+    for _ in range(steps):
+        opt.zero_grad()
+        q1 = agent.unmerge_actor.forward(s1b).gather(
+            1, c_b.unsqueeze(1)).squeeze(1)
+        loss = F.mse_loss(q1, t1b)
+        if s2b is not None:
+            q2 = agent.factor_actor.forward(s2b).gather(
+                1, f_b.unsqueeze(1)).squeeze(1)
+            loss = loss + F.mse_loss(q2, r_b)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable, 0.5)
+        opt.step()
+
+
+def _fit_category_ppo(agent, loops, data, trainable, lr, steps) -> None:
+    """
+    Behaviour cloning for the 3-way head.
+
+    The category head is cloned on every loop. The factor head is cloned ONLY on
+    loops whose gated oracle is a transform — a no-op loop has no factor to
+    clone toward, and including it would train the factor head on an action the
+    policy never takes there.
+    """
+    import torch.nn.functional as F
+
+    from adapt_eval import make_state
+    from agent import (FACTOR_VALUES, _IDX_TRIP_COUNT, _IDX_TRIP_COUNT_KNOWN)
+    from category_agent import (NOOP, UNMERGE_UNROLL, UNROLL_ONLY,
+                                category_factor_mask, category_mask)
+    from offline_data import category_of
+
+    _CAT = {"noop": NOOP, "unroll_only": UNROLL_ONLY,
+            "unmerge_unroll": UNMERGE_UNROLL}
+    cat_rows, fac_rows = [], []
+    for l in loops:
+        table = data["tables"][(l["benchmark_name"], l["loop_idx"])]
+        raw = l["pre_features_raw"]
+        known = raw[_IDX_TRIP_COUNT_KNOWN] > 0.5
+        trip = int(raw[_IDX_TRIP_COUNT])
+        (u, f), _ = oracle_of_gated(table, data["deadzone"])
+        cat = _CAT[category_of((u, f))]
+        s1, s2 = make_state(l, data["normalizer"], data["postf"], u)
+        cat_rows.append((s1, cat, category_mask(known, trip)))
+        if cat != NOOP:
+            fac_rows.append((s2, FACTOR_VALUES.index(f),
+                             category_factor_mask(cat, known, trip)))
+    if not cat_rows:
+        return
+    s1b = torch.stack([x[0] for x in cat_rows])
+    c_b = torch.tensor([x[1] for x in cat_rows], dtype=torch.long)
+    m1b = torch.stack([x[2] for x in cat_rows])
+    # Built ONCE. These are loop-invariant; stacking them inside the step loop
+    # rebuilt identical tensors on every one of --adapt-steps iterations.
+    if fac_rows:
+        s2b = torch.stack([x[0] for x in fac_rows])
+        f_b = torch.tensor([x[1] for x in fac_rows], dtype=torch.long)
+        m2b = torch.stack([x[2] for x in fac_rows])
+    else:
+        s2b = f_b = m2b = None
+
+    opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0)
+    for _ in range(steps):
+        opt.zero_grad()
+        c_logits = agent.unmerge_actor.forward(s1b).masked_fill(
+            ~m1b, float("-inf"))
+        loss = F.cross_entropy(c_logits, c_b)
+        if s2b is not None:
+            f_logits = agent.factor_actor.forward(s2b).masked_fill(
+                ~m2b, float("-inf"))
+            loss = loss + F.cross_entropy(f_logits, f_b)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, 0.5)
         opt.step()
@@ -414,11 +549,6 @@ def main() -> None:
                         "model from a table that does not exist; the population "
                         "mean fill is 0.992, so 0.95 costs almost nothing.")
     args = p.parse_args()
-    if args.agent.startswith("category"):
-        # adapt_in_place raises for the 3-way head, but only after a whole fold
-        # of training has already been spent.
-        p.error("few-shot adaptation is not wired for the 3-way category head: "
-                "the cloning target uses the 2-head (unmerge, factor) encoding")
     torch.set_num_threads(max(1, args.threads))
 
     data = load_run(args.run_dir, args.deadzone, args.labels)
