@@ -26,7 +26,6 @@ import json
 import shutil
 import sys
 import tempfile
-from argparse import Namespace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -36,6 +35,7 @@ import offline_data as od                                       # noqa: E402
 import offline_train as ot                                      # noqa: E402
 
 DZ = 0.005
+EPOCHS_SMOKE = 2
 N_FEAT = 93          # 18 structural + 75 IR2Vec; asserted against the real list
 
 
@@ -113,6 +113,27 @@ def build_fixture(tmp: Path) -> Path:
 
 def approx(a, b, tol=1e-9):
     return abs(a - b) < tol
+
+
+def _args(**over):
+    """
+    Training args for the tests, built from offline_train's OWN argparse
+    defaults rather than hand-copied. A hand-written Namespace silently drifts
+    the moment a flag is added — and it would drift toward the old, wrong values
+    the runner used before its defaults were aligned to train.py.
+    """
+    import contextlib, io, sys as _s
+    argv = _s.argv
+    _s.argv = ["offline_train.py", "RUN", "--deadzone", str(DZ)]
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            ns = ot.build_parser().parse_args()
+    finally:
+        _s.argv = argv
+    for k, v in over.items():
+        assert hasattr(ns, k), f"unknown arg {k}"
+        setattr(ns, k, v)
+    return ns
 
 
 # ---------------------------------------------------------------------------
@@ -411,12 +432,7 @@ def test_training_smoke(d: dict):
     grad_fn — the failure appears on the second of ppo_update's K inner passes,
     backpropagating through a freed graph.
     """
-    args = Namespace(
-        deadzone=DZ, epochs=2, patience=0, lr=3e-4, batch_size=4,
-        weight_decay=0.01, max_grad_norm=0.5, entropy_coef=0.01, clip_eps=0.2,
-        logit_cap=0.0, epsilon=0.1, missing="penalty", score_missing="penalty",
-        compile_failure_penalty=-0.161,
-    )
+    args = _args(epochs=EPOCHS_SMOKE, patience=0, batch_size=4)
     loops = od.labelled_loops(d)
     for kind in ("ppo", "bandit"):
         agent, info = ot.train_agent(kind, loops, loops, d, args, seed=0)
@@ -501,6 +517,116 @@ def test_marginal_ranking_and_table(d: dict):
     print("  marginal ranking / table   ok")
 
 
+def test_agent_construction_matches_pipeline():
+    """
+    The constructed agent must carry train.py's hyperparameters, and the
+    PPO-only ones must NOT reach the bandit.
+
+    This is the check that would have caught the whole class of bug found in
+    review: the offline runner was building agents with batch_size 32 and
+    logit_cap 0.0 while the pipeline used 8 and 4.0, so every offline number
+    described a different optimiser than the online ones it was meant to be
+    compared with.
+    """
+    args = _args()
+    ppo = ot.make_agent("ppo", args)
+    ban = ot.make_agent("bandit", args)
+
+    for name, a in (("ppo", ppo), ("bandit", ban)):
+        assert a.K == args.K, (name, a.K)
+        assert a.batch_size == args.batch_size, (name, a.batch_size)
+        assert a.lr == args.lr, (name, a.lr)
+        assert a.weight_decay == args.weight_decay, (name, a.weight_decay)
+        assert a.max_grad_norm == args.max_grad_norm, (name, a.max_grad_norm)
+        assert a.value_loss_coef == args.value_loss_coef, (name,)
+        assert a.clip_eps == args.clip_eps, (name,)
+        assert str(a.device) == "cpu", (name, a.device)
+
+    # PPO-only, per train.py:2402 — the bandit's heads are Q-values.
+    assert ppo.logit_cap == args.logit_cap and args.logit_cap > 0, ppo.logit_cap
+    assert ppo.entropy_coef_unmerge == args.entropy_coef_unmerge
+    assert ban.logit_cap == 0.0, "a tanh cap would distort the bandit's Q regression"
+    assert ban.epsilon == args.bandit_epsilon, ban.epsilon
+    print("  agent construction         ok  (batch=%d logit_cap=%.1f K=%d)"
+          % (args.batch_size, args.logit_cap, args.K))
+
+
+def test_schedules_match_pipeline():
+    """
+    Linear decay endpoints, MIRROR train.py:2586-2594 and _bandit_epsilon:
+    epoch 1 sits at the initial value, the last epoch at the final one, and the
+    UNMERGE entropy coefficient never moves.
+    """
+    from train import _bandit_epsilon
+    args = _args(epochs=10)
+
+    ppo = ot.make_agent("ppo", args)
+    fixed = ppo.entropy_coef_unmerge
+    ot._schedules(ppo, "ppo", 1, args)
+    assert approx(ppo.entropy_coef, args.entropy_coef), ppo.entropy_coef
+    ot._schedules(ppo, "ppo", args.epochs, args)
+    assert approx(ppo.entropy_coef, args.entropy_coef_final), ppo.entropy_coef
+    assert ppo.entropy_coef_unmerge == fixed, "unmerge coefficient must not decay"
+
+    ban = ot.make_agent("bandit", args)
+    for ep in (1, 5, args.epochs):
+        ot._schedules(ban, "bandit", ep, args)
+        # Compare against the pipeline's own function, not a re-derivation.
+        assert approx(ban.epsilon, _bandit_epsilon(args, ep, args.epochs)), \
+            (ep, ban.epsilon)
+    print("  schedules                  ok  (entropy %.3f->%.3f, eps %.2f->%.2f)"
+          % (args.entropy_coef, args.entropy_coef_final,
+             args.bandit_epsilon, args.bandit_epsilon_final))
+
+
+def test_update_cadence(d: dict):
+    """
+    Updates must fire mid-epoch when the buffer fills, not once at the end.
+
+    MIRROR: train.py:2088-2090 (fill -> update -> clear) plus the end-of-epoch
+    flush at :2146. With buffer=128, K=2 and batch=8 the pipeline targets ~0.25
+    gradient updates per sample (its own comment at :214). Collecting a whole
+    epoch into one buffer gives ~0.06 — same samples, ~4x fewer gradient steps.
+
+    Forced here with buffer_size=2 over 5 loops: at least 2 fills plus a flush.
+    """
+    args = _args(epochs=1, patience=0, buffer_size=2, bandit_warm_epochs=0)
+    loops = od.labelled_loops(d)
+    _, info = ot.train_agent("bandit", loops, loops, d, args, seed=0)
+    assert info["n_updates"] >= 3, info
+    # ...and one big buffer must give exactly one update per epoch.
+    args_big = _args(epochs=1, patience=0, buffer_size=10_000,
+                     bandit_warm_epochs=0)
+    _, info_big = ot.train_agent("bandit", loops, loops, d, args_big, seed=0)
+    assert info_big["n_updates"] == 1, info_big
+    print("  update cadence             ok  (buffer=2 -> %d updates, "
+          "one-big-buffer -> %d)" % (info["n_updates"], info_big["n_updates"]))
+
+
+def test_bandit_warm_start_uses_fit_loops_only(d: dict):
+    """
+    The bandit warm-starts on cached cells (train.py:2542). It must see the FIT
+    fold only — warming on held-out loops leaks their rewards into the model
+    that then predicts them.
+    """
+    loops = od.labelled_loops(d)
+    fit = [l for l in loops if l["benchmark_name"] in ("b1", "b2")]
+    held = [l for l in loops if l["benchmark_name"] not in ("b1", "b2")]
+    args = _args(epochs=1, patience=0)
+
+    from train import build_warm_start_entries
+    ws_fit, n_fit, _ = build_warm_start_entries(
+        fit, d["rewards"], d["postf"], d["normalizer"])
+    ws_all, n_all, _ = build_warm_start_entries(
+        loops, d["rewards"], d["postf"], d["normalizer"])
+    assert 0 < n_fit < n_all, (n_fit, n_all)
+
+    _, info = ot.train_agent("bandit", fit, held, d, args, seed=0)
+    assert info["n_warm_start_cells"] == n_fit, \
+        f"warm start saw {info['n_warm_start_cells']} cells, fit fold has {n_fit}"
+    print("  warm start (fit-only)      ok  (%d cells, not %d)" % (n_fit, n_all))
+
+
 def test_determinism(d: dict):
     """
     Same seed -> identical agent. This is the property the whole sweep rests on:
@@ -511,12 +637,7 @@ def test_determinism(d: dict):
     global random (batch shuffling, bandit epsilon-greedy), and the epoch
     shuffle. A single unseeded source anywhere in that chain breaks this.
     """
-    args = Namespace(
-        deadzone=DZ, epochs=3, patience=0, lr=3e-4, batch_size=4,
-        weight_decay=0.01, max_grad_norm=0.5, entropy_coef=0.01, clip_eps=0.2,
-        logit_cap=0.0, epsilon=0.1, missing="penalty", score_missing="penalty",
-        compile_failure_penalty=-0.161,
-    )
+    args = _args(epochs=EPOCHS_SMOKE, patience=0, batch_size=4)
     loops = od.labelled_loops(d)
     for kind in ("ppo", "bandit"):
         a1, i1 = ot.train_agent(kind, loops, loops, d, args, seed=7)
@@ -570,6 +691,10 @@ def main() -> None:
         test_regression_and_deadzone(d)
         test_marginal_is_deployable(d)
         test_marginal_ranking_and_table(d)
+        test_agent_construction_matches_pipeline()
+        test_schedules_match_pipeline()
+        test_update_cadence(d)
+        test_bandit_warm_start_uses_fit_loops_only(d)
         test_split_reproduction_uses_stored_order(d)
         test_trip_count_mask_is_respected(d)
         test_training_smoke(d)

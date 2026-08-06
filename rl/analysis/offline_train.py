@@ -175,43 +175,73 @@ def greedy_picks(agent, loops: list, normalizer, postf: dict) -> list:
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def collect(agent, order: list, data: dict, args):
+def rollout_one(agent, loop: dict, data: dict, args):
     """
-    One epoch of on-policy rollouts, rewards read from the table.
+    One on-policy sample. (RolloutEntry or None, absent_cell: bool)
 
-    (buffer, n_absent_cells). Runs under no_grad: the stored log-probs are
-    constants — the online pipeline gets that for free by shipping floats
-    through a process queue — and every gradient comes from ppo_update's own
-    forward passes.
+    no_grad covers SELECTION only. The ppo_update call must stay outside it —
+    running an update under no_grad disables every gradient and training
+    silently does nothing while still printing losses.
     """
-    from agent import RolloutBuffer, RolloutEntry
+    from agent import RolloutEntry
 
-    normalizer, postf, tables = data["normalizer"], data["postf"], data["tables"]
-    buf = RolloutBuffer(capacity=len(order) + 1)
-    n_missing = 0
+    u, f, f_idx, lp1, lp2, mask, s1, s2 = act(
+        agent, loop, data["normalizer"], data["postf"], greedy=False)
+    r, factor_active, measured = reward_for(data["tables"], loop, u, f)
+    if not measured:
+        if args.missing == "skip":
+            return None, True
+        r = args.compile_failure_penalty
+    # MIRROR: train._send_loop_result -> main's rebuild. Online, entries cross a
+    # process queue as PLAIN PYTHON, so ppo_update sees graph-free constants.
+    # Rebuilt here in the same shapes and dtypes: a log-prob still carrying
+    # grad_fn would make the PPO ratio differentiable through the
+    # COLLECTION-time policy, which is meant to be a fixed reference.
+    return RolloutEntry(
+        state1=s1.detach(), state2=s2.detach(),
+        action1=int(u), action2=int(f_idx),
+        log_prob1=torch.tensor(float(lp1), dtype=torch.float32),
+        log_prob2=torch.tensor(float(lp2), dtype=torch.float32),
+        reward=float(r),
+        mask2=mask.detach().to(torch.bool),
+        factor_active=factor_active), (not measured)
+
+
+def run_epoch(agent, order: list, buf, data: dict, args) -> tuple:
+    """
+    One epoch of collection with MID-EPOCH updates, exactly as the pipeline
+    does it (train.py:2088-2090 and 2838-2840): update the moment the buffer
+    fills, then clear.
+
+    This is not a detail. The pipeline sizes its buffer at 128 with K=2 and
+    batch 8 to hit ~0.25 gradient updates per sample (its own comment,
+    train.py:214-216). Collecting a whole epoch into one buffer and updating
+    once at the end gives ~0.06 — four times fewer gradient steps on the same
+    data, plus an advantage normalisation computed over a 300-sample batch
+    instead of a 128-sample one. Same samples, different optimiser entirely.
+
+    Returns (n_absent_cells, n_updates, sum_actor_loss).
+    """
+    n_missing = n_updates = 0
+    loss_sum = 0.0
     for l in order:
-        u, f, f_idx, lp1, lp2, mask, s1, s2 = act(
-            agent, l, normalizer, postf, greedy=False)
-        r, factor_active, measured = reward_for(tables, l, u, f)
-        if not measured:
-            n_missing += 1
-            if args.missing == "skip":
-                continue
-            r = args.compile_failure_penalty
-        # MIRROR: train._send_loop_result -> main's rebuild. Online, entries
-        # cross a process queue as PLAIN PYTHON, so ppo_update sees graph-free
-        # constants. Rebuilt here in the same shapes and dtypes: a log-prob that
-        # still carried grad_fn would make the PPO ratio differentiable through
-        # the COLLECTION-time policy, which is meant to be a fixed reference.
-        buf.append(RolloutEntry(
-            state1=s1.detach(), state2=s2.detach(),
-            action1=int(u), action2=int(f_idx),
-            log_prob1=torch.tensor(float(lp1), dtype=torch.float32),
-            log_prob2=torch.tensor(float(lp2), dtype=torch.float32),
-            reward=float(r),
-            mask2=mask.detach().to(torch.bool),
-            factor_active=factor_active))
-    return buf, n_missing
+        entry, missing = rollout_one(agent, l, data, args)
+        n_missing += int(missing)
+        if entry is None:
+            continue
+        buf.append(entry)
+        if buf.full():
+            stats = agent.ppo_update(buf)      # OUTSIDE no_grad — see above
+            buf.clear()
+            n_updates += 1
+            loss_sum += stats.get("actor_loss", 0.0)
+    # MIRROR: train.py:2146 — flush the partial buffer at end of epoch.
+    if len(buf) > 0:
+        stats = agent.ppo_update(buf)
+        buf.clear()
+        n_updates += 1
+        loss_sum += stats.get("actor_loss", 0.0)
+    return n_missing, n_updates, loss_sum
 
 
 def _snapshot(agent) -> dict:
@@ -226,50 +256,111 @@ def _restore(agent, snap: dict) -> None:
     agent.critic.load_state_dict(snap["c"])
 
 
+def make_agent(kind: str, args):
+    """
+    MIRROR: train.py:2390-2412, key for key.
+
+    _agent_common is shared by both agents; logit_cap and entropy_coef_unmerge
+    are passed to PPO ONLY. That is not an oversight to tidy up later — the
+    bandit's heads are Q-values, not softmax logits, so a tanh cap would distort
+    the regression and there is no policy-entropy term for the unmerge
+    coefficient to weight. train.py says so in a comment at :2402; asserted in
+    test_agent_construction_matches_pipeline so it stays true.
+    """
+    from agent import Agent, BanditAgent
+
+    common = dict(
+        clip_eps=args.clip_eps,
+        K=args.K,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        value_loss_coef=args.value_loss_coef,
+        entropy_coef=args.entropy_coef,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
+        device=DEVICE,
+    )
+    if kind == "bandit":
+        return BanditAgent(epsilon=args.bandit_epsilon, **common)
+    return Agent(logit_cap=args.logit_cap,
+                 entropy_coef_unmerge=args.entropy_coef_unmerge, **common)
+
+
+def _schedules(agent, kind: str, epoch: int, args) -> None:
+    """
+    MIRROR: train.py:2580-2594. Linear schedules, recomputed per epoch.
+
+    Factor-head entropy decays --entropy-coef -> --entropy-coef-final. The
+    UNMERGE head's coefficient is deliberately NOT decayed: it protects the
+    binary head from extinction and is set once at construction. Bandit epsilon
+    decays on the same shape (train._bandit_epsilon).
+    """
+    n = args.epochs
+    frac = (epoch - 1) / (n - 1) if n > 1 else 0.0
+    if kind == "bandit":
+        agent.epsilon = (args.bandit_epsilon
+                         + frac * (args.bandit_epsilon_final - args.bandit_epsilon))
+    else:
+        agent.entropy_coef = (args.entropy_coef
+                              + frac * (args.entropy_coef_final - args.entropy_coef))
+
+
 def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                 args, seed: int):
     """
-    Train from scratch on fit_loops; early-stop on hold_loops.
+    Train from scratch on fit_loops; select the best epoch on hold_loops.
+
+    Construction, update cadence, schedules and warm start all mirror train.py
+    so an offline number is comparable to an online one. The ONLY thing removed
+    is the compile-and-measure step, replaced by a table lookup.
 
     Selection metric is MEAN REALIZED REWARD over every scored held-out loop.
     Not capture, and not accuracy: capture ignores loops with no headroom, so a
     policy that fires destructively on them scores well on it; accuracy weights a
     +0.0001 loop the same as a +0.99 one. Mean realized is also the number that
-    compares directly against always-no-op's exact 0.0, which is the bar that
-    matters on this population.
+    compares directly against always-no-op's exact 0.0.
     """
-    from agent import Agent, BanditAgent
+    from agent import RolloutBuffer
 
     torch.manual_seed(seed)
     random.seed(seed)
 
-    kw = dict(device=DEVICE, lr=args.lr, batch_size=args.batch_size,
-              weight_decay=args.weight_decay, max_grad_norm=args.max_grad_norm)
-    if kind == "bandit":
-        agent = BanditAgent(epsilon=args.epsilon, **kw)
-    else:
-        agent = Agent(entropy_coef=args.entropy_coef, logit_cap=args.logit_cap,
-                      clip_eps=args.clip_eps, **kw)
+    agent = make_agent(kind, args)
 
-    normalizer, postf, tables = data["normalizer"], data["postf"], data["tables"]
+    # MIRROR: train.py:2542 — the bandit warm-starts its Q-heads on cached
+    # cells before any rollout. Restricted to FIT loops: build_warm_start_entries
+    # takes the assignment list, so passing only this fold's training loops is
+    # what keeps the held-out fold out of the warm start.
+    n_ws_cells = 0
+    if kind == "bandit" and args.bandit_warm_epochs > 0:
+        from train import build_warm_start_entries
+        ws, n_ws_cells, _ = build_warm_start_entries(
+            fit_loops, data["rewards"], data["postf"], data["normalizer"])
+        if n_ws_cells:
+            agent.warm_start(ws, args.bandit_warm_epochs)
+
     best_score, best_snap, best_epoch, since = -float("inf"), _snapshot(agent), 0, 0
-    n_missing = 0
+    n_missing = n_updates = 0
     history = []
+    buf = RolloutBuffer(capacity=args.buffer_size)
 
     for epoch in range(1, args.epochs + 1):
+        _schedules(agent, kind, epoch, args)
         order = list(fit_loops)
         random.shuffle(order)
-        buf, n_miss_epoch = collect(agent, order, data, args)
-        n_missing += n_miss_epoch
-        if len(buf) == 0:
+        miss, ups, loss = run_epoch(agent, order, buf, data, args)
+        n_missing += miss
+        n_updates += ups
+        if ups == 0:
             continue
-        stats = agent.ppo_update(buf)
 
-        m = score_decisions(greedy_picks(agent, hold_loops, normalizer, postf),
-                            tables, data["labels"], args.deadzone, _mr(args))
+        m = score_decisions(greedy_picks(agent, hold_loops, data["normalizer"],
+                                         data["postf"]),
+                            data["tables"], data["labels"], args.deadzone,
+                            _mr(args))
         history.append({"epoch": epoch, "hold_mean_realized": m["mean_realized"],
                         "hold_accuracy": m["accuracy"],
-                        "actor_loss": stats.get("actor_loss", float("nan"))})
+                        "actor_loss": loss / max(ups, 1)})
         if m["mean_realized"] > best_score:
             best_score, best_snap, best_epoch, since = (
                 m["mean_realized"], _snapshot(agent), epoch, 0)
@@ -279,9 +370,6 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                 break
 
     if not history:
-        # Every epoch produced an empty buffer, so the returned agent is the
-        # random initialization. Silently reporting its score as a trained
-        # result would be the worst outcome here.
         log.warning("    WARNING: no training samples in any epoch — the agent "
                     "is UNTRAINED. Check --missing and the table's coverage.")
 
@@ -290,6 +378,7 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
         mod.eval()
     return agent, {"best_epoch": best_epoch, "best_hold_mean_realized": best_score,
                    "epochs_run": len(history), "n_missing_cells": n_missing,
+                   "n_updates": n_updates, "n_warm_start_cells": n_ws_cells,
                    "history": history}
 
 
@@ -505,7 +594,11 @@ def run_score_ckpt(data: dict, args) -> None:
 
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """
+    Separate from main() so the tests can construct args from the REAL defaults
+    instead of a hand-written Namespace that drifts the moment a flag changes.
+    """
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("run_dir", type=Path)
@@ -528,34 +621,64 @@ def main() -> None:
                    help="fraction of each fold's train benchmarks used for "
                         "early stopping (never the test fold)")
 
-    g = p.add_argument_group("training")
-    g.add_argument("--epochs", type=int, default=60)
-    g.add_argument("--patience", type=int, default=12, help="0 disables")
+    g = p.add_argument_group("training — defaults MIRROR train.py's argparse")
+    # Every default below is train.py's. They are not tuning knobs here: an
+    # offline number is only comparable to an online one if the optimiser is the
+    # same one. Changing any of these makes this a different experiment.
+    g.add_argument("--epochs", type=int, default=100)
+    g.add_argument("--buffer-size", type=int, default=128,
+                   help="Rollout buffer capacity before an update is triggered. "
+                        "With K=2 and batch 8 this gives ~0.25 gradient updates "
+                        "per sample, which is what the pipeline runs. Raising it "
+                        "to a whole epoch cuts that ~4x. (default: 128)")
+    g.add_argument("--patience", type=int, default=0,
+                   help="Early-stop after this many epochs with no holdout "
+                        "improvement. 0 (default) = run all epochs and select "
+                        "the best, which is what the pipeline does.")
     g.add_argument("--lr", type=float, default=3e-4)
-    g.add_argument("--batch-size", type=int, default=32)
+    g.add_argument("--batch-size", type=int, default=8)
+    g.add_argument("--K", type=int, default=2, dest="K",
+                   help="Update epochs per rollout buffer. (default: 2)")
+    g.add_argument("--value-loss-coef", type=float, default=0.5)
     g.add_argument("--weight-decay", type=float, default=0.01)
     g.add_argument("--max-grad-norm", type=float, default=0.5)
-    g.add_argument("--entropy-coef", type=float, default=0.01, help="PPO only")
     g.add_argument("--clip-eps", type=float, default=0.2, help="PPO only")
-    g.add_argument("--logit-cap", type=float, default=0.0,
-                   help="PPO only; must match the run for a loaded checkpoint")
-    g.add_argument("--epsilon", type=float, default=0.1, help="bandit only")
+    g.add_argument("--entropy-coef", type=float, default=0.01,
+                   help="PPO factor-head entropy at epoch 1.")
+    g.add_argument("--entropy-coef-final", type=float, default=0.001,
+                   help="PPO factor-head entropy at the last epoch; decays "
+                        "linearly from --entropy-coef.")
+    g.add_argument("--entropy-coef-unmerge", type=float, default=0.05,
+                   help="PPO binary-head entropy, held CONSTANT (no decay) — it "
+                        "protects the unmerge head from extinction.")
+    g.add_argument("--logit-cap", type=float, default=4.0,
+                   help="PPO only. Bounds actor logits via C*tanh(logit/C). "
+                        "This is the entropy-collapse guard; 0 disables it.")
+    g.add_argument("--bandit-epsilon", type=float, default=0.3,
+                   help="Bandit exploration at epoch 1; decays linearly.")
+    g.add_argument("--bandit-epsilon-final", type=float, default=0.05)
+    g.add_argument("--bandit-warm-epochs", type=int, default=10,
+                   help="Q-head warm-start passes over the FIT fold's cached "
+                        "cells before any rollout. 0 disables.")
     g.add_argument("--missing", choices=["penalty", "skip"], default="penalty",
                    help="what a policy earns during TRAINING for a cell with no "
                         "row in the cache. Default 'penalty' pays "
                         "--compile-failure-penalty: after exhaustive collection "
                         "an absent row means the cell failed, not that it was "
                         "never tried, so the agent should learn to avoid it. "
-                        "'skip' drops the sample instead — use only to measure "
-                        "how much those cells are driving the policy.")
-    g.add_argument("--compile-failure-penalty", type=float, default=-0.161)
+                        "'skip' drops the sample instead.")
+    g.add_argument("--compile-failure-penalty", type=float, default=-0.161,
+                   help="The ONE default here that is deliberately not "
+                        "train.py's (-0.25). It must match the value the CACHE "
+                        "was built with, not the current CLI default: "
+                        "run_sweep_1 was measured at -0.161, and the cells "
+                        "holding it are indistinguishable from real "
+                        "measurements without the migration block.")
     g.add_argument("--score-missing", choices=["penalty", "exclude"],
                    default="penalty",
                    help="how an absent cell is scored at EVALUATION time. "
                         "Default matches --missing so the policy is scored "
-                        "against the rule it was trained under. 'exclude' drops "
-                        "it from performance (still counted against accuracy) — "
-                        "use to measure how much a result rides on those cells.")
+                        "against the rule it was trained under.")
 
     g = p.add_argument_group("score-ckpt")
     g.add_argument("--checkpoint", type=Path, default=None)
@@ -575,6 +698,11 @@ def main() -> None:
                         "independent, so there is nothing to share and no race "
                         "to have.")
 
+    return p
+
+
+def main() -> None:
+    p = build_parser()
     args = p.parse_args()
     if args.mode == "score-ckpt" and args.checkpoint is None:
         p.error("--mode score-ckpt requires --checkpoint")

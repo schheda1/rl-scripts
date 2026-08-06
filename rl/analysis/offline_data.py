@@ -220,6 +220,9 @@ def load_run(run_dir: Path, deadzone: float,
     return {
         "n_label_rows": len(labels),
         "n_labelled_loops": n_matched,
+        # Raw cache, for train.build_warm_start_entries — it wants the flat
+        # "bench|loop|u|f" map, not the per-loop tables.
+        "rewards": rc.get("rewards", {}),
         "loops": loops,
         "tables": tables,
         "normalizer": normalizer,
