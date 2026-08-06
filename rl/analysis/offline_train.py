@@ -358,8 +358,22 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                                          data["postf"]),
                             data["tables"], data["labels"], args.deadzone,
                             _mr(args))
+        # FIT curve, sampled. Without it there is no way to tell whether fit had
+        # plateaued by epoch 20 or was still climbing at 100 — and therefore no
+        # way to answer "would more epochs fit better?" except by guessing.
+        # Sampled rather than every epoch because it is a full pass over ~300
+        # loops; always taken on the last epoch so the endpoint is exact.
+        fit_a = fit_m = float("nan")
+        if args.curve_every and (epoch % args.curve_every == 0
+                                 or epoch == args.epochs):
+            fm = score_decisions(greedy_picks(agent, fit_loops,
+                                              data["normalizer"], data["postf"]),
+                                 data["tables"], data["labels"], args.deadzone,
+                                 _mr(args))
+            fit_a, fit_m = fm["accuracy"], fm["mean_realized"]
         history.append({"epoch": epoch, "hold_mean_realized": m["mean_realized"],
                         "hold_accuracy": m["accuracy"],
+                        "fit_accuracy": fit_a, "fit_mean_realized": fit_m,
                         "actor_loss": loss / max(ups, 1)})
         if m["mean_realized"] > best_score:
             best_score, best_snap, best_epoch, since = (
@@ -373,12 +387,24 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
         log.warning("    WARNING: no training samples in any epoch — the agent "
                     "is UNTRAINED. Check --missing and the table's coverage.")
 
+    # Score the FINAL agent on fit BEFORE restoring the val-selected snapshot.
+    # The restored checkpoint is whichever epoch maximised VAL, so its fit is
+    # not the best fit the run achieved. Asking "would more epochs fit better?"
+    # requires the final-epoch fit, not the selected one — otherwise extra
+    # epochs are discarded by selection and the answer looks like "no".
+    fin = score_decisions(greedy_picks(agent, fit_loops, data["normalizer"],
+                                       data["postf"]),
+                          data["tables"], data["labels"], args.deadzone,
+                          _mr(args))
+
     _restore(agent, best_snap)
     for mod in (agent.unmerge_actor, agent.factor_actor, agent.critic):
         mod.eval()
     return agent, {"best_epoch": best_epoch, "best_hold_mean_realized": best_score,
                    "epochs_run": len(history), "n_missing_cells": n_missing,
                    "n_updates": n_updates, "n_warm_start_cells": n_ws_cells,
+                   "final_fit_accuracy": fin["accuracy"],
+                   "final_fit_mean_realized": fin["mean_realized"],
                    "history": history}
 
 
@@ -438,6 +464,7 @@ def run_cv(data: dict, args) -> None:
         log.info(_h)
 
     union: dict = {}          # seed -> list of held-out picks
+    curve_rows: list = []
     fold_rows, per_fold_scores = [], {s: [] for s in range(args.seeds)}
 
     for k, (tr_b, te_b) in enumerate(folds):
@@ -504,7 +531,16 @@ def run_cv(data: dict, args) -> None:
                 "regression_rate": round(m["regression_rate"], 6),
                 "loops_unmeasured": m["loops_unmeasured"],
                 "n_missing_cells_in_training": info["n_missing_cells"],
+                # fit at the LAST epoch vs at the val-SELECTED epoch. If the
+                # first keeps rising with --epochs and the second does not, the
+                # limit is selection, not capacity.
+                "accuracy_fit_final": round(info["final_fit_accuracy"], 6),
+                "mean_realized_fit_final": round(
+                    info["final_fit_mean_realized"], 6),
             })
+            if args.curve_out:
+                for h in info["history"]:
+                    curve_rows.append(dict(fold=k + 1, seed=seed, **h))
 
     log.info(fold_header()[2])
     log.info("  always-no-op scores exactly +0.0000 on every split, so each "
@@ -517,6 +553,14 @@ def run_cv(data: dict, args) -> None:
              "optimistically biased. Only TEST is an\n  estimate of deployment "
              "quality. 'no-op' is always-no-op's accuracy on the TEST\n  loops "
              "of this fold — the trivial classifier the policy has to beat.")
+
+    _ff = [(r["accuracy_fit"], r["accuracy_fit_final"]) for r in fold_rows]
+    log.info("\n  fit accuracy at the SELECTED epoch %.1f%% vs at the FINAL "
+             "epoch %.1f%%.\n  If the final keeps rising with --epochs while "
+             "the selected does not, the binding\n  constraint is val-based "
+             "selection, not capacity or training length.",
+             100 * st.mean([a for a, _ in _ff]),
+             100 * st.mean([b for _, b in _ff]))
 
     _acc = [(r["accuracy_fit"], r["accuracy_val"], r["accuracy"],
              r["noop_accuracy_test"]) for r in fold_rows]
@@ -588,6 +632,11 @@ def run_cv(data: dict, args) -> None:
             w.writeheader()
             w.writerows(fold_rows)
         log.info("\n  per-fold: %s", args.csv_out)
+    if args.curve_out and curve_rows:
+        with open(args.curve_out, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(curve_rows[0].keys()))
+            w.writeheader(); w.writerows(curve_rows)
+        log.info("  learning curves: %s", args.curve_out)
 
 
 def _baseline_rows(data: dict, loops: list, folds: list, args) -> None:
@@ -711,6 +760,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--labels", type=Path, default=None,
                    help="default: RUN_DIR/loop_labels.csv")
     p.add_argument("--csv-out", type=Path, default=None)
+    p.add_argument("--curve-out", type=Path, default=None,
+                   help="Per-epoch learning curves (fold, seed, epoch, fit and "
+                        "holdout accuracy/mean). This is what answers 'would "
+                        "more epochs fit better?' — a single final number "
+                        "cannot.")
+    p.add_argument("--curve-every", type=int, default=5,
+                   help="Sample the FIT curve every N epochs (0 disables). Each "
+                        "sample is a full pass over the training loops; the "
+                        "last epoch is always sampled. (default: 5)")
 
     g = p.add_argument_group("cross-validation")
     g.add_argument("--folds", type=int, default=5)
