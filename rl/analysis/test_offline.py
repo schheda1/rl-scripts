@@ -737,6 +737,90 @@ def test_category_noop_target_is_exact_zero(d: dict):
     print(f"  no-op Q target exact       ok  (Q1(noop) = {q_noop:+.4f})")
 
 
+
+def test_supcon_loss_geometry():
+    """
+    Hand-computable. Two classes, two points each, unit vectors, tau=0.1.
+
+    Perfectly separated (same class identical, classes orthogonal): for any
+    anchor the positive sits at similarity 1/tau=10 and both negatives at 0, so
+    log p(positive) = 10 - logsumexp([10,0,0]) ~= 0 and the loss ~= 0.
+
+    Same four points with labels shuffled so each anchor's positive is the
+    ORTHOGONAL point: log p = 0 - logsumexp([10,0,0]) ~= -10, loss ~= 10.
+    """
+    import torch
+    from supcon import supcon_loss
+    emb = torch.tensor([[1., 0.], [1., 0.], [0., 1.], [0., 1.]])
+    good = supcon_loss(emb, torch.tensor([0, 0, 1, 1]), temperature=0.1)
+    bad = supcon_loss(emb, torch.tensor([0, 1, 0, 1]), temperature=0.1)
+    assert good.item() < 0.01, good.item()
+    assert bad.item() > 9.0, bad.item()
+    # No anchor has a positive -> exactly 0, not NaN, so callers can add it
+    # unconditionally.
+    lone = supcon_loss(emb[:2], torch.tensor([0, 1]), temperature=0.1)
+    assert lone.item() == 0.0, lone.item()
+    print(f"  supcon loss geometry      ok  (separated {good.item():.4f}, "
+          f"mixed {bad.item():.1f})")
+
+
+def test_provisional_labels_use_observed_only(d: dict):
+    """
+    The property the whole design rests on: labels come from cells the agent
+    PAID FOR, never from the reward table. b1|0's table holds (1,2)=+0.30, but a
+    label built from an observation of (0,2)=+0.10 must say unroll_only — if it
+    said unmerge_unroll, the term would be reading the table and the method
+    would stop being online-legitimate.
+    """
+    from supcon import provisional_labels
+    loops = [l for l in od.labelled_loops(d) if l["benchmark_name"] == "b1"
+             and l["loop_idx"] == 0]
+    key = ("b1", 0)
+
+    seen_unroll = {key: {(0, 2): 0.10}}
+    assert provisional_labels(loops, seen_unroll, DZ, 1)[key] == 1, "unroll_only"
+
+    seen_unmerge = {key: {(1, 2): 0.30}}
+    assert provisional_labels(loops, seen_unmerge, DZ, 1)[key] == 2, "unmerge"
+
+    # Every observed transform harmful -> the FREE no-op wins, as build_tables
+    # injects it. Not "least bad transform".
+    seen_bad = {key: {(1, 5): -0.50}}
+    assert provisional_labels(loops, seen_bad, DZ, 1)[key] == 0, "noop"
+
+    # Below the coverage threshold the loop is excluded entirely, rather than
+    # defaulting to no-op and flooding that cluster with evidence-free loops.
+    assert provisional_labels(loops, seen_bad, DZ, 4) == {}
+    assert provisional_labels(loops, {}, DZ, 1) == {}
+    print("  provisional labels         ok  (observed-only, coverage-gated)")
+
+
+def test_supcon_gate(d: dict):
+    """Inactive before the warmup epoch, and inactive when the batch holds a
+    single category — no negatives means the loss is identically zero and the
+    optimizer step is wasted."""
+    from supcon import is_active
+    args = _args(supcon_coef=1.0, supcon_warmup=15)
+    two = {("a", 0): 0, ("b", 0): 2}
+    one = {("a", 0): 0, ("b", 0): 0}
+    assert not is_active(14, two, args), "fired before warmup"
+    assert is_active(15, two, args)
+    assert not is_active(50, one, args), "fired with one category"
+    assert not is_active(50, two, _args(supcon_coef=0.0)), "fired when disabled"
+    print("  supcon gate                ok")
+
+
+def test_supcon_smoke(d: dict):
+    """The contrastive step runs end to end and reaches the optimizer."""
+    args = _args(epochs=EPOCHS_SMOKE, patience=0, supcon_coef=1.0,
+                 supcon_warmup=1, supcon_min_cells=1, supcon_batch=8)
+    loops = od.labelled_loops(d)
+    agent, info = ot.train_agent("category-bandit", loops, loops, d, args, seed=0)
+    assert info["n_observed_cells"] > 0, "observed-cell tracker stayed empty"
+    print(f"  supcon smoke               ok  ({info['n_supcon_steps']} step(s), "
+          f"{info['n_observed_cells']} cells observed)")
+
+
 def test_determinism(d: dict):
     """
     Same seed -> identical agent. This is the property the whole sweep rests on:
@@ -801,6 +885,10 @@ def main() -> None:
         test_regression_and_deadzone(d)
         test_marginal_is_deployable(d)
         test_marginal_ranking_and_table(d)
+        test_supcon_loss_geometry()
+        test_provisional_labels_use_observed_only(d)
+        test_supcon_gate(d)
+        test_supcon_smoke(d)
         test_category_round_trip()
         test_category_masks()
         test_category_entry_carries_category(d)

@@ -67,7 +67,7 @@ from offline_data import (_RULE, IDX_TRIP_COUNT, IDX_TRIP_KNOWN,  # noqa: E402
                           NOOP, always_noop_picks, benchmark_dominant_picks,
                           fingerprint, format_confusion, format_report, grouped_kfold,
                           holdout_split, fingerprint, labelled_loops, load_run, loops_for,
-                          marginal_picks, marginal_ranking, oracle_picks,
+                          marginal_picks, marginal_ranking, oracle_picks, pairwise_accuracy,
                           score_decisions, table_header, table_row)
 
 # force=True is load-bearing: importing offline_data pulls in adapt_eval and
@@ -219,9 +219,11 @@ def rollout_one(agent, loop: dict, data: dict, args):
     u, f, f_idx, lp1, lp2, mask, s1, s2, head, head_mask = act(
         agent, loop, data["normalizer"], data["postf"], greedy=False)
     r, factor_active, measured = reward_for(data["tables"], loop, u, f)
+    seen = (((loop["benchmark_name"], loop["loop_idx"]), (u, f), float(r))
+            if measured else None)
     if not measured:
         if args.missing == "skip":
-            return None, True
+            return None, True, None
         r = args.compile_failure_penalty
     # MIRROR: train._send_loop_result -> main's rebuild. Online, entries cross a
     # process queue as PLAIN PYTHON, so ppo_update sees graph-free constants.
@@ -240,15 +242,16 @@ def rollout_one(agent, loop: dict, data: dict, args):
         mask2=None if mask is None else mask.detach().to(torch.bool),
         factor_active=factor_active)
     if head_mask is None:
-        return RolloutEntry(**fields), (not measured)
+        return RolloutEntry(**fields), (not measured), seen
     # 3-way head: carry the category mask so ppo_update can reapply it.
     from category_agent import CategoryRolloutEntry
     return (CategoryRolloutEntry(mask1=head_mask.detach().to(torch.bool),
                                  **fields),
-            (not measured))
+            (not measured), seen)
 
 
-def run_epoch(agent, order: list, buf, data: dict, args) -> tuple:
+def run_epoch(agent, order: list, buf, data: dict, args,
+              observed: dict) -> tuple:
     """
     One epoch of collection with MID-EPOCH updates, exactly as the pipeline
     does it (train.py:2088-2090 and 2838-2840): update the moment the buffer
@@ -261,13 +264,20 @@ def run_epoch(agent, order: list, buf, data: dict, args) -> tuple:
     data, plus an advantage normalisation computed over a 300-sample batch
     instead of a 128-sample one. Same samples, different optimiser entirely.
 
+    `observed` accumulates {(bench, loop): {(unmerge, factor): reward}} across
+    epochs — the cells the agent has actually paid for. It is the label source
+    for the contrastive term, and keeping it separate from data["tables"] is
+    what makes that term online-legitimate rather than a table lookup.
+
     Returns (n_absent_cells, n_updates, sum_actor_loss).
     """
     n_missing = n_updates = 0
     loss_sum = 0.0
     for l in order:
-        entry, missing = rollout_one(agent, l, data, args)
+        entry, missing, seen = rollout_one(agent, l, data, args)
         n_missing += int(missing)
+        if seen is not None:
+            observed.setdefault(seen[0], {})[seen[1]] = seen[2]
         if entry is None:
             continue
         buf.append(entry)
@@ -356,6 +366,61 @@ def _schedules(agent, kind: str, epoch: int, args) -> None:
                               + frac * (args.entropy_coef_final - args.entropy_coef))
 
 
+def supcon_step(agent, fit_loops: list, observed: dict, data: dict,
+                epoch: int, args) -> tuple:
+    """
+    One supervised-contrastive update on the category head's embedding.
+
+    A SEPARATE optimizer step, not a term folded into ppo_update. Two reasons:
+    the agents in agent.py stay untouched, and the contrastive term wants a much
+    larger batch than the rollout minibatch of 8 — with three classes, batch 8
+    yields roughly three same-label pairs, far too few negatives for the loss to
+    mean anything. It needs states and labels, not rollout structure, so it can
+    be batched independently.
+
+    Runs --supcon-steps times per epoch. This matters more than the
+    coefficient: the rollout cadence performs ~76 Q updates per epoch, so ONE
+    contrastive step is 1.3% of the optimizer traffic and would barely move the
+    embedding no matter how it were weighted. The two knobs are not
+    interchangeable — the coefficient scales one step's gradient, the count
+    decides how much of training the term actually participates in.
+
+    Returns (mean loss over the steps taken, n_labelled) — (0.0, n) when the
+    gate is closed.
+    """
+    from adapt_eval import make_state
+    from supcon import embed, is_active, provisional_labels, supcon_loss
+
+    labels = provisional_labels(fit_loops, observed, args.deadzone,
+                                args.supcon_min_cells)
+    if not is_active(epoch, labels, args):
+        return 0.0, len(labels)
+
+    pool = [l for l in fit_loops
+            if (l["benchmark_name"], l["loop_idx"]) in labels]
+    if len(pool) > args.supcon_batch:
+        pool = random.sample(pool, args.supcon_batch)
+    states = torch.stack([
+        make_state(l, data["normalizer"], data["postf"], 0)[0] for l in pool])
+    y = torch.tensor([labels[(l["benchmark_name"], l["loop_idx"])] for l in pool],
+                     dtype=torch.long)
+
+    total, taken = 0.0, 0
+    for _ in range(max(1, args.supcon_steps)):
+        loss = args.supcon_coef * supcon_loss(embed(agent, states), y,
+                                              args.supcon_temp)
+        if float(loss) == 0.0:
+            break
+        agent.optimizer.zero_grad()
+        loss.backward()
+        if agent.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(agent._all_params, agent.max_grad_norm)
+        agent.optimizer.step()
+        total += float(loss)
+        taken += 1
+    return (total / taken if taken else 0.0), len(labels)
+
+
 def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                 args, seed: int):
     """
@@ -386,6 +451,12 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
     # NOT applied to the category agents: build_warm_start_entries emits
     # action1 as an unmerge BIT, which a 3-way head would read as a category
     # index — silently training "unmerge=1" as "unroll_only".
+    if kind.startswith("category") and args.bandit_warm_epochs > 0:
+        log.warning("    --bandit-warm-epochs %d IGNORED for %s: "
+                    "build_warm_start_entries encodes action1 as an unmerge BIT, "
+                    "which a 3-way head reads as a category index. Setting it to "
+                    "0 changes nothing — this agent never warm-starts.",
+                    args.bandit_warm_epochs, kind)
     if kind == "bandit" and args.bandit_warm_epochs > 0:
         from train import build_warm_start_entries
         ws, n_ws_cells, _ = build_warm_start_entries(
@@ -404,6 +475,11 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                           _mr(args))
 
     best_score, best_snap, best_epoch, since = -float("inf"), _snapshot(agent), 0, 0
+    # Cells the agent has paid for, accumulated across epochs. Grows toward the
+    # full table as epsilon decays, so the contrastive labels sharpen over the
+    # run without ever reading a cell that was not sampled.
+    observed: dict = {}
+    n_supcon = n_labelled = 0
     n_missing = n_updates = 0
     history = [{"epoch": 0, "hold_mean_realized": float("nan"),
                 "hold_accuracy": float("nan"),
@@ -416,9 +492,16 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
         _schedules(agent, kind, epoch, args)
         order = list(fit_loops)
         random.shuffle(order)
-        miss, ups, loss = run_epoch(agent, order, buf, data, args)
+        miss, ups, loss = run_epoch(agent, order, buf, data, args,
+                                    observed)
         n_missing += miss
         n_updates += ups
+        sc_loss, n_lab = supcon_step(agent, fit_loops, observed, data, epoch, args)
+        n_supcon += int(sc_loss != 0.0)
+        # How many loops CLEARED --supcon-min-cells. If this stays near zero the
+        # term never fires and the run silently reduces to the plain agent, so
+        # it is reported rather than inferred from the absence of an effect.
+        n_labelled = max(n_labelled, n_lab)
         if ups == 0:
             continue
 
@@ -442,7 +525,12 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
         history.append({"epoch": epoch, "hold_mean_realized": m["mean_realized"],
                         "hold_accuracy": m["accuracy"],
                         "fit_accuracy": fit_a, "fit_mean_realized": fit_m,
-                        "actor_loss": loss / max(ups, 1)})
+                        "actor_loss": loss / max(ups, 1),
+                        # Without these the curve cannot answer the only
+                        # question that matters for the term: is the embedding
+                        # separating (loss falling) and is coverage growing
+                        # enough for the labels to mean anything (n_labelled).
+                        "supcon_loss": sc_loss, "supcon_labelled": n_lab})
         if m["mean_realized"] > best_score:
             best_score, best_snap, best_epoch, since = (
                 m["mean_realized"], _snapshot(agent), epoch, 0)
@@ -474,6 +562,9 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                    "warm_fit_accuracy": pre["accuracy"],
                    "warm_fit_mean_realized": pre["mean_realized"],
                    "n_updates": n_updates, "n_warm_start_cells": n_ws_cells,
+                   "n_supcon_steps": n_supcon,
+                   "n_supcon_labelled": n_labelled,
+                   "n_observed_cells": sum(len(v) for v in observed.values()),
                    "final_fit_accuracy": fin["accuracy"],
                    "final_fit_mean_realized": fin["mean_realized"],
                    "history": history}
@@ -612,6 +703,8 @@ def run_cv(data: dict, args) -> None:
                 "regression_rate": round(m["regression_rate"], 6),
                 "loops_unmeasured": m["loops_unmeasured"],
                 "n_missing_cells_in_training": info["n_missing_cells"],
+                "n_supcon_steps": info["n_supcon_steps"],
+                "n_supcon_labelled": info["n_supcon_labelled"],
                 # fit at the LAST epoch vs at the val-SELECTED epoch. If the
                 # first keeps rising with --epochs and the second does not, the
                 # limit is selection, not capacity.
@@ -704,6 +797,13 @@ def run_cv(data: dict, args) -> None:
     log.info("\n  confusion, %s init seed %d (rows = truth, cols = predicted)",
              args.agent, sorted(union)[0])
     log.info(format_confusion(pooled[0]))
+    for s_, mm in zip(sorted(union), pooled):
+        acc2, n2 = pairwise_accuracy(mm)
+        log.info("  seed %d | no-op vs unmerge+unroll alone: %.1f%% of %d loops"
+                 "  (chance = 50%%)", s_, 100 * acc2, n2)
+    log.info("  Those two categories are ~86%% of the population. A 3-way "
+             "accuracy that\n  looks reasonable can still sit at chance on the "
+             "call that decides most loops.")
 
     # --- the two spreads, which mean different things ---
     log.info("\n" + "=" * 74)
@@ -861,6 +961,31 @@ def build_parser() -> argparse.ArgumentParser:
                    help="'category*' use the 3-way head in "
                         "analysis/category_agent.py — an isolated test of the "
                         "2-head no-op defect. Nothing in the pipeline changes.")
+    p.add_argument("--supcon-coef", type=float, default=0.0,
+                   help="Weight on the supervised-contrastive term applied to "
+                        "the CATEGORY head's embedding. 0 disables it. Labels "
+                        "come from cells the agent has OBSERVED, never from the "
+                        "reward table, so the term stays online-legitimate.")
+    p.add_argument("--supcon-warmup", type=int, default=15,
+                   help="Epoch floor before the term activates. Early on almost "
+                        "every loop is provisionally no-op (the no-op is free), "
+                        "so applying it immediately would pull everything into "
+                        "one cluster and teach the head to always decline.")
+    p.add_argument("--supcon-min-cells", type=int, default=4,
+                   help="Observed cells a loop needs before it can enter the "
+                        "contrastive batch. The REAL gate: without it, unvisited "
+                        "loops all report 'no-op' by default and flood that "
+                        "cluster with loops carrying no evidence.")
+    p.add_argument("--supcon-batch", type=int, default=128,
+                   help="States per contrastive step. Deliberately much larger "
+                        "than --batch-size: 3 classes at batch 8 gives only "
+                        "~3 same-label pairs.")
+    p.add_argument("--supcon-steps", type=int, default=8,
+                   help="Contrastive steps per epoch. The binding knob: the "
+                        "rollout cadence runs ~76 Q updates per epoch, so 1 "
+                        "step is ~1%% of the optimizer traffic. 8 puts the term "
+                        "at ~10%%, which is a starting point, not a tuned value.")
+    p.add_argument("--supcon-temp", type=float, default=0.1)
     p.add_argument("--q-pessimism", type=float, default=0.0,
                    help="category-bandit only: subtract this from the "
                         "BOOTSTRAPPED transform Q-targets. The no-op target is "
@@ -986,6 +1111,12 @@ def main() -> None:
                 "fresh_agent builds a 2-head agent and the checkpoint's "
                 "category layer is 3-wide. Use --mode cv.")
     torch.set_num_threads(max(1, args.threads))
+    if args.supcon_coef > 0 and not args.agent.startswith("category"):
+        # The term clusters THREE categories on the first head's embedding. The
+        # 2-head agents' first head is a binary unmerge bit — the labels would
+        # not correspond to anything it predicts.
+        p.error("--supcon-coef needs a 3-way head: use --agent category or "
+                "category-bandit")
 
     data = load_run(args.run_dir, args.deadzone, args.labels)
     log.info("Loaded %d loops / %d benchmarks | %d labelled | "

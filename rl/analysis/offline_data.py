@@ -615,6 +615,8 @@ TRAINING_ARGS = (
     "bandit_epsilon_final", "bandit_warm_epochs", "q_pessimism", "logit_cap",
     "entropy_coef", "entropy_coef_final", "entropy_coef_unmerge", "missing",
     "compile_failure_penalty", "score_missing", "threads",
+    "supcon_coef", "supcon_warmup", "supcon_min_cells", "supcon_batch",
+    "supcon_steps", "supcon_temp",
 )
 
 
@@ -638,3 +640,21 @@ def fingerprint(loops: list, args) -> list:
         out.append(("  training args: " if i == 0 else "                 ")
                    + vals[i:i + 88])
     return out
+
+def pairwise_accuracy(m: dict, a: str = "noop", b: str = "unmerge_unroll") -> tuple:
+    """
+    (accuracy, n) on the a-vs-b call alone, over loops whose truth is a or b AND
+    whose prediction is a or b.
+
+    Reported because it is the measured bottleneck, not a generic extra: those
+    two categories are ~86% of the population, and on held-out applications the
+    3-way accuracy hides that the model is at chance between exactly them.
+    Loops predicted as the THIRD category are excluded — they are a different
+    error, and folding them in turns a clean two-way call into a muddle.
+    """
+    conf = m["confusion"]
+    correct = conf[a][a] + conf[b][b]
+    crossed = conf[a][b] + conf[b][a]
+    n = correct + crossed
+    return (correct / n if n else float("nan")), n
+
