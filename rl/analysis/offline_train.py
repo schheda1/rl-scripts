@@ -66,6 +66,7 @@ import torch                                                    # noqa: E402
 
 from offline_data import (_RULE, IDX_TRIP_COUNT, IDX_TRIP_KNOWN,  # noqa: E402
                           NOOP, always_noop_picks, benchmark_dominant_picks,
+                          best_constant_factor,
                           fingerprint, format_confusion, format_report, grouped_kfold,
                           holdout_split, fingerprint, labelled_loops, load_run, loops_for,
                           marginal_picks, marginal_ranking, oracle_picks, pairwise_accuracy,
@@ -83,6 +84,14 @@ log = logging.getLogger("offline")
 logging.getLogger("agent").setLevel(logging.WARNING)
 
 DEVICE = torch.device("cpu")
+
+
+def _nanmean(xs: list) -> float:
+    """Mean over the finite entries. A fold whose held-out slice happens to hold
+    no transform-labelled loop yields NaN, and st.mean would then poison the
+    whole summary line — the same trap the curve's accuracy column hit."""
+    ok = [x for x in xs if x == x]
+    return st.mean(ok) if ok else float("nan")
 
 
 def _mr(args):
@@ -192,6 +201,53 @@ def reward_for(tables: dict, loop: dict, unmerge: int, factor: int):
 
 
 @torch.no_grad()
+@torch.no_grad()
+def factor_probe_picks(agent, loops: list, normalizer, postf: dict,
+                       labels: dict) -> list:
+    """
+    The FACTOR head alone: the category is FORCED to the truth and the policy
+    chooses only the factor.
+
+    Why this and not `capture_factor`. That one restricts to the loops the model
+    happened to get category-right, so the population MOVES between runs — a head
+    that shifts category accuracy is then scored on a different and
+    differently-hard subset, and two runs are not comparable. This probe covers
+    every loop whose true category is a transform, whatever the category head
+    did, so the denominator is a property of the fold and not of the model.
+
+    Category agents only. The 2-head path's factor mask does not exclude factor 1
+    from the unroll branch, so a probe there could answer (0,1) — the no-op —
+    which is a category decision leaking back into a factor measurement. Raising
+    beats reporting a number that means something different per agent.
+    """
+    from adapt_eval import make_state
+    from agent import FACTOR_VALUES
+
+    if not hasattr(agent, "select_category"):
+        raise NotImplementedError(
+            "factor_probe_picks needs a 3-way head (--agent category or "
+            "category-bandit); the 2-head factor mask admits (0,1).")
+    from category_agent import UNMERGE_UNROLL, UNROLL_ONLY, to_pipeline_action
+
+    out = []
+    for l in loops:
+        key = (l["benchmark_name"], l["loop_idx"])
+        truth = labels.get(key)
+        if truth is None or truth == "noop":
+            continue
+        raw = l["pre_features_raw"]
+        known, trip = raw[IDX_TRIP_KNOWN] > 0.5, int(raw[IDX_TRIP_COUNT])
+        cat = UNMERGE_UNROLL if truth == "unmerge_unroll" else UNROLL_ONLY
+        unmerge, _ = to_pipeline_action(cat, 1)
+        # s2 must be built from the FORCED branch, exactly as act() builds it
+        # from the chosen one — the unmerge branch uses post-unmerge features.
+        _, s2 = make_state(l, normalizer, postf, unmerge)
+        f_idx, _, _ = agent.select_factor(s2, cat, trip_known=known,
+                                          trip_count=trip, greedy=True)
+        out.append((key[0], key[1], to_pipeline_action(cat, FACTOR_VALUES[f_idx])))
+    return out
+
+
 def greedy_picks(agent, loops: list, normalizer, postf: dict) -> list:
     """Deployment-mode argmax over a set of loops. Runs every epoch, so no_grad
     is worth it — and it keeps evaluation from ever touching the graph."""
@@ -516,6 +572,11 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
     random.seed(seed)
 
     agent = make_agent(kind, args)
+    if args.factor_head == "scorer":
+        # AFTER make_agent and BEFORE anything reads agent.optimizer: the swap
+        # rebuilds the optimizer, so any reference taken earlier would be stale.
+        from factor_scorer import swap_factor_head
+        swap_factor_head(agent, args.factor_feats)
 
     # MIRROR: train.py:2542 — the bandit warm-starts its Q-heads on cached
     # cells before any rollout. Restricted to FIT loops: build_warm_start_entries
@@ -645,6 +706,21 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                           data["tables"], data["labels"], args.deadzone,
                           _mr(args))
 
+    # THE factor measurement. Category forced to the truth, so the population is
+    # fixed by the fold and the category head cannot move it — unlike
+    # capture_factor, whose subset is whatever the model got category-right.
+    # `probe_const` is model-independent (it depends only on tables and labels),
+    # so it is the same number for every run on this fold: the bar to beat.
+    probe = fin_probe = None
+    if hasattr(agent, "select_category"):
+        probe = score_decisions(
+            factor_probe_picks(agent, fit_loops, data["normalizer"],
+                               data["postf"], data["labels"]),
+            data["tables"], data["labels"], args.deadzone, _mr(args))
+        fin_probe = best_constant_factor(fit_loops, data["tables"],
+                                         data["labels"], args.deadzone,
+                                         _mr(args))
+
     # Three checkpoints, three selection rules. The agent is returned on the
     # val rule (unchanged default); the others are handed back so the caller can
     # score the SAME held-out loops under each and see whether the rule matters.
@@ -670,6 +746,7 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                    "warm_fit_accuracy": pre["accuracy"],
                    "warm_fit_mean_realized": pre["mean_realized"],
                    "warm_fit_capture": pre["capture"],
+                   "warm_fit_capture_factor": pre["capture_factor"],
                    "n_updates": n_updates, "n_warm_start_cells": n_ws_cells,
                    "n_supcon_steps": n_supcon,
                    "n_supcon_labelled": n_labelled,
@@ -680,6 +757,14 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                    "final_fit_accuracy": fin["accuracy"],
                    "final_fit_mean_realized": fin["mean_realized"],
                    "final_fit_capture": fin["capture"],
+                   "final_fit_capture_factor": fin["capture_factor"],
+                   "final_fit_n_factor": fin["n_factor_loops"],
+                   # nan/0 for the 2-head agents, which the probe refuses.
+                   "probe_capture": probe["capture"] if probe else float("nan"),
+                   "probe_n": probe["loops_with_headroom"] if probe else 0,
+                   "probe_regress": probe["n_regress"] if probe else 0,
+                   "probe_const_factor": fin_probe[0] if fin_probe else 0,
+                   "probe_const_capture": fin_probe[1] if fin_probe else float("nan"),
                    "history": history}
 
 
@@ -760,6 +845,22 @@ def run_cv(data: dict, args) -> None:
                 union.setdefault((rule, seed), []).extend(
                     greedy_picks(agent, test_l, data["normalizer"],
                                  data["postf"]))
+            # Factor probe on the HELD-OUT loops, on the FINAL snapshot so it
+            # matches probe_capture_fit — comparing a final-epoch fit number
+            # against a val-selected test number would confound the
+            # architecture with the selection rule. Restored to val below, so
+            # nothing downstream sees the swap.
+            probe_te = probe_te_const = None
+            if hasattr(agent, "select_category"):
+                _restore(agent, info["snapshots"]["final"])
+                probe_te = score_decisions(
+                    factor_probe_picks(agent, test_l, data["normalizer"],
+                                       data["postf"], data["labels"]),
+                    data["tables"], data["labels"], args.deadzone, _mr(args))
+                probe_te_const = best_constant_factor(
+                    test_l, data["tables"], data["labels"], args.deadzone,
+                    _mr(args))
+
             _restore(agent, info["snapshots"]["val"])
             picks = greedy_picks(agent, test_l, data["normalizer"], data["postf"])
             def _sc(ls):
@@ -817,6 +918,13 @@ def run_cv(data: dict, args) -> None:
                 "accuracy_val": round(m_val["accuracy"], 6),
                 "capture": round(m["capture"], 6),
                 "capture_fit": round(m_fit["capture"], 6),
+                # Factor-only capture: the same ratio restricted to loops whose
+                # CATEGORY was already right. `n_factor_*` is its denominator
+                # size — a ratio over a handful of loops is noise, so it is
+                # never reported without the count beside it.
+                "capture_factor": round(m["capture_factor"], 6),
+                "n_factor_loops": m["n_factor_loops"],
+                "capture_factor_val": round(m_val["capture_factor"], 6),
                 "mean_realized_fit": round(m_fit["mean_realized"], 6),
                 "mean_realized_val": round(m_val["mean_realized"], 6),
                 "mean_realized": round(m["mean_realized"], 6),
@@ -848,6 +956,30 @@ def run_cv(data: dict, args) -> None:
                 # (best_epoch 89) across one run's folds. THIS is the column the
                 # factor-ranking criterion is pre-registered against.
                 "capture_fit_final": round(info["final_fit_capture"], 6),
+                # THE primary criterion for any factor-head change.
+                "capture_factor_fit_final": round(
+                    info["final_fit_capture_factor"], 6),
+                "n_factor_loops_fit_final": info["final_fit_n_factor"],
+                "capture_factor_fit_prerollout": round(
+                    info["warm_fit_capture_factor"], 6),
+                # THE decision numbers. probe_* is the factor head alone on a
+                # population the category head cannot move; probe_const_* is the
+                # best single fixed factor on that same population and is
+                # identical for every run on this fold.
+                "probe_capture_fit": round(info["probe_capture"], 6),
+                "probe_n_fit": info["probe_n"],
+                "probe_regress_fit": info["probe_regress"],
+                "probe_const_capture_fit": round(info["probe_const_capture"], 6),
+                "probe_const_factor_fit": info["probe_const_factor"],
+                # Same probe on the HELD-OUT loops, final snapshot.
+                "probe_capture_test": round(
+                    probe_te["capture"], 6) if probe_te else float("nan"),
+                "probe_n_test": probe_te["loops_with_headroom"] if probe_te else 0,
+                "probe_regress_test": probe_te["n_regress"] if probe_te else 0,
+                "probe_const_capture_test": round(
+                    probe_te_const[1], 6) if probe_te_const else float("nan"),
+                "probe_const_factor_test": (probe_te_const[0]
+                                            if probe_te_const else 0),
             })
             if args.curve_out:
                 for h in info["history"]:
@@ -884,6 +1016,63 @@ def run_cv(data: dict, args) -> None:
              "selection, not capacity or training length.",
              100 * st.mean([a for a, _ in _ff]),
              100 * st.mean([b for _, b in _ff]))
+
+    # Factor-only capture on the FIT split at the final epoch. `capture_fit_final`
+    # answers "how much headroom did the policy realise"; this answers "given the
+    # category was right, how good was the factor" — the only one of the two that
+    # a factor-head change can be judged on. nan when no fold had a
+    # category-correct headroom loop, which would itself be the finding.
+    _cf = [(r["capture_factor_fit_final"], r["capture_fit_final"],
+            r["n_factor_loops_fit_final"]) for r in fold_rows
+           if r["capture_factor_fit_final"] == r["capture_factor_fit_final"]]
+    if _cf:
+        log.info("\n  FIT capture %.1f%% overall vs %.1f%% on the loops whose "
+                 "CATEGORY was right\n  (%.0f loops per fold on average). The "
+                 "second number is the factor's own score:\n  category errors "
+                 "are divided out, so a factor-head change moves it and a\n"
+                 "  category-head change does not. The heuristic scores 5.9%% "
+                 "here.",
+                 100 * st.mean([c for _, c, _ in _cf]),
+                 100 * st.mean([f for f, _, _ in _cf]),
+                 st.mean([n for _, _, n in _cf]))
+
+    _pb = [r for r in fold_rows if r["probe_n_fit"] > 0
+           and r["probe_capture_fit"] == r["probe_capture_fit"]]
+    if _pb:
+        log.info(
+            "\n==========================================================\n"
+            "  FACTOR HEAD ALONE — category forced to the truth\n"
+            "==========================================================\n"
+            "  %.0f fit / %.0f held-out loops per fold, fixed by the fold and\n"
+            "  NOT by the model — identical in every run on the same split.\n"
+            "                              FIT       HELD-OUT\n"
+            "    learned factor        %7.1f%%      %7.1f%%\n"
+            "    best constant factor  %7.1f%%      %7.1f%%    (f=%d / f=%d)\n"
+            "    oracle                  100.0%%        100.0%%\n"
+            "    loops made slower     %8.0f     %8.0f\n"
+            "  The constant row is the bar. A learned factor that does not clear\n"
+            "  it is not a factor model, it is an expensive constant — the same\n"
+            "  reading always-no-op forces on the category numbers. Both\n"
+            "  constant rows are model-independent: if they differ between two\n"
+            "  runs on the same split, the comparison is invalid.",
+            st.mean([r["probe_n_fit"] for r in _pb]),
+            st.mean([r["probe_n_test"] for r in _pb]),
+            100 * st.mean([r["probe_capture_fit"] for r in _pb]),
+            100 * _nanmean([r["probe_capture_test"] for r in _pb]),
+            # ORDER MATTERS and an arity check does not catch it: both captures
+            # come first, then both factor indices, matching the row layout
+            # "%.1f%% %.1f%% (f=%d / f=%d)".
+            100 * st.mean([r["probe_const_capture_fit"] for r in _pb]),
+            100 * _nanmean([r["probe_const_capture_test"] for r in _pb]),
+            # sorted(), not set(): set iteration order varies with hash
+            # randomisation, so a tie between two equally common factors would
+            # print differently run to run. Same bug as benchmark_dominant_picks.
+            max(sorted({r["probe_const_factor_fit"] for r in _pb}),
+                key=[r["probe_const_factor_fit"] for r in _pb].count),
+            max(sorted({r["probe_const_factor_test"] for r in _pb}),
+                key=[r["probe_const_factor_test"] for r in _pb].count),
+            st.mean([r["probe_regress_fit"] for r in _pb]),
+            st.mean([r["probe_regress_test"] for r in _pb]))
 
     _acc = [(r["accuracy_fit_final"], r["accuracy_val"], r["accuracy"],
              r["noop_accuracy_test"]) for r in fold_rows]
@@ -1126,6 +1315,12 @@ def warn_ignored_flags(args) -> None:
         log.warning("NOTE --supcon-warmup %d >= --epochs %d: the contrastive "
                     "term can never\n     activate.", args.supcon_warmup,
                     args.epochs)
+    if args.factor_head == "mlp" and args.factor_feats != "basic":
+        log.warning("NOTE --factor-feats %s is IGNORED with --factor-head mlp: "
+                    "the pipeline's\n     FactorActor takes no factor features "
+                    "at all — the factor is an output index.\n     Pass "
+                    "--factor-head scorer to make it mean anything.",
+                    args.factor_feats)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1184,6 +1379,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "be ranked. Below ~2 there is no preference to express.")
     p.add_argument("--rank-steps", type=int, default=8)
     p.add_argument("--rank-batch", type=int, default=128)
+    p.add_argument("--factor-head", choices=("mlp", "scorer"), default="mlp",
+                   help="mlp: the pipeline's FactorActor, where the factor is an "
+                        "OUTPUT INDEX and is never an input. scorer: one shared "
+                        "network scoring (loop, factor) pairs, so factor features "
+                        "reach the model and weights are shared across the ten "
+                        "factors. Parameter count is held within 3%%, so a "
+                        "difference is the featurisation, not capacity.")
+    p.add_argument("--factor-feats", choices=("basic", "interact"),
+                   default="basic",
+                   help="scorer only. basic: 5 intrinsic factor features "
+                        "(f/10, log f, 1/f, is_pow2, f==1). interact: basic plus "
+                        "f x {loopSize, numMemoryInsts, numComputeInsts} — the "
+                        "body-growth interaction. No trip-count features: it is "
+                        "unknown for most loops.")
     p.add_argument("--q-pessimism", type=float, default=0.0,
                    help="category-bandit only: subtract this from the "
                         "BOOTSTRAPPED transform Q-targets. The no-op target is "

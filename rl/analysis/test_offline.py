@@ -353,6 +353,111 @@ def test_oracle(d: dict):
     print("  oracle ceiling             ok")
 
 
+def test_capture_factor_divides_out_category(d: dict):
+    """
+    capture_factor is `capture` restricted to loops whose CATEGORY was already
+    right — the factor's own score. Three properties, each of which has bitten
+    a metric in this file before:
+
+      * the oracle scores exactly 1.0 on it (it is category-correct everywhere
+        by construction, so anything less means the subset is wrong);
+      * always-no-op scores NaN, not 0.0 — the subset is EMPTY, and reporting a
+        zero would read as "the factor captured nothing" when in fact the
+        factor was never exercised;
+      * it is genuinely different from `capture`, i.e. picking the right
+        category and a bad factor is visible here and diluted there.
+    """
+    loops = od.labelled_loops(d)
+
+    m = od.score_decisions(od.oracle_picks(loops, d["tables"], DZ), d["tables"],
+                           d["labels"], DZ)
+    assert approx(m["capture_factor"], 1.0), m["capture_factor"]
+    # Category-correct everywhere means the two subsets coincide for the oracle.
+    assert m["n_factor_loops"] == m["loops_with_headroom"], (
+        m["n_factor_loops"], m["loops_with_headroom"])
+
+    n = od.score_decisions(od.always_noop_picks(loops), d["tables"],
+                           d["labels"], DZ)
+    assert n["n_factor_loops"] == 0, n["n_factor_loops"]
+    assert n["capture_factor"] != n["capture_factor"], \
+        f"empty subset must be NaN, got {n['capture_factor']}"
+
+    # Right category, worst factor: must show up in capture_factor. Built from
+    # the fixture rather than hard-coded so it survives a fixture edit.
+    picks, seen = [], 0
+    for l in loops:
+        key = (l["benchmark_name"], l["loop_idx"])
+        truth = d["labels"][key]
+        cells = [(r, a) for a, r in d["tables"][key].items()
+                 if od.category_of(a) == truth and a != od.NOOP]
+        if truth != "noop" and cells:
+            picks.append((key[0], key[1], min(cells)[1]))   # worst legal cell
+            seen += 1
+        else:
+            picks.append((key[0], key[1], od.NOOP))
+    assert seen > 0, "fixture has no non-noop loop to build the case from"
+    w = od.score_decisions(picks, d["tables"], d["labels"], DZ)
+    assert w["n_factor_loops"] == seen, (w["n_factor_loops"], seen)
+    assert w["capture_factor"] < 1.0, w["capture_factor"]
+    # Same picks, and the two metrics disagree — which is the whole point of
+    # having both: `capture` also carries the no-op loops' zero contribution.
+    assert not approx(w["capture_factor"], w["capture"]), \
+        (w["capture_factor"], w["capture"])
+    print("  capture_factor             ok")
+
+
+def test_factor_scorer_shapes_and_wiring():
+    """
+    The scorer head, and the one way it can fail silently.
+
+    `swap_factor_head` replaces agent.factor_actor AND rebuilds the optimizer.
+    If the rebuild were ever dropped, the optimizer would keep the DISCARDED
+    head's tensors: the run completes, losses fall, every number looks real, and
+    the new head receives no update at all. That is what the param-identity
+    assertions below exist for — nothing downstream would catch it.
+    """
+    import torch
+    from factor_scorer import FactorScorer, N_BASIC, N_INTERACT, swap_factor_head
+    from agent import N_FACTORS, N_FEATURES
+
+    for feats, k in (("basic", N_BASIC), ("interact", N_INTERACT)):
+        h = FactorScorer(feats=feats, logit_cap=4.0)
+        assert h.net[0].in_features == N_FEATURES + k, (feats, h.net[0].in_features)
+        assert h.net[6].out_features == 1
+        for b in (1, 8):
+            out = h.forward(torch.zeros(b, N_FEATURES))
+            assert out.shape == (b, N_FACTORS), (feats, b, out.shape)
+        # The (10,k) table is a BUFFER: as a Parameter it would take weight decay
+        # and drift, turning fixed features into learned embeddings.
+        assert "factor_feats" in dict(h.named_buffers())
+        assert all(p is not h.factor_feats for p in h.parameters())
+        # logit_cap survives the forward override.
+        assert float(h.forward(torch.randn(4, N_FEATURES) * 50).abs().max()) <= 4.0
+
+    # sample/log_prob are INHERITED and must still honour the mask.
+    h = FactorScorer(feats="basic")
+    mask = torch.zeros(N_FACTORS, dtype=torch.bool)
+    mask[3] = True
+    idx, _ = h.sample(torch.zeros(N_FEATURES), mask=mask, greedy=True)
+    assert int(idx) == 3, idx
+
+    args = _args(agent="category", factor_head="scorer", factor_feats="interact")
+    agent = ot.make_agent("category", args)
+    old_ids = {id(p) for p in agent.factor_actor.parameters()}
+    swap_factor_head(agent, "interact")
+    new_ids = {id(p) for p in agent.factor_actor.parameters()}
+    opt_ids = {id(p) for g in agent.optimizer.param_groups for p in g["params"]}
+    assert new_ids <= opt_ids, "new head is NOT in the optimizer — it would never train"
+    assert not (old_ids & opt_ids), "discarded head is still in the optimizer"
+    assert opt_ids == {id(p) for p in agent._all_params}, "_all_params out of sync"
+    # Weight decay must still land only on the >=2-dim tensors, as the agent does.
+    g0, g1 = agent.optimizer.param_groups
+    assert g0["weight_decay"] > 0 and g1["weight_decay"] == 0.0
+    assert all(p.ndim >= 2 for p in g0["params"])
+    assert all(p.ndim < 2 for p in g1["params"])
+    print("  factor scorer + swap       ok")
+
+
 def test_absent_cell_scoring(d: dict):
     """
     An absent cell always counts as a DECISION (accuracy), and what it earns
@@ -1003,6 +1108,8 @@ def main() -> None:
         test_fold_seed_and_init_seed_are_independent()
         test_always_noop(d)
         test_oracle(d)
+        test_capture_factor_divides_out_category(d)
+        test_factor_scorer_shapes_and_wiring()
         test_absent_cell_scoring(d)
         test_regression_and_deadzone(d)
         test_marginal_is_deployable(d)

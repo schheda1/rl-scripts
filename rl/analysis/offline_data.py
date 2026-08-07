@@ -49,7 +49,8 @@ from train import _dedup_loop_records                          # noqa: E402
 # gate on the oracle, and the trip-count restriction on which cells exist at all.
 # label_loops is the definition of ground truth, so anything that has to agree
 # with it comes from it.
-from label_loops import CATEGORIES, valid_factors               # noqa: E402
+from label_loops import (CATEGORIES, FACTOR_VALUES,             # noqa: E402
+                         valid_factors)
 
 LABEL = {"noop": "no-op", "unroll_only": "unroll-only",
          "unmerge_unroll": "unmerge+unroll"}
@@ -450,6 +451,56 @@ def benchmark_dominant_picks(loops: list, tables: dict, labels: dict) -> list:
 # Scoring — decision quality AND performance
 # ---------------------------------------------------------------------------
 
+def constant_factor_picks(loops: list, labels: dict, factor: int) -> list:
+    """
+    Picks for "force the TRUE category, always answer `factor`" — the trivial
+    baseline the factor head has to beat.
+
+    Without it a probe capture of X% is uninterpretable, exactly as 3-way
+    accuracy was uninterpretable before always-no-op's 40.1% sat beside it. The
+    factor head earns its place only by beating the best constant.
+
+    Legality mirrors category_factor_mask (verified at category_agent.py:74-88),
+    not its docstring: the trip-count mask via valid_factors, PLUS factor 1
+    removed from unroll_only because (0,1) IS the no-op. A loop where `factor` is
+    illegal is skipped, so compare the returned length as well as the capture.
+    Action encoding mirrors to_pipeline_action (:106-112): unroll_only -> (0,f),
+    unmerge_unroll -> (1,f).
+    """
+    out = []
+    for l in loops:
+        key = (l["benchmark_name"], l["loop_idx"])
+        truth = labels.get(key)
+        if truth is None or truth == "noop":
+            continue
+        if factor not in valid_factors(l["pre_features_raw"]):
+            continue
+        if truth == "unroll_only":
+            if factor == 1:
+                continue
+            out.append((key[0], key[1], (0, factor)))
+        else:
+            out.append((key[0], key[1], (1, factor)))
+    return out
+
+
+def best_constant_factor(loops: list, tables: dict, labels: dict,
+                         deadzone: float, missing_reward: "float | None" = None):
+    """(factor, capture, n_loops) for the best single fixed factor."""
+    best = (0, float("-inf"), 0)
+    for f in FACTOR_VALUES:
+        picks = constant_factor_picks(loops, labels, f)
+        if not picks:
+            continue
+        m = score_decisions(picks, tables, labels, deadzone, missing_reward)
+        c = m["capture"]
+        # NaN-safe: `c > best[1]` is False for NaN, so a fold with no headroom
+        # never wins by accident.
+        if c == c and c > best[1]:
+            best = (f, c, m["loops_with_headroom"])
+    return best
+
+
 def score_decisions(picks: list, tables: dict, labels: dict,
                     deadzone: float, missing_reward: "float | None" = None) -> dict:
     """
@@ -469,6 +520,15 @@ def score_decisions(picks: list, tables: dict, labels: dict,
     """
     conf = {t: {p: 0 for p in CATEGORIES} for t in CATEGORIES}
     realized_sum = oracle_sum = 0.0
+    # Capture on the loops where the CATEGORY was already right — the factor's
+    # own score, with the category error divided out. Note the denominator needs
+    # no separate within-category maximum: label_loops defines the label as the
+    # category holding the globally best cell, so category-correct implies the
+    # category's best IS the oracle. MIRROR: the heuristic is reported this way
+    # in study_plan.md ("fired AND headroom existed ... captured 5.9%"), and
+    # without it the learned policy has no comparable number.
+    f_realized_sum = f_oracle_sum = 0.0
+    n_factor = 0
     n = n_scored = n_unmeasured = n_regress = n_headroom = 0
     realized_all: list = []
     per_bench: dict = {}
@@ -479,7 +539,8 @@ def score_decisions(picks: list, tables: dict, labels: dict,
         if truth is None:
             continue
         n += 1
-        conf[truth][category_of(action)] += 1
+        pred = category_of(action)
+        conf[truth][pred] += 1
 
         table = tables[key]
         # Gated, so oracle_sum is exactly the sum of label_loops' stored
@@ -512,6 +573,13 @@ def score_decisions(picks: list, tables: dict, labels: dict,
             oracle_sum += orc
             b["realized"] += r
             b["oracle"] += orc
+            # truth == "noop" cannot reach here: its gated oracle is exactly 0.0,
+            # which fails `orc > deadzone`. So this subset is precisely "fired,
+            # fired in the RIGHT category, and there was something to win".
+            if pred == truth:
+                n_factor += 1
+                f_realized_sum += r
+                f_oracle_sum += orc
 
     correct = sum(conf[t][t] for t in CATEGORIES)
     per_cat = {}
@@ -529,6 +597,13 @@ def score_decisions(picks: list, tables: dict, labels: dict,
         "per_category": per_cat,
         "confusion": conf,
         "capture": realized_sum / oracle_sum if oracle_sum > 0 else float("nan"),
+        # The factor's score with the category error divided out. Read this, not
+        # `capture`, when judging a FACTOR-side intervention: `capture` moves
+        # when the category improves (supcon, which never touches the factor,
+        # shifted it +3.9pp), so it cannot attribute a change to the factor.
+        "capture_factor": (f_realized_sum / f_oracle_sum
+                           if f_oracle_sum > 0 else float("nan")),
+        "n_factor_loops": n_factor,
         "oracle_sum": oracle_sum,
         "realized_sum": realized_sum,
         # Mean over EVERY scored loop, not only those with headroom: this is the
@@ -622,6 +697,9 @@ TRAINING_ARGS = (
     "clip_eps", "value_loss_coef",
     "rank_coef", "rank_temp", "rank_warmup", "rank_min_cells", "rank_steps",
     "rank_batch",
+    # Architecture of the factor head. Two runs differing only here are NOT
+    # comparable checkpoints, so they must fingerprint apart.
+    "factor_head", "factor_feats",
 )
 
 
