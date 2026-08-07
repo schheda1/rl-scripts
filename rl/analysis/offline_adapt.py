@@ -59,11 +59,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import torch                                                     # noqa: E402
 
-from offline_data import (always_noop_picks, fingerprint,        # noqa: E402
+from offline_data import (always_noop_picks, best_constant_factor,  # noqa: E402
+                          fingerprint,
                           grouped_kfold, holdout_split, labelled_loops,
                           load_run, loops_for, oracle_of_gated, oracle_picks,
                           score_decisions, table_header, table_row)
-from offline_train import (_mr, build_parser, greedy_picks,      # noqa: E402
+from offline_train import (_mr, build_parser, factor_probe_picks,  # noqa: E402
+                           greedy_picks,
                            train_agent, warn_ignored_flags, write_csv)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
@@ -492,6 +494,19 @@ def run(data: dict, args) -> None:
     # is drawn from a per-(fold,seed) rng, so these differ by seed and a single
     # global ceiling would be the wrong denominator.
     ev: dict = {}
+    # The FACTOR PROBE, zero-shot and adapted, on the same eval loops. Separate
+    # from `zero`/`adapt` because it asks a different question: those score the
+    # whole decision, this forces the category to the truth and scores the
+    # factor alone. Zero-shot the factor head loses to a fixed factor on every
+    # held-out fold, so "does adaptation reach the factor at all" is not
+    # answerable from the accuracy/mean columns — the known few-shot win was
+    # entirely category-side and the factor was never measured.
+    # The eval loops these are scored on are `ev[seed]` — not a third parallel
+    # list. Both are appended under the same `if adapt_l:` guard, so for a
+    # category agent they are identical by construction, and keeping a copy
+    # would only create something that can drift.
+    pz: dict = {}
+    pa: dict = {}
     rows, leaks = [], 0
 
     def _sc(picks):
@@ -536,6 +551,16 @@ def run(data: dict, args) -> None:
                     adapt.setdefault(seed, []).extend(ad)
                     ev.setdefault(seed, []).extend(eval_l)
                     fz.extend(zs); fa.extend(ad)
+                    # Same two models, same loops, category forced to the truth.
+                    # Only for the adapted benchmarks: the k=0 control has no
+                    # adaptation to measure.
+                    if hasattr(base_agent, "select_category"):
+                        pz.setdefault(seed, []).extend(factor_probe_picks(
+                            base_agent, eval_l, data["normalizer"],
+                            data["postf"], data["labels"]))
+                        pa.setdefault(seed, []).extend(factor_probe_picks(
+                            tuned, eval_l, data["normalizer"],
+                            data["postf"], data["labels"]))
                 else:
                     ctrl.setdefault(seed, []).extend(zs)
                     n_k0 += 1
@@ -609,6 +634,43 @@ def run(data: dict, args) -> None:
         log.info("  CONTROL — single-loop benchmarks, 0 adaptation loops "
                  "(scored zero-shot)")
         log.info(table_row("control (k=0)", _sc(sum(ctrl.values(), []))))
+
+    if pz:
+        log.info("\n" + "=" * 92)
+        log.info("  FACTOR HEAD ALONE — category forced to the truth, same "
+                 "evaluation loops")
+        log.info("=" * 92)
+        log.info("  Does adaptation reach the FACTOR? The accuracy and mean "
+                 "columns above cannot\n  say: they move when the CATEGORY "
+                 "improves, and that is where the known\n  few-shot win came "
+                 "from. Here the category is handed to the model, so only\n"
+                 "  the factor choice is being scored.\n")
+        log.info("  seed |  loops |  zero-shot   few-shot     delta | best "
+                 "constant (bar)")
+        log.info("  " + "-" * 68)
+        p_deltas = []
+        for seed in sorted(pz):
+            z, a = _sc(pz[seed]), _sc(pa[seed])
+            # Model-independent: same loops, no model involved. If the learned
+            # factor cannot clear this even AFTER adaptation, few-shot did not
+            # reach the factor.
+            _, bar, _ = best_constant_factor(ev[seed], data["tables"],
+                                             data["labels"], args.deadzone,
+                                             _mr(args))
+            log.info("  %4d | %6d |  %7.1f%%   %7.1f%%  %+7.1fpp | %7.1f%%",
+                     seed, z["loops_with_headroom"], 100 * z["capture"],
+                     100 * a["capture"],
+                     100 * (a["capture"] - z["capture"]), 100 * bar)
+            p_deltas.append(a["capture"] - z["capture"])
+        log.info("  " + "-" * 68)
+        log.info("  mean factor-capture delta over %d seed(s): %+.1fpp"
+                 "   [%+.1f, %+.1f]",
+                 len(p_deltas), 100 * (sum(p_deltas) / len(p_deltas)),
+                 100 * min(p_deltas), 100 * max(p_deltas))
+        log.info("\n  Read the delta against the bar, not against zero. A "
+                 "positive delta that still\n  sits below the constant means "
+                 "adaptation improved a factor model that is\n  worse than "
+                 "picking one fixed number.")
 
     def _spread(vals, label, pct):
         f = (lambda v: f"{100 * v:+.1f}pp") if pct else (lambda v: f"{v:+.4f}")
