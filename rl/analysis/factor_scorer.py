@@ -176,10 +176,11 @@ class FactorScorer(FactorActor):
         return out
 
 
-def swap_factor_head(agent, feats: str):
+def swap_factor_head(agent, factory):
     """
-    Replace `agent.factor_actor` with a FactorScorer, IN PLACE, rebuilding the
-    optimizer.
+    Replace `agent.factor_actor` with `factory(logit_cap)`, IN PLACE, rebuilding
+    the optimizer. Architecture-agnostic on purpose: one rebuild, so a second
+    head type cannot arrive with a second copy of this logic that drifts.
 
     The rebuild is the whole point. Every agent builds `_all_params` and the
     AdamW groups from the three modules' parameters inside __init__
@@ -196,15 +197,21 @@ def swap_factor_head(agent, feats: str):
         cannot drift if the pipeline ever changes how it builds them.
 
     The decay/no-decay split (`ndim >= 2` -> decay) is duplicated from the agent
-    because there is no accessor for it; `test_swap_rebuilds_optimizer` asserts
-    the resulting groups match a freshly built agent's.
+    because there is no accessor for it. `test_factor_scorer_shapes_and_wiring`
+    and `test_factor_attn_head` assert that the new head's parameters are in the
+    optimizer, the old head's are not, and `_all_params` agrees with it.
+
+    CONSEQUENCE worth knowing for the attention head: its positional embedding is
+    2-D, so this rule puts it in the WEIGHT-DECAY group. That is consistent with
+    how the agent treats every other 2-D tensor, and it is not special-cased
+    here — but it does mean the position signal is pulled toward zero over
+    training, which is not what a transformer implementation would normally do.
     """
     old = agent.factor_actor
     lr = agent.optimizer.param_groups[0]["lr"]
     wd = agent.optimizer.param_groups[0]["weight_decay"]
 
-    agent.factor_actor = FactorScorer(
-        feats=feats, logit_cap=getattr(old, "logit_cap", 0.0)).to(agent.device)
+    agent.factor_actor = factory(getattr(old, "logit_cap", 0.0)).to(agent.device)
 
     decay, no_decay = [], []
     for m in (agent.unmerge_actor, agent.factor_actor, agent.critic):

@@ -486,19 +486,32 @@ def constant_factor_picks(loops: list, labels: dict, factor: int) -> list:
 
 def best_constant_factor(loops: list, tables: dict, labels: dict,
                          deadzone: float, missing_reward: "float | None" = None):
-    """(factor, capture, n_loops) for the best single fixed factor."""
-    best = (0, float("-inf"), 0)
+    """
+    (factor, capture, n_loops) for the best single fixed factor, or
+    (0, nan, 0) when no factor scores finitely on these loops.
+
+    NaN and not -inf for the empty case. -inf survives every NaN filter
+    downstream (`x == x` is True for -inf), so it would reach the report mean
+    and turn the whole summary line into -inf after a full run rather than
+    being skipped like a missing value.
+
+    Candidates are collected and maximised at the end rather than tracked in a
+    running best: ties then break to the LOWER factor, matching the study's
+    tie convention everywhere else, instead of to whichever came first.
+    """
+    cands = []
     for f in FACTOR_VALUES:
         picks = constant_factor_picks(loops, labels, f)
         if not picks:
             continue
         m = score_decisions(picks, tables, labels, deadzone, missing_reward)
         c = m["capture"]
-        # NaN-safe: `c > best[1]` is False for NaN, so a fold with no headroom
-        # never wins by accident.
-        if c == c and c > best[1]:
-            best = (f, c, m["loops_with_headroom"])
-    return best
+        if c == c:                       # skip NaN (no headroom for this factor)
+            cands.append((c, f, m["loops_with_headroom"]))
+    if not cands:
+        return 0, float("nan"), 0
+    c, f, n = max(cands, key=lambda t: (t[0], -t[1]))
+    return f, c, n
 
 
 def score_decisions(picks: list, tables: dict, labels: dict,
@@ -700,6 +713,7 @@ TRAINING_ARGS = (
     # Architecture of the factor head. Two runs differing only here are NOT
     # comparable checkpoints, so they must fingerprint apart.
     "factor_head", "factor_feats",
+    "attn_tokens", "attn_heads", "attn_blocks",
 )
 
 

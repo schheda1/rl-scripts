@@ -466,7 +466,8 @@ def test_factor_scorer_shapes_and_wiring():
     args = _args(agent="category", factor_head="scorer", factor_feats="interact")
     agent = ot.make_agent("category", args)
     old_ids = {id(p) for p in agent.factor_actor.parameters()}
-    swap_factor_head(agent, "interact")
+    swap_factor_head(agent, lambda cap: FactorScorer(feats="interact",
+                                                     logit_cap=cap))
     new_ids = {id(p) for p in agent.factor_actor.parameters()}
     opt_ids = {id(p) for g in agent.optimizer.param_groups for p in g["params"]}
     assert new_ids <= opt_ids, "new head is NOT in the optimizer — it would never train"
@@ -478,6 +479,76 @@ def test_factor_scorer_shapes_and_wiring():
     assert all(p.ndim >= 2 for p in g0["params"])
     assert all(p.ndim < 2 for p in g1["params"])
     print("  factor scorer + swap       ok")
+
+
+def test_factor_attn_head():
+    """
+    The attention head: input projection -> attention -> output projection, with
+    the dense hidden layer REMOVED.
+
+    The load-bearing check is the net layout. `forward` is inherited from _MLP
+    (so logit_cap cannot be dropped) and `offline_adapt._freeze_for_adaptation`
+    resolves layers by INDEX — {1:[6], 2:[3,4,6], 3:[0,1,3,4,6]}. If any of
+    those indices stopped holding parameters, adaptation would silently
+    fine-tune nothing and every few-shot number would be quietly wrong.
+    """
+    import torch
+    import torch.nn as nn
+    from agent import N_FACTORS, N_FEATURES
+    from factor_attn import AttnStack, FactorAttnActor, param_delta
+    from factor_scorer import swap_factor_head
+
+    for tokens, heads, blocks in ((8, 4, 1), (8, 4, 2), (16, 2, 1)):
+        h = FactorAttnActor(tokens=tokens, heads=heads, blocks=blocks,
+                            logit_cap=4.0)
+        assert isinstance(h.net[0], nn.Linear) and h.net[0].in_features == N_FEATURES
+        assert isinstance(h.net[3], AttnStack)
+        assert isinstance(h.net[6], nn.Linear), type(h.net[6])
+        # Output projection reads the FLATTENED token stack, not a 64-d hidden.
+        assert h.net[6].in_features == 128, h.net[6].in_features
+        assert h.net[6].out_features == N_FACTORS
+        # No dense hidden layer survives between the projections.
+        assert not any(isinstance(h.net[i], nn.Linear) for i in (2, 3, 4, 5))
+        # Every freeze index must still carry parameters.
+        for i in (0, 1, 3, 4, 6):
+            assert list(h.net[i].parameters()), f"net[{i}] has no parameters"
+        assert len(h.net) == 7, len(h.net)
+        for b in (1, 8):
+            out = h.forward(torch.zeros(b, N_FEATURES))
+            assert out.shape == (b, N_FACTORS), (tokens, heads, blocks, out.shape)
+        # logit_cap comes from the INHERITED forward, not a re-implementation.
+        assert float(h.forward(torch.randn(8, N_FEATURES) * 50).abs().max()) <= 4.0
+        assert len(h.net[3].attn) == blocks and len(h.net[3].norm) == blocks
+
+    # Bad geometry must fail loudly, not silently reshape.
+    for bad in (dict(tokens=7), dict(tokens=8, heads=3)):
+        try:
+            FactorAttnActor(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} should have raised")
+
+    base, att, pct = param_delta(8, 4, 1)
+    assert att < base, (att, base)          # the dense layer is gone
+    print(f"    attn head {att} params vs dense {base} ({pct:+.1f}%)")
+
+    h = FactorAttnActor()
+    mask = torch.zeros(N_FACTORS, dtype=torch.bool)
+    mask[5] = True
+    idx, _ = h.sample(torch.zeros(N_FEATURES), mask=mask, greedy=True)
+    assert int(idx) == 5, idx
+
+    args = _args(agent="category", factor_head="attn")
+    agent = ot.make_agent("category", args)
+    old_ids = {id(p) for p in agent.factor_actor.parameters()}
+    swap_factor_head(agent, lambda cap: FactorAttnActor(logit_cap=cap))
+    new_ids = {id(p) for p in agent.factor_actor.parameters()}
+    opt_ids = {id(p) for g in agent.optimizer.param_groups for p in g["params"]}
+    assert new_ids <= opt_ids, "attn head is NOT in the optimizer"
+    assert not (old_ids & opt_ids), "discarded head still in the optimizer"
+    assert opt_ids == {id(p) for p in agent._all_params}
+    print("  factor attention head      ok")
 
 
 def test_absent_cell_scoring(d: dict):
@@ -1132,6 +1203,7 @@ def main() -> None:
         test_oracle(d)
         test_capture_factor_divides_out_category(d)
         test_factor_scorer_shapes_and_wiring()
+        test_factor_attn_head()
         test_absent_cell_scoring(d)
         test_regression_and_deadzone(d)
         test_marginal_is_deployable(d)

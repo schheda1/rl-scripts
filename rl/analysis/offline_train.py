@@ -86,6 +86,25 @@ logging.getLogger("agent").setLevel(logging.WARNING)
 DEVICE = torch.device("cpu")
 
 
+def _modal_factor(rows: list, key: str, n_key: str) -> int:
+    """
+    Most common constant factor across folds, skipping folds whose probe
+    population was empty.
+
+    Two things it must not do. It must not count the 0 placeholder a fold with
+    no probe loops writes — 0 is not a factor, and one such fold would vote in a
+    value FACTOR_VALUES does not contain. And it must not iterate a set: set
+    order varies with hash randomisation, so a tie between two equally common
+    factors would print differently run to run (the bug already fixed once in
+    benchmark_dominant_picks). sorted() makes ties break to the lower factor,
+    matching the tie convention used everywhere else.
+    """
+    vals = [r[key] for r in rows if r.get(n_key, 0) > 0 and r[key]]
+    if not vals:
+        return 0
+    return max(sorted(set(vals)), key=vals.count)
+
+
 def _nanmean(xs: list) -> float:
     """Mean over the finite entries. A fold whose held-out slice happens to hold
     no transform-labelled loop yields NaN, and st.mean would then poison the
@@ -572,11 +591,20 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
     random.seed(seed)
 
     agent = make_agent(kind, args)
-    if args.factor_head == "scorer":
+    if args.factor_head != "mlp":
         # AFTER make_agent and BEFORE anything reads agent.optimizer: the swap
         # rebuilds the optimizer, so any reference taken earlier would be stale.
-        from factor_scorer import swap_factor_head
-        swap_factor_head(agent, args.factor_feats)
+        from factor_scorer import FactorScorer, swap_factor_head
+        if args.factor_head == "scorer":
+            def _factory(cap, _f=args.factor_feats):
+                return FactorScorer(feats=_f, logit_cap=cap)
+        else:
+            from factor_attn import FactorAttnActor
+            def _factory(cap, _t=args.attn_tokens, _h=args.attn_heads,
+                         _b=args.attn_blocks):
+                return FactorAttnActor(tokens=_t, heads=_h, blocks=_b,
+                                       logit_cap=cap)
+        swap_factor_head(agent, _factory)
 
     # MIRROR: train.py:2542 — the bandit warm-starts its Q-heads on cached
     # cells before any rollout. Restricted to FIT loops: build_warm_start_entries
@@ -760,11 +788,18 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                    "final_fit_capture_factor": fin["capture_factor"],
                    "final_fit_n_factor": fin["n_factor_loops"],
                    # nan/0 for the 2-head agents, which the probe refuses.
-                   "probe_capture": probe["capture"] if probe else float("nan"),
-                   "probe_n": probe["loops_with_headroom"] if probe else 0,
-                   "probe_regress": probe["n_regress"] if probe else 0,
-                   "probe_const_factor": fin_probe[0] if fin_probe else 0,
-                   "probe_const_capture": fin_probe[1] if fin_probe else float("nan"),
+                   # `is not None`, not truthiness: probe is a dict and
+                   # fin_probe a tuple, and an empty one of either would read as
+                   # "no probe ran" when it actually means "the probe ran and
+                   # found nothing" — different things, different columns.
+                   "probe_capture": (probe["capture"]
+                                     if probe is not None else float("nan")),
+                   "probe_n": (probe["loops_with_headroom"]
+                               if probe is not None else 0),
+                   "probe_regress": probe["n_regress"] if probe is not None else 0,
+                   "probe_const_factor": fin_probe[0] if fin_probe is not None else 0,
+                   "probe_const_capture": (fin_probe[1] if fin_probe is not None
+                                           else float("nan")),
                    "history": history}
 
 
@@ -972,14 +1007,17 @@ def run_cv(data: dict, args) -> None:
                 "probe_const_capture_fit": round(info["probe_const_capture"], 6),
                 "probe_const_factor_fit": info["probe_const_factor"],
                 # Same probe on the HELD-OUT loops, final snapshot.
-                "probe_capture_test": round(
-                    probe_te["capture"], 6) if probe_te else float("nan"),
-                "probe_n_test": probe_te["loops_with_headroom"] if probe_te else 0,
-                "probe_regress_test": probe_te["n_regress"] if probe_te else 0,
-                "probe_const_capture_test": round(
-                    probe_te_const[1], 6) if probe_te_const else float("nan"),
+                "probe_capture_test": (round(probe_te["capture"], 6)
+                                       if probe_te is not None else float("nan")),
+                "probe_n_test": (probe_te["loops_with_headroom"]
+                                 if probe_te is not None else 0),
+                "probe_regress_test": (probe_te["n_regress"]
+                                       if probe_te is not None else 0),
+                "probe_const_capture_test": (round(probe_te_const[1], 6)
+                                             if probe_te_const is not None
+                                             else float("nan")),
                 "probe_const_factor_test": (probe_te_const[0]
-                                            if probe_te_const else 0),
+                                            if probe_te_const is not None else 0),
             })
             if args.curve_out:
                 for h in info["history"]:
@@ -1057,20 +1095,19 @@ def run_cv(data: dict, args) -> None:
             "  runs on the same split, the comparison is invalid.",
             st.mean([r["probe_n_fit"] for r in _pb]),
             st.mean([r["probe_n_test"] for r in _pb]),
-            100 * st.mean([r["probe_capture_fit"] for r in _pb]),
+            # _nanmean throughout, including the fit columns that _pb has
+            # already filtered. Two different reducers over columns that must be
+            # read side by side is how one of them silently becomes -inf or NaN
+            # while the other looks fine.
+            100 * _nanmean([r["probe_capture_fit"] for r in _pb]),
             100 * _nanmean([r["probe_capture_test"] for r in _pb]),
             # ORDER MATTERS and an arity check does not catch it: both captures
             # come first, then both factor indices, matching the row layout
             # "%.1f%% %.1f%% (f=%d / f=%d)".
-            100 * st.mean([r["probe_const_capture_fit"] for r in _pb]),
+            100 * _nanmean([r["probe_const_capture_fit"] for r in _pb]),
             100 * _nanmean([r["probe_const_capture_test"] for r in _pb]),
-            # sorted(), not set(): set iteration order varies with hash
-            # randomisation, so a tie between two equally common factors would
-            # print differently run to run. Same bug as benchmark_dominant_picks.
-            max(sorted({r["probe_const_factor_fit"] for r in _pb}),
-                key=[r["probe_const_factor_fit"] for r in _pb].count),
-            max(sorted({r["probe_const_factor_test"] for r in _pb}),
-                key=[r["probe_const_factor_test"] for r in _pb].count),
+            _modal_factor(_pb, "probe_const_factor_fit", "probe_n_fit"),
+            _modal_factor(_pb, "probe_const_factor_test", "probe_n_test"),
             st.mean([r["probe_regress_fit"] for r in _pb]),
             st.mean([r["probe_regress_test"] for r in _pb]))
 
@@ -1315,6 +1352,22 @@ def warn_ignored_flags(args) -> None:
         log.warning("NOTE --supcon-warmup %d >= --epochs %d: the contrastive "
                     "term can never\n     activate.", args.supcon_warmup,
                     args.epochs)
+    if args.factor_head == "attn":
+        # Capacity is NOT held constant here: removing Linear(128,64) takes out
+        # 8,256 parameters and an attention block adds ~1,100. Printed once so
+        # the change is a stated caveat rather than a hidden confound.
+        from factor_attn import param_delta
+        base, att, pct = param_delta(args.attn_tokens, args.attn_heads,
+                                     args.attn_blocks, args.logit_cap)
+        log.info("NOTE factor head is ATTENTION: %d params vs the dense head's "
+                 "%d (%+.1f%%).\n     The dense hidden layer is REMOVED, so a "
+                 "negative result is confounded with the\n     capacity drop; "
+                 "only a positive result is clean.", att, base, pct)
+    if args.factor_head != "attn" and (args.attn_tokens != 8
+                                       or args.attn_heads != 4
+                                       or args.attn_blocks != 1):
+        log.warning("NOTE --attn-* are IGNORED with --factor-head %s.",
+                    args.factor_head)
     if args.factor_head == "mlp" and args.factor_feats != "basic":
         log.warning("NOTE --factor-feats %s is IGNORED with --factor-head mlp: "
                     "the pipeline's\n     FactorActor takes no factor features "
@@ -1379,13 +1432,27 @@ def build_parser() -> argparse.ArgumentParser:
                         "be ranked. Below ~2 there is no preference to express.")
     p.add_argument("--rank-steps", type=int, default=8)
     p.add_argument("--rank-batch", type=int, default=128)
-    p.add_argument("--factor-head", choices=("mlp", "scorer"), default="mlp",
+    p.add_argument("--attn-tokens", type=int, default=8,
+                   help="--factor-head attn only. The 128-d hidden vector is "
+                        "reshaped into this many tokens before self-attention; "
+                        "must divide 128. NOTE the token boundaries are "
+                        "arbitrary slices of hidden units, not features.")
+    p.add_argument("--attn-heads", type=int, default=4,
+                   help="--factor-head attn only. Must divide 128/--attn-tokens.")
+    p.add_argument("--attn-blocks", type=int, default=1, choices=(1, 2),
+                   help="--factor-head attn only. Self-attention blocks back to "
+                        "back at constant width. No FFN inside them — an FFN is "
+                        "two dense layers, which is what this head removes.")
+    p.add_argument("--factor-head", choices=("mlp", "scorer", "attn"),
+                   default="mlp",
                    help="mlp: the pipeline's FactorActor, where the factor is an "
                         "OUTPUT INDEX and is never an input. scorer: one shared "
-                        "network scoring (loop, factor) pairs, so factor features "
-                        "reach the model and weights are shared across the ten "
-                        "factors. Parameter count is held within 3%%, so a "
-                        "difference is the featurisation, not capacity.")
+                        "network scoring (loop, factor) pairs (DISCARDED "
+                        "2026-08-07, kept for reproduction). attn: mlp with the "
+                        "hidden dense layer net[3] replaced by a self-attention "
+                        "block over the 128-d hidden vector — the factor is "
+                        "STILL an output index; only how the 93 loop features "
+                        "mix is changed. Parameter delta is logged at startup.")
     p.add_argument("--factor-feats", choices=("basic", "interact"),
                    default="basic",
                    help="scorer only. basic: 5 intrinsic factor features "
