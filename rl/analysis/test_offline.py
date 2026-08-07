@@ -399,10 +399,32 @@ def test_capture_factor_divides_out_category(d: dict):
     w = od.score_decisions(picks, d["tables"], d["labels"], DZ)
     assert w["n_factor_loops"] == seen, (w["n_factor_loops"], seen)
     assert w["capture_factor"] < 1.0, w["capture_factor"]
-    # Same picks, and the two metrics disagree — which is the whole point of
-    # having both: `capture` also carries the no-op loops' zero contribution.
-    assert not approx(w["capture_factor"], w["capture"]), \
+    # These picks are category-PERFECT, so every headroom loop is in both
+    # subsets and the two metrics must COINCIDE. That identity is the proof the
+    # subset is built right: a capture_factor that drifted from capture here
+    # would mean the filter is admitting or dropping the wrong loops. (The
+    # no-op-truth loops contribute to NEITHER — their gated oracle is 0.0, so
+    # they fail the headroom gate before either accumulator sees them.)
+    assert approx(w["capture_factor"], w["capture"]), \
         (w["capture_factor"], w["capture"])
+
+    # Now flip ONE headroom loop to the wrong category. It leaves the
+    # capture_factor subset but stays in capture's, so the two must part — this
+    # is what makes capture_factor a different measurement rather than an alias,
+    # and it is exactly the drift that makes capture_factor unusable for
+    # comparing two models: the subset moves with the category head.
+    flipped, done = [], False
+    for bench, li, a in picks:
+        if not done and d["labels"][(bench, li)] != "noop" and a != od.NOOP:
+            flipped.append((bench, li, od.NOOP))
+            done = True
+        else:
+            flipped.append((bench, li, a))
+    assert done, "no category-correct headroom pick to flip"
+    x = od.score_decisions(flipped, d["tables"], d["labels"], DZ)
+    assert x["n_factor_loops"] == seen - 1, (x["n_factor_loops"], seen)
+    assert not approx(x["capture_factor"], x["capture"]), \
+        (x["capture_factor"], x["capture"])
     print("  capture_factor             ok")
 
 
