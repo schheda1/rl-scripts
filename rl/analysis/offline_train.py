@@ -669,6 +669,7 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                    "n_missing_cells": n_missing,
                    "warm_fit_accuracy": pre["accuracy"],
                    "warm_fit_mean_realized": pre["mean_realized"],
+                   "warm_fit_capture": pre["capture"],
                    "n_updates": n_updates, "n_warm_start_cells": n_ws_cells,
                    "n_supcon_steps": n_supcon,
                    "n_supcon_labelled": n_labelled,
@@ -678,6 +679,7 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                    "n_observed_cells": sum(len(v) for v in observed.values()),
                    "final_fit_accuracy": fin["accuracy"],
                    "final_fit_mean_realized": fin["mean_realized"],
+                   "final_fit_capture": fin["capture"],
                    "history": history}
 
 
@@ -836,9 +838,16 @@ def run_cv(data: dict, args) -> None:
                 "accuracy_fit_prerollout": round(info["warm_fit_accuracy"], 6),
                 "mean_realized_fit_prerollout": round(
                     info["warm_fit_mean_realized"], 6),
+                "capture_fit_prerollout": round(info["warm_fit_capture"], 6),
                 "accuracy_fit_final": round(info["final_fit_accuracy"], 6),
                 "mean_realized_fit_final": round(
                     info["final_fit_mean_realized"], 6),
+                # capture_fit above is scored on the VAL-SELECTED snapshot, so it
+                # reports which epoch selection landed on as much as it reports
+                # factor quality — it ranged 0.04 (best_epoch 1) to 0.80
+                # (best_epoch 89) across one run's folds. THIS is the column the
+                # factor-ranking criterion is pre-registered against.
+                "capture_fit_final": round(info["final_fit_capture"], 6),
             })
             if args.curve_out:
                 for h in info["history"]:
