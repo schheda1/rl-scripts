@@ -216,7 +216,7 @@ class CategoryAgent:
 
     def ppo_update(self, buffer: RolloutBuffer) -> dict:
         """Clipped PPO over both heads. Same name/signature as agent.Agent."""
-        tot_a = tot_v = tot_e = 0.0
+        tot_a = tot_v = tot_e = tot_ec = tot_ef = 0.0
         n = 0
         for _ in range(self.K):
             with torch.no_grad():
@@ -253,27 +253,39 @@ class CategoryAgent:
                 ent_c = _policy_entropy(
                     self.unmerge_actor.forward(s1).masked_fill(
                         ~m1, float("-inf")))
-                ent_f = torch.zeros(())
+                ent_f = torch.zeros((), device=self.device)
                 if fa.any():
                     nlp2 = self.factor_actor.log_prob(s2[fa], a2[fa], mask=m2[fa])
                     loss_a = loss_a + _clipped_pg_loss(nlp2, olp2[fa], adv[fa],
-                                                 self.clip_eps)
-                    ent_f = _policy_entropy(self.factor_actor.forward(s2[fa]).masked_fill(
-                        ~m2[fa], float("-inf")))
+                                                       self.clip_eps)
+                    ent_f = _policy_entropy(
+                        self.factor_actor.forward(s2[fa]).masked_fill(
+                            ~m2[fa], float("-inf")))
+                # Computed ONCE. agent.Agent does the same; recomputing it after
+                # backward() just to log it builds a second graph node for a
+                # number already in hand.
+                value_loss = F.mse_loss(values, r)
                 loss = (loss_a
+                        + self.value_loss_coef * value_loss
                         - self.entropy_coef_category * ent_c
-                        - self.entropy_coef * ent_f
-                        + self.value_loss_coef * F.mse_loss(values, r))
+                        - self.entropy_coef * ent_f)
                 self.optimizer.zero_grad()
                 loss.backward()
                 if self.max_grad_norm > 0:
                     nn.utils.clip_grad_norm_(self._all_params, self.max_grad_norm)
                 self.optimizer.step()
-                tot_a += float(loss_a); tot_v += float(F.mse_loss(values, r))
-                tot_e += float(ent_c); n += 1
+                tot_a += float(loss_a)
+                tot_v += float(value_loss)
+                # MIRROR agent.Agent: "entropy" is the SUM over both heads, so
+                # the column means the same thing whichever agent produced it.
+                # Per-head values go in their own keys, as there.
+                tot_e += float(ent_c) + float(ent_f)
+                tot_ec += float(ent_c); tot_ef += float(ent_f)
+                n += 1
         d = max(n, 1)
         return {"actor_loss": tot_a / d, "value_loss": tot_v / d,
-                "entropy": tot_e / d}
+                "entropy": tot_e / d, "entropy_unmerge": tot_ec / d,
+                "entropy_factor": tot_ef / d}
 
     def save(self, path: str) -> None:
         torch.save({"unmerge_actor": self.unmerge_actor.state_dict(),
@@ -380,14 +392,18 @@ class CategoryBanditAgent(CategoryAgent):
                 if fa.any():
                     q2 = q2_all[fa].gather(1, a2[fa].unsqueeze(1)).squeeze(1)
                     q_loss = q_loss + F.mse_loss(q2, r[fa])
-                loss = q_loss + self.value_loss_coef * F.mse_loss(values, r)
+                # Once, as agent.BanditAgent does — the logging line below
+                # reuses it rather than rebuilding the same number.
+                value_loss = F.mse_loss(values, r)
+                loss = q_loss + self.value_loss_coef * value_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 if self.max_grad_norm > 0:
                     nn.utils.clip_grad_norm_(self._all_params, self.max_grad_norm)
                 self.optimizer.step()
-                tot_q += float(q_loss); tot_v += float(F.mse_loss(values, r))
+                tot_q += float(q_loss)
+                tot_v += float(value_loss)
                 n += 1
         d = max(n, 1)
         return {"actor_loss": tot_q / d, "value_loss": tot_v / d,
