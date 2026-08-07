@@ -620,6 +620,8 @@ TRAINING_ARGS = (
     # PPO-only, but they reach make_agent for every kind, so a run that varies
     # them is a different training run and must fingerprint differently.
     "clip_eps", "value_loss_coef",
+    "rank_coef", "rank_temp", "rank_warmup", "rank_min_cells", "rank_steps",
+    "rank_batch",
 )
 
 

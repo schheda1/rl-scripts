@@ -431,6 +431,53 @@ def supcon_step(agent, fit_loops: list, observed: dict, data: dict,
     return (total / taken if taken else 0.0), len(labels)
 
 
+def factor_rank_step(agent, kind: str, fit_loops: list, observed: dict,
+                     data: dict, epoch: int, args) -> tuple:
+    """
+    Soft-target ranking updates on the FACTOR head. See analysis/factor_rank.py.
+
+    A separate optimizer step, for the same reasons as supcon_step: agent.py
+    stays untouched and the term wants a larger batch than the rollout's 8. The
+    batch is resampled every step — a fixed batch stepped N times is N steps of
+    memorising one draw, which is exactly what the first supcon implementation
+    did.
+
+    Returns (mean loss, n_rankable_rows, calibration). Calibration is mean
+    |Q2 - r| and is meaningful for the BANDIT only, where Q1 backs up max_f Q2
+    and so depends on Q2 keeping reward scale; it is NaN for PPO, whose head
+    emits logits and is not supposed to be calibrated at all.
+    """
+    from factor_rank import branch_rows, factor_calibration, is_active, rank_loss
+
+    states, masks, targets, rewards = branch_rows(
+        fit_loops, observed, data, args.rank_temp, args.rank_min_cells)
+    if not is_active(epoch, len(states), args):
+        return 0.0, len(states), float("nan")
+
+    S, M, T = torch.stack(states), torch.stack(masks), torch.stack(targets)
+    n_rows = S.size(0)
+    bs = min(args.rank_batch, n_rows)
+
+    total, taken = 0.0, 0
+    for _ in range(max(1, args.rank_steps)):
+        idx = torch.randperm(n_rows)[:bs]
+        loss = args.rank_coef * rank_loss(
+            agent.factor_actor.forward(S[idx]), T[idx], M[idx])
+        if float(loss) == 0.0:
+            continue
+        agent.optimizer.zero_grad()
+        loss.backward()
+        if agent.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(agent._all_params, agent.max_grad_norm)
+        agent.optimizer.step()
+        total += float(loss)
+        taken += 1
+
+    cal = (factor_calibration(agent, S, M, torch.stack(rewards))
+           if kind.endswith("bandit") else float("nan"))
+    return (total / taken if taken else 0.0), n_rows, cal
+
+
 def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                 args, seed: int):
     """
@@ -484,7 +531,9 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
     # full table as epsilon decays, so the contrastive labels sharpen over the
     # run without ever reading a cell that was not sampled.
     observed: dict = {}
-    n_supcon = n_labelled = 0
+    n_supcon = n_labelled = n_rankstep = 0
+    n_rank = 0
+    rk_cal = float("nan")
     n_missing = n_updates = 0
     # Same keys as the per-epoch rows below. This row is built BEFORE the loop,
     # so any field added to the loop's history entry must be mirrored here or
@@ -495,7 +544,9 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                 "fit_accuracy": pre["accuracy"],
                 "fit_mean_realized": pre["mean_realized"],
                 "actor_loss": float("nan"),
-                "supcon_loss": float("nan"), "supcon_labelled": 0}]
+                "supcon_loss": float("nan"), "supcon_labelled": 0,
+                "rank_loss": float("nan"), "rank_rows": 0,
+                "factor_calibration": float("nan")}]
     buf = RolloutBuffer(capacity=args.buffer_size)
 
     for epoch in range(1, args.epochs + 1):
@@ -508,6 +559,9 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
         n_updates += ups
         sc_loss, n_lab = supcon_step(agent, fit_loops, observed, data, epoch, args)
         n_supcon += int(sc_loss != 0.0)
+        rk_loss, n_rank, rk_cal = factor_rank_step(
+            agent, kind, fit_loops, observed, data, epoch, args)
+        n_rankstep += int(rk_loss != 0.0)
         # How many loops CLEARED --supcon-min-cells. If this stays near zero the
         # term never fires and the run silently reduces to the plain agent, so
         # it is reported rather than inferred from the absence of an effect.
@@ -540,7 +594,12 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                         # question that matters for the term: is the embedding
                         # separating (loss falling) and is coverage growing
                         # enough for the labels to mean anything (n_labelled).
-                        "supcon_loss": sc_loss, "supcon_labelled": n_lab})
+                        "supcon_loss": sc_loss, "supcon_labelled": n_lab,
+                        # rank_rows is the count of (loop, branch) pairs with
+                        # enough observed factors to rank; if it stays at 0 the
+                        # term never fired and nothing below it means anything.
+                        "rank_loss": rk_loss, "rank_rows": n_rank,
+                        "factor_calibration": rk_cal})
         # Best-FIT checkpoint, tracked independently of val. Selecting on ~17
         # held-out benchmarks is a noisy criterion, and there is no reason to
         # assume the epoch that maximises a small val slice is the one that
@@ -596,6 +655,8 @@ def train_agent(kind: str, fit_loops: list, hold_loops: list, data: dict,
                    "n_updates": n_updates, "n_warm_start_cells": n_ws_cells,
                    "n_supcon_steps": n_supcon,
                    "n_supcon_labelled": n_labelled,
+                   "n_rank_steps": n_rankstep, "n_rank_rows": n_rank,
+                   "factor_calibration": rk_cal,
                    "snapshots": snapshots, "bestfit_epoch": bestfit_epoch,
                    "n_observed_cells": sum(len(v) for v in observed.values()),
                    "final_fit_accuracy": fin["accuracy"],
@@ -747,6 +808,9 @@ def run_cv(data: dict, args) -> None:
                 "bestfit_epoch": info["bestfit_epoch"],
                 "n_supcon_steps": info["n_supcon_steps"],
                 "n_supcon_labelled": info["n_supcon_labelled"],
+                "n_rank_steps": info["n_rank_steps"],
+                "n_rank_rows": info["n_rank_rows"],
+                "factor_calibration": round(info["factor_calibration"], 6),
                 # fit at the LAST epoch vs at the val-SELECTED epoch. If the
                 # first keeps rising with --epochs and the second does not, the
                 # limit is selection, not capacity.
@@ -1078,6 +1142,22 @@ def build_parser() -> argparse.ArgumentParser:
                         "step is ~1%% of the optimizer traffic. 8 puts the term "
                         "at ~10%%, which is a starting point, not a tuned value.")
     p.add_argument("--supcon-temp", type=float, default=0.1)
+    p.add_argument("--rank-coef", type=float, default=0.0,
+                   help="Weight on the per-loop soft-target RANKING loss over "
+                        "the factor head. 0 disables. Targets are "
+                        "p_f ~ exp(r_f/temp) over the factors OBSERVED for that "
+                        "branch — soft, because the median arm has 2-3 factors "
+                        "within the deadzone of the best and hard argmax would "
+                        "train against an arbitrary tie-break.")
+    p.add_argument("--rank-temp", type=float, default=0.1,
+                   help="Target temperature. At 0.1 a 0.005 reward gap stays a "
+                        "near-tie while -1.0 vs +0.2 separates by e^12.")
+    p.add_argument("--rank-warmup", type=int, default=15)
+    p.add_argument("--rank-min-cells", type=int, default=3,
+                   help="Observed factors a (loop, branch) needs before it can "
+                        "be ranked. Below ~2 there is no preference to express.")
+    p.add_argument("--rank-steps", type=int, default=8)
+    p.add_argument("--rank-batch", type=int, default=128)
     p.add_argument("--q-pessimism", type=float, default=0.0,
                    help="category-bandit only: subtract this from the "
                         "BOOTSTRAPPED transform Q-targets. The no-op target is "

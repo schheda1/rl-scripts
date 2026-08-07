@@ -821,6 +821,125 @@ def test_supcon_smoke(d: dict):
           f"{info['n_observed_cells']} cells observed)")
 
 
+
+def test_rank_loss_geometry():
+    """
+    Hand-computable. logits [0, 10, 0] over a 3-wide mask:
+      log_softmax denominator = e^0 + e^10 + e^0 = 22028.47, log = 10.00009
+      target on index 1 -> loss = -(-0.00009) ~= 0
+      target on index 0 -> loss = 10.00009
+    Also checks the NaN trap: masked positions must contribute exactly 0, not
+    0 * -inf.
+    """
+    import torch
+    from factor_rank import rank_loss
+    logits = torch.zeros(1, 10); logits[0, 1] = 10.0
+    mask = torch.zeros(1, 10, dtype=torch.bool); mask[0, :3] = True
+    t_good = torch.zeros(1, 10); t_good[0, 1] = 1.0
+    t_bad = torch.zeros(1, 10); t_bad[0, 0] = 1.0
+    good = rank_loss(logits, t_good, mask).item()
+    bad = rank_loss(logits, t_bad, mask).item()
+    assert good < 0.001, good
+    assert 9.9 < bad < 10.1, bad
+    assert good == good and bad == bad, "NaN leaked from the masked positions"
+    print(f"  rank loss geometry         ok  (aligned {good:.5f}, "
+          f"opposed {bad:.3f})")
+
+
+def test_branch_rows_targets(d: dict):
+    """
+    Hand-computed target. Observing (1,2)=+0.30 and (1,5)=-0.50 on b1|0, temp
+    0.1:  r/temp = [+3.0, -5.0]  ->  e^3 / (e^3 + e^-5) = 0.99966 on factor 2.
+
+    Also pins the two rules that make the term mean what it says:
+      * factor 1 is excluded from the u=0 branch — (0,1) IS the no-op, so
+        ranking it against unroll factors compares a decline to a transform
+      * a branch below --rank-min-cells is dropped: with one cell there is no
+        preference to express and the softmax target is degenerate
+    """
+    from agent import FACTOR_VALUES
+    from factor_rank import branch_rows
+    loops = [l for l in od.labelled_loops(d)
+             if (l["benchmark_name"], l["loop_idx"]) == ("b1", 0)]
+
+    obs = {("b1", 0): {(1, 2): 0.30, (1, 5): -0.50}}
+    S, M, T, R = branch_rows(loops, obs, d, 0.1, 2)
+    assert len(S) == 1, f"expected one branch row, got {len(S)}"
+    i2, i5 = FACTOR_VALUES.index(2), FACTOR_VALUES.index(5)
+    assert M[0][i2] and M[0][i5], "mask must mark exactly the observed factors"
+    assert M[0].sum().item() == 2, M[0]
+    assert approx(T[0][i2].item(), 0.999665, 1e-5), T[0][i2].item()
+    assert approx(T[0][i5].item(), 0.000335, 1e-5), T[0][i5].item()
+    assert approx(R[0][i2].item(), 0.30, 1e-6)
+
+    # factor 1 must never enter the unroll branch
+    obs_u0 = {("b1", 0): {(0, 1): 0.0, (0, 2): 0.10, (0, 3): 0.05}}
+    S, M, T, _ = branch_rows(loops, obs_u0, d, 0.1, 2)
+    assert len(S) == 1
+    assert not M[0][FACTOR_VALUES.index(1)], "factor 1 leaked into unroll_only"
+    assert M[0].sum().item() == 2
+
+    # below min_cells -> no row at all
+    assert branch_rows(loops, {("b1", 0): {(1, 2): 0.30}}, d, 0.1, 2)[0] == []
+    print("  branch rows / targets      ok")
+
+
+def test_rank_uses_observed_not_table(d: dict):
+    """
+    The discipline the whole term rests on. b3|0's TABLE holds (1,4)=+0.40, but
+    with nothing observed for it there must be no row — otherwise the loss is
+    reading the reward table and the method stops being online-legitimate.
+    """
+    from factor_rank import branch_rows
+    loops = [l for l in od.labelled_loops(d)
+             if l["benchmark_name"] == "b3"]
+    assert d["tables"][("b3", 0)][(1, 4)] == 0.40, "fixture changed"
+    assert branch_rows(loops, {}, d, 0.1, 2)[0] == [], \
+        "produced a row from a loop with no observed cells"
+    print("  rank targets are earned    ok  (table ignored)")
+
+
+def test_factor_rank_step_both_agents(d: dict):
+    """
+    The step runs, reaches the optimizer, and reports calibration only where it
+    is meaningful: the bandit's Q1 backs up max_f Q2 and so depends on Q2
+    keeping reward scale; PPO's head emits logits and has no such property.
+    """
+    import torch
+    args = _args(rank_coef=1.0, rank_warmup=1, rank_min_cells=2,
+                 rank_steps=3, rank_batch=8)
+    loops = od.labelled_loops(d)
+    observed = {(l["benchmark_name"], l["loop_idx"]):
+                {a: r for a, r in d["tables"][(l["benchmark_name"],
+                                               l["loop_idx"])].items()
+                 if a != od.NOOP}
+                for l in loops}
+    for kind, want_cal in (("category", False), ("category-bandit", True)):
+        agent = ot.make_agent(kind, args)
+        w0 = agent.factor_actor.net[6].weight.detach().clone()
+        loss, n_rows, cal = ot.factor_rank_step(
+            agent, kind, loops, observed, d, epoch=5, args=args)
+        assert n_rows > 0, f"{kind}: no rankable rows"
+        assert loss > 0, f"{kind}: loss {loss}"
+        moved = not torch.allclose(w0, agent.factor_actor.net[6].weight)
+        assert moved, f"{kind}: factor head did not move — step never applied"
+        is_nan = cal != cal
+        assert is_nan != want_cal, f"{kind}: calibration {cal}"
+        print(f"  rank step [{kind:<15}] ok  ({n_rows} rows, loss {loss:.3f}, "
+              f"calib {'n/a' if is_nan else f'{cal:.3f}'})")
+
+    # gate: below the warmup epoch nothing runs and no weight moves
+    agent = ot.make_agent("category", args)
+    w0 = agent.factor_actor.net[6].weight.detach().clone()
+    loss, n_rows, _ = ot.factor_rank_step(agent, "category", loops, observed, d,
+                                          epoch=0, args=_args(rank_coef=1.0,
+                                          rank_warmup=15, rank_min_cells=2))
+    assert loss == 0.0 and n_rows > 0
+    assert torch.allclose(w0, agent.factor_actor.net[6].weight), \
+        "weights moved before the warmup epoch"
+    print("  rank warmup gate           ok")
+
+
 def test_determinism(d: dict):
     """
     Same seed -> identical agent. This is the property the whole sweep rests on:
@@ -885,6 +1004,10 @@ def main() -> None:
         test_regression_and_deadzone(d)
         test_marginal_is_deployable(d)
         test_marginal_ranking_and_table(d)
+        test_rank_loss_geometry()
+        test_branch_rows_targets(d)
+        test_rank_uses_observed_not_table(d)
+        test_factor_rank_step_both_agents(d)
         test_supcon_loss_geometry()
         test_provisional_labels_use_observed_only(d)
         test_supcon_gate(d)
