@@ -123,6 +123,10 @@ def supcon_loss(emb: torch.Tensor, labels: torch.Tensor,
     # exp(1/tau) would otherwise dominate every row.
     sim = sim.masked_fill(eye, float("-inf"))
     logprob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+    # The diagonal is -inf by construction, and `pos` is False there, so the
+    # product is -inf * 0.0 = NaN — NOT 0. One NaN poisons the row sum, the
+    # mean, the backward pass and every weight it reaches. Zero it explicitly.
+    logprob = logprob.masked_fill(eye, 0.0)
     pos = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~eye
     n_pos = pos.sum(1)
     keep = n_pos > 0

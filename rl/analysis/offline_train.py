@@ -53,6 +53,7 @@ import argparse
 import copy
 import csv
 import logging
+import math
 import random
 import statistics as st
 import sys
@@ -417,6 +418,14 @@ def supcon_step(agent, fit_loops: list, observed: dict, data: dict,
         states, y = all_states[idx], all_y[idx]
         loss = args.supcon_coef * supcon_loss(embed(agent, states), y,
                                               args.supcon_temp)
+        if not math.isfinite(float(loss)):
+            # A non-finite loss reaches the optimizer as non-finite gradients
+            # and turns every weight it touches to NaN — after which the agent
+            # still runs, still reports numbers, and every one of them is
+            # garbage. `float(loss) == 0.0` does NOT catch NaN. Fail loudly.
+            raise AssertionError(
+                f"supcon loss is {float(loss)} at epoch {epoch} — refusing to "
+                f"step. A NaN here silently corrupts the run.")
         if float(loss) == 0.0:
             # This draw had no same-label pair. Resample rather than abandon
             # the epoch's remaining steps.
@@ -463,6 +472,14 @@ def factor_rank_step(agent, kind: str, fit_loops: list, observed: dict,
         idx = torch.randperm(n_rows)[:bs]
         loss = args.rank_coef * rank_loss(
             agent.factor_actor.forward(S[idx]), T[idx], M[idx])
+        if not math.isfinite(float(loss)):
+            # A non-finite loss reaches the optimizer as non-finite gradients
+            # and turns every weight it touches to NaN — after which the agent
+            # still runs, still reports numbers, and every one of them is
+            # garbage. `float(loss) == 0.0` does NOT catch NaN. Fail loudly.
+            raise AssertionError(
+                f"factor-rank loss is {float(loss)} at epoch {epoch} — refusing to "
+                f"step. A NaN here silently corrupts the run.")
         if float(loss) == 0.0:
             continue
         agent.optimizer.zero_grad()
