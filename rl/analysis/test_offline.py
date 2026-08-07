@@ -692,7 +692,10 @@ def test_category_entry_carries_category(d: dict):
     seen_cats, seen_unmerge = set(), set()
     for _ in range(80):
         for l in od.labelled_loops(d):
-            e, _ = ot.rollout_one(agent, l, d, args)
+            # rollout_one returns (entry, absent_cell, observed_cell) —
+            # the third element feeds the observed-cell tracker that the
+            # contrastive terms build their labels from.
+            e, _, _seen = ot.rollout_one(agent, l, d, args)
             if e is None:
                 continue
             assert isinstance(e, CategoryRolloutEntry), type(e)
