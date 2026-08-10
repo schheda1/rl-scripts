@@ -182,11 +182,13 @@ def states_for(loop: dict, data: dict) -> list:
     return out
 
 
-def reward_for(table: dict, u: int, f: int, missing: float) -> tuple:
+def reward_for(table: dict, u: int, f: int, missing: float,
+               floor_penalty=None) -> tuple:
     """(reward, measured). An absent cell is charged `missing`: after exhaustive
     collection it means the cell FAILED, so charging it is the honest reading."""
     if (u, f) in table:
-        return table[(u, f)], True
+        from offline_train import reshape_floor
+        return reshape_floor(table[(u, f)], floor_penalty), True
     return missing, False
 
 
@@ -323,7 +325,10 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
             idx = agent.select(s, m)
             f = FACTOR_VALUES[idx]
             key = (l["benchmark_name"], l["loop_idx"])
-            r, _ = reward_for(data["tables"][key], u, f, args.missing)
+            # ROLLOUT only. branch_bar and branch_picks (the scoring paths)
+            # deliberately do NOT pass it — they must read the true value.
+            r, _ = reward_for(data["tables"][key], u, f, args.missing,
+                              args.train_floor_penalty)
             seen.add((key, u, f))
             buf.append((s, idx, r))
             if len(buf) >= args.buffer_size:
@@ -350,23 +355,23 @@ def evaluate(agent: FactorOnly, loops: list, data: dict, args) -> dict:
                         data.get("failures"))
     _, bar, _ = best_constant_factor(loops, data["tables"], data["labels"],
                                      args.deadzone, args.missing)
-    out = {"probe": m["capture_applied"], "probe_n": m["loops_with_headroom"],
+    out = {"probe": m["capture"], "probe_n": m["loops_with_headroom"],
            "probe_bar": bar,
            # Sums, so callers can POOL rather than average per-benchmark
            # ratios — with one or two evaluation loops apiece, a mean of
            # capture ratios is decided by whichever denominators are smallest.
            # `probe_realized` uses the APPLIED semantics: a pick that failed
            # to build contributes 0.0, because the original program stands.
-           "probe_realized": m["realized_sum_applied"],
+           "probe_realized": m["realized_sum"],
            "probe_oracle": m["oracle_sum"],
            # `probe_slower` counts only picks that BUILT AND RAN — a compile
            # failure carries the same reward as a slowdown, and 31.4% of cells
            # in this cache are failures, so the raw n_regress counts programs
            # that never ran. `probe_failed` is that population, reported apart.
            "probe_mean": m["mean_realized"],
-           "probe_mean_ran": m["mean_realized_ran"],
-           "probe_slower": m["n_regress_ran"], "probe_failed": m["n_failed"],
-           "probe_ran": m["n_ran"]}
+           "probe_mean_applied": m["mean_realized_applied"],
+           "probe_slower": m["n_regress"], "probe_failed": m["n_failed"],
+           "probe_clipped": m["n_clipped"]}
     for u, cat, label in BRANCHES:
         # ONLY loops whose true category IS this branch. Scoring an
         # unroll-only loop on the unmerge branch measures a decision the policy
@@ -421,6 +426,9 @@ def main() -> None:
     p.add_argument("--missing", type=float, default=-0.161,
                    help="Reward for a cell absent from the cache. After "
                         "exhaustive collection an absent row means it FAILED.")
+    p.add_argument("--train-floor-penalty", type=float, default=None,
+                   help="Remap the -1.0 clip floor in the ROLLOUT reward "
+                        "only; scoring keeps the true value. Off by default.")
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--log-every", type=int, default=25,
                    help="Emit the Q-loss every N epochs. 0 silences it. Epochs "

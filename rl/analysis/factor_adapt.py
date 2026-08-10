@@ -272,8 +272,8 @@ def report(rows: list, args) -> None:
     am = med([r["ad_probe"] for r in scored])
     log.info("  %-25s %8.1f%% %10.1f%% %9.1fpp", "capture (median)",
              100 * zm, 100 * am, 100 * (am - zm))
-    zr = _mean([r["zs"]["probe_mean_ran"] for r in scored])
-    ar = _mean([r["ad"]["probe_mean_ran"] for r in scored])
+    zr = _mean([r["zs"]["probe_mean_applied"] for r in scored])
+    ar = _mean([r["ad"]["probe_mean_applied"] for r in scored])
     log.info("  %-25s %+9.4f %+11.4f %+11.4f", "mean realized (ran)",
              zr, ar, ar - zr)
     zs_ = _mean([r["zs"]["probe_slower"] for r in scored])

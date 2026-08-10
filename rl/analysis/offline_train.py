@@ -192,7 +192,38 @@ def act(agent, loop: dict, normalizer, postf: dict, greedy: bool):
             log_p1, log_p2, mask, s1, s2, int(unmerge), None)
 
 
-def reward_for(tables: dict, loop: dict, unmerge: int, factor: int):
+CLIP_FLOOR = -1.0
+
+
+def reshape_floor(r: float, floor_penalty) -> float:
+    """
+    Rollout-time reward SHAPING at the clip floor. Training only.
+
+    train.py:1443 clips every measured reward at -1.0 and also uses -1.0 as the
+    compile-timeout penalty, so a cell sitting there is either a timeout or a
+    slowdown of 100% or worse — 744 of 8,352 cells, and the cache keeps no
+    record of which is which (`is_timeout` never reaches it; 0 of the 744 are
+    in failure_keys). They are therefore not separable, and this remaps ALL of
+    them.
+
+    The hypothesis it exists to test: the floor is ~10x the size of the typical
+    gain (+0.19 median win), so it may be suppressing firing far beyond what the
+    real risk warrants.
+
+    ONLY the rollout reward is remapped. Every reported number — capture,
+    mean_realized, the oracle, the labels — is still computed from the true
+    stored value, so a softer tail cannot manufacture performance. The oracle
+    and labels are unaffected either way: both -1.0 and any softer value sit far
+    below the deadzone, so a category whose best cell is at the floor is -inf
+    regardless.
+    """
+    if floor_penalty is None or r > CLIP_FLOOR + 1e-9:
+        return r
+    return float(floor_penalty)
+
+
+def reward_for(tables: dict, loop: dict, unmerge: int, factor: int,
+               floor_penalty=None):
     """
     (reward, factor_active, measured) for a chosen action.
 
@@ -216,7 +247,7 @@ def reward_for(tables: dict, loop: dict, unmerge: int, factor: int):
     cell = tables[key].get((unmerge, factor))
     if cell is None:
         return None, True, False
-    return float(cell), True, True
+    return reshape_floor(float(cell), floor_penalty), True, True
 
 
 @torch.no_grad()
@@ -294,7 +325,9 @@ def rollout_one(agent, loop: dict, data: dict, args):
 
     u, f, f_idx, lp1, lp2, mask, s1, s2, head, head_mask = act(
         agent, loop, data["normalizer"], data["postf"], greedy=False)
-    r, factor_active, measured = reward_for(data["tables"], loop, u, f)
+    # floor_penalty applies to the ROLLOUT ONLY — scoring never sees it.
+    r, factor_active, measured = reward_for(data["tables"], loop, u, f,
+                                            args.train_floor_penalty)
     seen = (((loop["benchmark_name"], loop["loop_idx"]), (u, f), float(r))
             if measured else None)
     if not measured:
@@ -1352,6 +1385,11 @@ def warn_ignored_flags(args) -> None:
         log.warning("NOTE --supcon-warmup %d >= --epochs %d: the contrastive "
                     "term can never\n     activate.", args.supcon_warmup,
                     args.epochs)
+    if args.train_floor_penalty is not None:
+        log.warning("NOTE --train-floor-penalty %.3f remaps the -1.0 clip floor in "
+                    "the ROLLOUT reward\n     only. Every REPORTED figure — capture, "
+                    "mean_realized, the oracle — still uses the\n     true stored "
+                    "-1.0, so this cannot manufacture performance. The 744 cells at\n     the floor are timeouts AND >=100%% slowdowns mixed; the cache cannot\n     separate them, so ALL are remapped.", args.train_floor_penalty)
     if args.factor_head == "attn":
         # Capacity is NOT held constant here: removing Linear(128,64) takes out
         # 8,256 parameters and an attention block adds ~1,100. Printed once so
@@ -1432,6 +1470,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "be ranked. Below ~2 there is no preference to express.")
     p.add_argument("--rank-steps", type=int, default=8)
     p.add_argument("--rank-batch", type=int, default=128)
+    p.add_argument("--train-floor-penalty", type=float, default=None,
+                   help="Remap the -1.0 clip floor to this value in the "
+                        "ROLLOUT reward only. 744 of 8,352 cells sit there "
+                        "and are a mix of timeouts and >=100%% slowdowns that "
+                        "the cache cannot separate. The floor is ~10x the "
+                        "median win (+0.19), so it may suppress firing beyond "
+                        "the real risk. REPORTING still uses the true stored "
+                        "value, so this cannot manufacture performance. Off by "
+                        "default.")
     p.add_argument("--attn-tokens", type=int, default=8,
                    help="--factor-head attn only. The 128-d hidden vector is "
                         "reshaped into this many tokens before self-attention; "

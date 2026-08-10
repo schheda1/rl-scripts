@@ -69,6 +69,13 @@ assert set(LABEL) == set(CATEGORIES), "LABEL and label_loops.CATEGORIES differ"
 # FEATURE_COLUMNS rather than trusting them: if the schema ever gains a column
 # at the front, the mask silently starts reading a different feature and every
 # factor decision is made against a fabricated trip count.
+# train.py:1443 clips every measured reward here, and --compile-timeout-penalty
+# also defaults to it, so a cell at this value is a timeout OR a slowdown of
+# 100%+ and the cache cannot say which (`is_timeout` is never persisted; 0 of
+# the 744 are in failure_keys). Counted as a slowdown, since that is the
+# conservative reading and it did run.
+CLIP_FLOOR = -1.0
+
 IDX_TRIP_KNOWN = 10
 IDX_TRIP_COUNT = 11
 
@@ -582,9 +589,12 @@ def score_decisions(picks: list, tables: dict, labels: dict,
     # A compile failure carries the same number as a measured slowdown, so
     # `n_regress` counts programs that never ran. These track the picks that
     # BUILT, which is the only population "made slower" can be asserted of.
-    n_failed = n_regress_ran = 0
+    n_failed = n_regress_ran = n_clipped = 0
     realized_ran: list = []
     realized_sum_applied = 0.0
+    realized_sum_masked = 0.0
+    realized_sum_hd = 0.0
+    realized_ran_masked: list = []
 
     for bench, li, action in picks:
         key = (bench, li)
@@ -628,12 +638,32 @@ def score_decisions(picks: list, tables: dict, labels: dict,
             realized_ran.append(r)
             if r < -deadzone:
                 n_regress_ran += 1
+            # A pick sitting at the clip floor. It RAN, so it belongs in
+            # the performance delta — but it is censored (">=100% slower
+            # or timed out") and catastrophic, and a policy that improves
+            # its mean while taking more of these is the exact trade the
+            # study calls disqualifying for the published heuristic
+            # (one 117.6% regression erased every gain in the suite).
+            if r <= CLIP_FLOOR + 1e-9:
+                n_clipped += 1
         # What a failed pick ACTUALLY realises is 0.0, not the penalty: the
         # transform did not build, so the compiler keeps the original and the
         # program is unchanged. -0.161 is a training signal, not a measured
         # delta, and letting it into the capture numerator charges the policy a
         # 16% slowdown for a program that still runs at its original speed.
         r_applied = 0.0 if failed else r
+        # A clip-floor cell is a TIMEOUT or a >=100% slowdown and the cache
+        # cannot say which. A timeout shipped no binary, so its true cost is
+        # 0.0; a clipped slowdown's true cost is at least -1.0. Rather than
+        # guess, both readings are carried: *_applied counts them (lower
+        # bound on performance), *_masked zeroes them (upper bound). The
+        # truth lies between, and n_clipped says how many cells separate
+        # the two.
+        at_floor = (not failed) and r <= CLIP_FLOOR + 1e-9
+        r_masked = 0.0 if (failed or at_floor) else r
+        realized_sum_applied += r_applied
+        if not failed:
+            realized_ran_masked.append(r_masked)
         b = per_bench.setdefault(bench, {"realized": 0.0, "oracle": 0.0,
                                          "loops": 0, "regress": 0})
         b["loops"] += 1
@@ -645,7 +675,8 @@ def score_decisions(picks: list, tables: dict, labels: dict,
         if orc > deadzone:
             n_headroom += 1
             realized_sum += r
-            realized_sum_applied += r_applied
+            realized_sum_hd += r_applied
+            realized_sum_masked += r_masked
             oracle_sum += orc
             b["realized"] += r
             b["oracle"] += orc
@@ -672,15 +703,22 @@ def score_decisions(picks: list, tables: dict, labels: dict,
         "accuracy": correct / n if n else float("nan"),
         "per_category": per_cat,
         "confusion": conf,
-        "capture": realized_sum / oracle_sum if oracle_sum > 0 else float("nan"),
+        # Failures realise 0.0: the transform did not build, the original
+        # stands, the program is unchanged. This is THE capture figure — every
+        # consumer reads it, so correcting it here rather than adding a variant
+        # is what stops the main table reporting the training encoding.
+        "capture": realized_sum_hd / oracle_sum if oracle_sum > 0 else float("nan"),
+        # Upper bound: clip-floor cells read as timeouts (cost 0.0) instead of
+        # as >=100% slowdowns. Equal to `capture` unless a pick hit the floor;
+        # n_clipped is how many did.
         # Capture with a failed pick contributing 0.0 rather than the
         # penalty: the transform did not build, the original stands, the
         # program is unchanged. THIS is the performance figure to report;
         # `capture` above keeps the training encoding and is left alone so
         # nothing that already consumes it shifts.
-        "capture_applied": (realized_sum_applied / oracle_sum
-                            if oracle_sum > 0 else float("nan")),
-        "realized_sum_applied": realized_sum_applied,
+        # UPPER bound: every clip-floor pick read as a timeout, costing 0.0.
+        "capture_masked": (realized_sum_masked / oracle_sum
+                           if oracle_sum > 0 else float("nan")),
         # The factor's score with the category error divided out. Read this, not
         # `capture`, when judging a FACTOR-side intervention: `capture` moves
         # when the category improves (supcon, which never touches the factor,
@@ -689,7 +727,7 @@ def score_decisions(picks: list, tables: dict, labels: dict,
                            if f_oracle_sum > 0 else float("nan")),
         "n_factor_loops": n_factor,
         "oracle_sum": oracle_sum,
-        "realized_sum": realized_sum,
+        "realized_sum": realized_sum_hd,
         # Mean over EVERY scored loop, not only those with headroom: this is the
         # number that must be compared against always-no-op's exact 0.0, and
         # restricting it to headroom loops would hide the cost of firing on
@@ -698,23 +736,27 @@ def score_decisions(picks: list, tables: dict, labels: dict,
                           if realized_all else 0.0),
         # INCLUDES compile failures — kept unchanged so nothing that already
         # consumes it shifts. Report the *_ran figures below instead.
-        "regression_rate": n_regress / n_scored if n_scored else 0.0,
-        "n_regress": n_regress,
+        # Slowdowns among picks that BUILT AND RAN. A compile failure is not
+        # a slowdown under any reading, so this is corrected at source.
+        "regression_rate": (n_regress_ran / len(realized_ran)
+                            if realized_ran else 0.0),
+        "n_regress": n_regress_ran,
+        # Mean delta with failures at 0.0 — same denominator as
+        # always-no-op, which is exactly 0.0 on every loop.
+        "mean_realized_applied": (realized_sum_applied / n_scored
+                                  if n_scored else 0.0),
         # Picks that never produced a running program: a cell in failure_keys,
         # or absent from the cache entirely.
         "n_failed": n_failed,
-        "failure_rate": n_failed / n_scored if n_scored else 0.0,
         # Restricted to picks that BUILT AND RAN. `n_regress_ran` is the only
         # figure that supports the sentence "this many loops were made slower";
         # `mean_realized_ran` is the only mean that is a performance delta.
         # Both are lower bounds: 744 measured cells sit exactly at the -1.0 clip,
         # meaning ">=100% slower or timed out", with the true magnitude censored.
-        "n_regress_ran": n_regress_ran,
-        "n_ran": len(realized_ran),
-        "regression_rate_ran": (n_regress_ran / len(realized_ran)
-                                if realized_ran else float("nan")),
-        "mean_realized_ran": (sum(realized_ran) / len(realized_ran)
-                              if realized_ran else float("nan")),
+        # Catastrophic outcomes among the picks that ran. Counted, never
+        # excluded: a slowdown is a real performance delta. Only compile
+        # failures and absent cells are held out of the numbers.
+        "n_clipped": n_clipped,
         "n_benchmarks": len(per_bench),
         "per_bench": per_bench,
     }
@@ -745,8 +787,8 @@ def table_row(name: str, m: dict) -> str:
             # `slower` is n_regress_RAN and `failed` is everything that never
             # produced a running program. The raw n_regress counted compile
             # failures as slowdowns — 31.4% of cells in this cache never built.
-            f"  |{100 * m['capture']:8.1f}%{m['mean_realized']:+9.4f}"
-            f"{m['n_regress_ran']:>8}{m['n_failed']:>8}")
+            f"  |{100 * m['capture']:8.1f}%{m['mean_realized_applied']:+9.4f}"
+            f"{m['n_regress']:>8}{m['n_failed']:>8}")
 
 
 def format_report(name: str, m: dict) -> str:
@@ -763,17 +805,21 @@ def format_report(name: str, m: dict) -> str:
     lines.append(f"    capture         {100 * m['capture']:5.1f}%"
                  f"   (realized {m['realized_sum']:+.3f}"
                  f" of {m['oracle_sum']:+.3f})")
-    lines.append(f"    mean realized   {m['mean_realized']:+.4f}"
-                 f"   (ran only {m['mean_realized_ran']:+.4f})")
+    lines.append(f"    mean realized   {m['mean_realized_applied']:+.4f}"
+                 f"   (failures at 0.0; charged {m['mean_realized']:+.4f})")
     # Slowdowns are counted over the picks that BUILT AND RAN. A compile
     # failure carries the same reward as a slowdown, so the unrestricted count
     # asserts programs were made slower that never executed.
-    lines.append(f"    regressions     {m['n_regress_ran']:>4}"
-                 f"   ({100 * m['regression_rate_ran']:.1f}% of the "
-                 f"{m['n_ran']} that ran)")
+    lines.append(f"    regressions     {m['n_regress']:>4}"
+                 f"   ({100 * m['regression_rate']:.1f}% of those that ran)")
+    lines.append(f"    capture bound   {100 * m['capture']:5.1f}%"
+                 f" .. {100 * m['capture_masked']:5.1f}%"
+                 f"   (clip cells as slowdowns .. as timeouts)")
+    lines.append(f"    at clip floor   {m['n_clipped']:>4}"
+                 f"   (>=100% slower or timed out — counted in the delta,"
+                 f" magnitude censored)")
     lines.append(f"    never built     {m['n_failed']:>4}"
-                 f"   ({100 * m['failure_rate']:.1f}% of picks — compile "
-                 f"failures and cells absent from the cache)")
+                 f"   (compile failures and cells absent from the cache)")
     return "\n".join(lines)
 
 
@@ -813,6 +859,9 @@ TRAINING_ARGS = (
     # comparable checkpoints, so they must fingerprint apart.
     "factor_head", "factor_feats",
     "attn_tokens", "attn_heads", "attn_blocks",
+    # Rollout-only reward shaping. Two runs differing only here trained on
+    # DIFFERENT reward functions, so they must fingerprint apart.
+    "train_floor_penalty",
 )
 
 
