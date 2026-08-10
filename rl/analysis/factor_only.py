@@ -57,9 +57,10 @@ from agent import FACTOR_VALUES, N_FACTORS, FactorActor          # noqa: E402
 from category_agent import (UNMERGE_UNROLL, UNROLL_ONLY,         # noqa: E402
                             category_factor_mask)
 from offline_data import (IDX_TRIP_COUNT, IDX_TRIP_KNOWN, NOOP,  # noqa: E402
-                          best_constant_factor, grouped_kfold,
+                          best_constant_factor,
                           labelled_loops, load_run, loops_for,
                           score_decisions)
+from offline_train import write_csv                              # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 log = logging.getLogger("factor_only")
@@ -139,6 +140,29 @@ class FactorOnly:
 # ---------------------------------------------------------------------------
 # States and rewards
 # ---------------------------------------------------------------------------
+
+def random_split(benchmarks: list, test_frac: float, seed: int) -> tuple:
+    """
+    (train_benchmarks, test_benchmarks), grouped by BENCHMARK.
+
+    Replaces grouped_kfold. K-fold costs folds x seeds runs to answer a question
+    that a handful of independent random splits answers just as well: nothing
+    here needs every benchmark to appear in the held-out set exactly once, since
+    the result is read as a distribution over splits rather than as one pooled
+    prediction per loop.
+
+    Grouping by benchmark is NOT optional. Loops inside a benchmark share source,
+    kernels and often the reward itself, so splitting one across the boundary
+    leaks the answer.
+
+    sorted() before shuffling so the draw is a function of the seed alone and not
+    of dict iteration order.
+    """
+    bs = sorted(benchmarks)
+    random.Random(seed).shuffle(bs)
+    n = max(1, min(len(bs) - 1, round(test_frac * len(bs))))
+    return bs[n:], bs[:n]
+
 
 def states_for(loop: dict, data: dict) -> list:
     """
@@ -282,11 +306,18 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
     seen = set()
 
     buf = []
+    history = []
     for epoch in range(1, args.epochs + 1):
         frac = (epoch - 1) / (args.epochs - 1) if args.epochs > 1 else 0.0
         agent.epsilon = args.epsilon + frac * (args.epsilon_final - args.epsilon)
         order = list(range(len(cells)))
         random.shuffle(order)
+        # Q-loss is the only view into whether the head is fitting at all. A flat
+        # curve with high coverage means it cannot represent the table; a falling
+        # one that still fails on held-out loops means it can, and the failure is
+        # transfer. Those are different results and the final table cannot tell
+        # them apart.
+        loss_sum, n_upd = 0.0, 0
         for i in order:
             l, u, s, m = cells[i]
             idx = agent.select(s, m)
@@ -296,12 +327,20 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
             seen.add((key, u, f))
             buf.append((s, idx, r))
             if len(buf) >= args.buffer_size:
-                agent.update(buf)
+                loss_sum += agent.update(buf); n_upd += 1
                 buf = []
         if buf:
-            agent.update(buf)
+            loss_sum += agent.update(buf); n_upd += 1
             buf = []
-    return agent, (len(seen) / n_legal if n_legal else float("nan"))
+        cov = len(seen) / n_legal if n_legal else float("nan")
+        history.append({"epoch": epoch, "q_loss": loss_sum / max(n_upd, 1),
+                        "epsilon": agent.epsilon, "coverage": cov,
+                        "updates": n_upd})
+        if args.log_every and (epoch % args.log_every == 0
+                               or epoch in (1, args.epochs)):
+            log.info("      epoch %4d | q_loss %.5f | eps %.3f | coverage %5.1f%%",
+                     epoch, history[-1]["q_loss"], agent.epsilon, 100 * cov)
+    return agent, (len(seen) / n_legal if n_legal else float("nan")), history
 
 
 def evaluate(agent: FactorOnly, loops: list, data: dict, args) -> dict:
@@ -329,10 +368,18 @@ def main() -> None:
     p.add_argument("run_dir", type=Path)
     p.add_argument("--deadzone", type=float, default=0.005)
     p.add_argument("--labels", type=Path, default=None)
-    p.add_argument("--folds", type=int, default=5)
-    p.add_argument("--fold-seed", type=int, default=0)
+    p.add_argument("--splits", type=int, default=5,
+                   help="Independent random train/test splits over BENCHMARKS. "
+                        "Replaces k-fold: 5 splits is 5 runs, where 5 folds x 3 "
+                        "init seeds was 15, and the result is read as a "
+                        "distribution either way.")
+    p.add_argument("--split-seed", type=int, default=0)
+    p.add_argument("--test-frac", type=float, default=0.2)
     p.add_argument("--base-seed", type=int, default=100)
-    p.add_argument("--seeds", type=int, default=3)
+    p.add_argument("--seeds", type=int, default=1,
+                   help="Init seeds PER split. 1 by default — which loops land "
+                        "in the split moves the result far more than the network "
+                        "init does, so extra splits beat extra inits.")
     p.add_argument("--epochs", type=int, default=300,
                    help="Many epochs is the point: there is no policy to "
                         "collapse and no category head to over-decline.")
@@ -351,6 +398,13 @@ def main() -> None:
                    help="Reward for a cell absent from the cache. After "
                         "exhaustive collection an absent row means it FAILED.")
     p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--log-every", type=int, default=25,
+                   help="Emit the Q-loss every N epochs. 0 silences it. Epochs "
+                        "1 and --epochs are always emitted.")
+    p.add_argument("--csv-out", type=str, default=None,
+                   help="Per-split rows, fit_* and test_* prefixed.")
+    p.add_argument("--curve-out", type=str, default=None,
+                   help="Per-epoch Q-loss, epsilon and coverage.")
     args = p.parse_args()
 
     torch.set_num_threads(max(1, args.threads))
@@ -360,24 +414,52 @@ def main() -> None:
              len(data["loops"]), len(data["benchmarks"]),
              data["n_labelled_loops"], 2 * len(loops))
 
-    rows = []
-    for k, (tr_b, te_b) in enumerate(grouped_kfold(data["benchmarks"],
-                                                   args.folds, args.fold_seed)):
+    rows, curve = [], []
+    for sp in range(args.splits):
+        sseed = args.split_seed + sp
+        tr_b, te_b = random_split(data["benchmarks"], args.test_frac, sseed)
         fit_l, test_l = loops_for(loops, tr_b), loops_for(loops, te_b)
+        if not fit_l or not test_l:
+            log.warning("  split %d produced an empty side (%d train / %d test "
+                        "loops) — skipped", sp + 1, len(fit_l), len(test_l))
+            continue
         for si in range(args.seeds):
             seed = args.base_seed + si
-            agent, cov = train(fit_l, data, args, seed)
+            agent, cov, hist = train(fit_l, data, args, seed)
             fit, test = evaluate(agent, fit_l, data, args), \
                 evaluate(agent, test_l, data, args)
-            rows.append({"fold": k + 1, "seed": seed, "coverage": cov,
+            rows.append({"split": sp + 1, "split_seed": sseed, "seed": seed,
+                         "n_fit_loops": len(fit_l), "n_test_loops": len(test_l),
+                         "n_test_benchmarks": len(te_b), "coverage": cov,
+                         "q_loss_first": hist[0]["q_loss"],
+                         "q_loss_final": hist[-1]["q_loss"],
                          "fit": fit, "test": test})
-            log.info("  fold %d/%d seed %d | coverage %5.1f%% | "
+            curve.extend(dict(split=sp + 1, seed=seed, **h) for h in hist)
+            log.info("  split %d/%d seed %d | %3d/%3d loops | coverage %5.1f%% | "
                      "probe fit %5.1f%% (bar %5.1f%%)  test %5.1f%% (bar %5.1f%%)",
-                     k + 1, args.folds, seed, 100 * cov,
+                     sp + 1, args.splits, seed, len(fit_l), len(test_l),
+                     100 * cov,
                      100 * fit["probe"], 100 * fit["probe_bar"],
                      100 * test["probe"], 100 * test["probe_bar"])
 
     report(rows)
+    if args.csv_out and rows:
+        write_csv(Path(args.csv_out), [flatten(r) for r in rows])
+        log.info("\n  per-split rows: %s", args.csv_out)
+    if args.curve_out and curve:
+        write_csv(Path(args.curve_out), curve)
+        log.info("  q-loss curve  : %s", args.curve_out)
+
+
+def flatten(row: dict) -> dict:
+    """One flat CSV record. `fit` and `test` are nested dicts of the same keys,
+    so they are prefixed rather than merged — otherwise the second silently
+    overwrites the first and every reported number is the test one."""
+    out = {k: v for k, v in row.items() if k not in ("fit", "test")}
+    for side in ("fit", "test"):
+        for k, v in row[side].items():
+            out[f"{side}_{k}"] = round(v, 6) if isinstance(v, float) else v
+    return out
 
 
 def _mean(rows: list, split: str, key: str) -> float:
