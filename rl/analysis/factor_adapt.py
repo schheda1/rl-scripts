@@ -53,9 +53,9 @@ import torch.nn as nn                                            # noqa: E402
 import torch.nn.functional as F                                  # noqa: E402
 
 from agent import FACTOR_VALUES                                  # noqa: E402
-from factor_only import (evaluate, labelled_loops,               # noqa: E402
-                         load_run, loops_for, random_split,
-                         states_for, train)
+from factor_only import (best_constant_factor, evaluate,        # noqa: E402
+                         labelled_loops, load_run, loops_for,
+                         random_split, states_for, train)
 from offline_train import write_csv                              # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
@@ -115,13 +115,13 @@ def adapt_in_place(agent, loops: list, data: dict, args):
     trainable = freeze_for_adaptation(agent, args.adapt_unfreeze)
     rows = adaptation_rows(loops, data)
     if not rows or not trainable:
-        return agent, 0, float("nan")
+        return agent, 0, float("nan"), float("nan")
     s = torch.stack([r[0] for r in rows])
     a = torch.tensor([r[1] for r in rows], dtype=torch.long)
     r = torch.tensor([r[2] for r in rows], dtype=torch.float32)
     opt = torch.optim.AdamW(trainable, lr=args.adapt_lr)
-    loss = float("nan")
-    for _ in range(args.adapt_steps):
+    first = last = float("nan")
+    for step in range(args.adapt_steps):
         q = agent.factor_actor.forward(s).gather(1, a.unsqueeze(1)).squeeze(1)
         l_ = F.mse_loss(q, r)
         opt.zero_grad()
@@ -129,8 +129,12 @@ def adapt_in_place(agent, loops: list, data: dict, args):
         if agent.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(trainable, agent.max_grad_norm)
         opt.step()
-        loss = float(l_)
-    return agent, len(rows), loss
+        last = float(l_)
+        if step == 0:
+            first = last
+    # first AND last: a fit that never moves and a fit that collapses to zero
+    # are different failures, and only the pair distinguishes them.
+    return agent, len(rows), first, last
 
 
 def split_for_adaptation(loops: list, rng: random.Random) -> tuple:
@@ -153,6 +157,7 @@ def run(data: dict, args) -> None:
             base, cov, hist = train(fit_l, data, args, seed)
             curve.extend(dict(split=sp + 1, seed=seed, **h) for h in hist)
             rng = random.Random(seed * 1000 + sseed)
+            here, pooled_ev = [], []
             for b in sorted(te_b):
                 bl = [l for l in loops if l["benchmark_name"] == b]
                 if not bl:
@@ -160,25 +165,41 @@ def run(data: dict, args) -> None:
                 ad_l, ev_l = split_for_adaptation(bl, rng)
                 if not ev_l:
                     continue
+                pooled_ev.extend(ev_l)
                 zs = evaluate(base, ev_l, data, args)
                 if ad_l:
                     # A FRESH copy per benchmark: adapting the shared base would
                     # carry one target's fine-tuning into the next, which is
                     # incremental training over the fold, not few-shot.
                     tuned = copy.deepcopy(base)
-                    tuned, n_cells, aloss = adapt_in_place(tuned, ad_l, data, args)
+                    tuned, n_cells, l0, l1 = adapt_in_place(tuned, ad_l, data, args)
                     ad = evaluate(tuned, ev_l, data, args)
                 else:
-                    n_cells, aloss, ad = 0, float("nan"), zs
-                rows.append({
+                    n_cells, l0, l1, ad = 0, float("nan"), float("nan"), zs
+                here.append({
                     "split": sp + 1, "seed": seed, "benchmark": b,
                     "n_adapt_loops": len(ad_l), "n_eval_loops": len(ev_l),
-                    "adapt_cells": n_cells, "adapt_loss": aloss,
+                    "adapt_cells": n_cells,
+                    "adapt_loss_first": l0, "adapt_loss_final": l1,
                     "coverage": cov,
                     "zs_probe": zs["probe"], "zs_probe_n": zs["probe_n"],
                     "ad_probe": ad["probe"], "bar": zs["probe_bar"],
                     "zs": zs, "ad": ad,
                 })
+            # The per-benchmark bar is fitted on that benchmark's ONE OR TWO
+            # evaluation loops, so it is close to an oracle and almost
+            # unbeatable. The honest reference is the best single fixed factor
+            # over ALL held-out loops at once — one number a practitioner could
+            # actually ship.
+            if pooled_ev:
+                pf, pbar, pn = best_constant_factor(
+                    pooled_ev, data["tables"], data["labels"],
+                    args.deadzone, args.missing)
+                for r in here:
+                    r["pooled_bar"] = pbar
+                    r["pooled_bar_f"] = pf
+                    r["pooled_bar_n"] = pn
+            rows.extend(here)
     report(rows, args)
     if args.csv_out and rows:
         write_csv(Path(args.csv_out), [flatten(r) for r in rows])
@@ -218,35 +239,85 @@ def report(rows: list, args) -> None:
     scored = [r for r in ad if r["zs_probe"] == r["zs_probe"]
               and r["ad_probe"] == r["ad_probe"]]
 
-    log.info("\n" + "=" * 78)
+    def pooled(side):
+        num = sum(r[side]["probe_realized"] for r in scored)
+        den = sum(r[side]["probe_oracle"] for r in scored)
+        return num / den if den else float("nan")
+
+    def med(xs):
+        xs = sorted(x for x in xs if x == x)
+        if not xs:
+            return float("nan")
+        h = len(xs) // 2
+        return xs[h] if len(xs) % 2 else (xs[h - 1] + xs[h]) / 2
+
+    nparams = {1: 650, 2: 9034}[args.adapt_unfreeze]
+    log.info("\n" + "=" * 74)
     log.info("  FEW-SHOT ADAPTATION — isolated unroller, factor head only")
-    log.info("=" * 78)
-    log.info("  %d held-out benchmark-runs with adaptation loops, %d control "
-             "(single-loop,\n  nothing to adapt on). %d scorable — the rest have "
-             "no headroom in their\n  evaluation loops, so there is no factor "
-             "question to ask.\n", len(ad), len(ctrl), len(scored))
-    log.info("                       zero-shot    adapted      delta | best "
-             "constant")
-    log.info("  " + "-" * 68)
-    log.info("  %-18s %9.1f%% %10.1f%% %10.1fpp | %9.1f%%", "probe capture",
-             100 * _mean([r["zs_probe"] for r in scored]),
-             100 * _mean([r["ad_probe"] for r in scored]),
-             100 * _mean([r["ad_probe"] - r["zs_probe"] for r in scored]),
-             100 * _mean([r["bar"] for r in scored]))
-    won = sum(1 for r in scored if r["ad_probe"] > r["zs_probe"])
-    beat = sum(1 for r in scored if r["ad_probe"] > r["bar"])
-    log.info("  " + "-" * 68)
-    log.info("  adapted beat zero-shot on %d/%d; beat the constant bar on %d/%d",
-             won, len(scored), beat, len(scored))
-    log.info("  mean adaptation budget: %.0f measured cells over %.1f loops "
-             "(%d steps, %d layer(s) unfrozen)",
-             _mean([r["adapt_cells"] for r in ad]),
+    log.info("=" * 74)
+    log.info("  %d runs with adaptation loops | %d control (single-loop) | "
+             "%d scorable", len(ad), len(ctrl), len(scored))
+    log.info("  budget: %.1f loops, %.0f measured cells, %d steps, "
+             "%d layer(s) = %d params\n",
              _mean([r["n_adapt_loops"] for r in ad]),
-             args.adapt_steps, args.adapt_unfreeze)
-    log.info("\n  Read the delta against the BAR, not against zero. A positive "
-             "delta that still\n  sits below the best single fixed factor means "
-             "adaptation improved a factor\n  model that is worse than picking "
-             "one constant.")
+             _mean([r["adapt_cells"] for r in ad]),
+             args.adapt_steps, args.adapt_unfreeze, nparams)
+
+    log.info("  %-25s %9s %11s %11s", "", "zero-shot", "adapted", "delta")
+    log.info("  " + "-" * 60)
+    zp, ap = pooled("zs"), pooled("ad")
+    log.info("  %-25s %8.1f%% %10.1f%% %9.1fpp", "capture (pooled)",
+             100 * zp, 100 * ap, 100 * (ap - zp))
+    zm = med([r["zs_probe"] for r in scored])
+    am = med([r["ad_probe"] for r in scored])
+    log.info("  %-25s %8.1f%% %10.1f%% %9.1fpp", "capture (median)",
+             100 * zm, 100 * am, 100 * (am - zm))
+    zr = _mean([r["zs"]["probe_mean"] for r in scored])
+    ar = _mean([r["ad"]["probe_mean"] for r in scored])
+    log.info("  %-25s %+9.4f %+11.4f %+11.4f", "mean realized", zr, ar, ar - zr)
+    zs_ = _mean([r["zs"]["probe_slower"] for r in scored])
+    as_ = _mean([r["ad"]["probe_slower"] for r in scored])
+    log.info("  %-25s %9.1f %11.1f %11.1f", "loops made slower",
+             zs_, as_, as_ - zs_)
+
+    log.info("  " + "-" * 60)
+    log.info("  by branch (pooled capture)")
+    for u, label in ((0, "pre-unmerge state"), (1, "post-unmerge state")):
+        def bp(side, u=u):
+            ok = [r for r in scored if r[side][f"u{u}"] == r[side][f"u{u}"]]
+            d = sum(r[side][f"u{u}_n"] for r in ok)
+            n = sum(r[side][f"u{u}"] * r[side][f"u{u}_n"] for r in ok)
+            return n / d if d else float("nan")
+        log.info("    %-23s %8.1f%% %10.1f%%", label, 100 * bp("zs"),
+                 100 * bp("ad"))
+
+    log.info("  " + "-" * 60)
+    log.info("  references on the same evaluation loops")
+    # Every line here passes an argument. A log.info with NO args is not
+    # %-formatted at all, so an escaped %% would print literally.
+    log.info("    %-23s %8.1f%%   capture is 0 by definition", "always-no-op", 0.0)
+    pb = _mean([r.get("pooled_bar", float("nan")) for r in scored])
+    pbn = _mean([r.get("pooled_bar_n", 0) for r in scored])
+    log.info("    %-23s %8.1f%%   one constant over ~%.0f held-out loops",
+             "best fixed factor, pooled", 100 * pb, pbn)
+    log.info("    %-23s %8.1f%%   refit on %.1f loops each — near-oracle,\n"
+             "%s not a policy anyone could ship",
+             "best fixed factor, per-bm",
+             100 * _mean([r["bar"] for r in scored]),
+             _mean([r["zs_probe_n"] for r in scored]), " " * 40)
+
+    log.info("  " + "-" * 62)
+    won = sum(1 for r in scored if r["ad_probe"] > r["zs_probe"])
+    beat = sum(1 for r in scored
+               if r["ad_probe"] > r.get("pooled_bar", float("inf")))
+    log.info("  adapted > zero-shot on %d/%d   |   adapted > pooled bar on %d/%d",
+             won, len(scored), beat, len(scored))
+    log.info("  adaptation q-loss %.4f -> %.4f over %d steps",
+             _mean([r["adapt_loss_first"] for r in ad]),
+             _mean([r["adapt_loss_final"] for r in ad]), args.adapt_steps)
+    log.info("\n  Judge against the POOLED bar. The per-benchmark bar is refit "
+             "on the same one\n  or two loops it is scored on, so it is close to "
+             "an oracle and losing to it\n  says almost nothing.")
 
 
 def main() -> None:

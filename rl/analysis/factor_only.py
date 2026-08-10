@@ -350,7 +350,12 @@ def evaluate(agent: FactorOnly, loops: list, data: dict, args) -> dict:
     _, bar, _ = best_constant_factor(loops, data["tables"], data["labels"],
                                      args.deadzone, args.missing)
     out = {"probe": m["capture"], "probe_n": m["loops_with_headroom"],
-           "probe_bar": bar}
+           "probe_bar": bar,
+           # Sums, so callers can POOL rather than average per-benchmark
+           # ratios — with one or two evaluation loops apiece, a mean of
+           # capture ratios is decided by whichever denominators are smallest.
+           "probe_realized": m["realized_sum"], "probe_oracle": m["oracle_sum"],
+           "probe_mean": m["mean_realized"], "probe_slower": m["n_regress"]}
     for u, cat, label in BRANCHES:
         picks = branch_picks(agent, loops, data, u, cat, args.missing)
         c, n = branch_capture(picks, data["tables"], u, args.deadzone)
