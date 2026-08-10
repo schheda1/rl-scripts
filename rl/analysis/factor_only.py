@@ -348,11 +348,12 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
     return agent, (len(seen) / n_legal if n_legal else float("nan")), history
 
 
-def evaluate(agent: FactorOnly, loops: list, data: dict, args) -> dict:
+def evaluate(agent: FactorOnly, loops: list, data: dict, args,
+             collect: bool = False) -> dict:
     """Probe on the true branch, plus each state population separately."""
     m = score_decisions(probe_picks(agent, loops, data), data["tables"],
                         data["labels"], args.deadzone, args.missing,
-                        data.get("failures"))
+                        data.get("failures"), collect=collect)
     _, bar, _ = best_constant_factor(loops, data["tables"], data["labels"],
                                      args.deadzone, args.missing)
     out = {"probe": m["capture"], "probe_n": m["loops_with_headroom"],
@@ -371,7 +372,7 @@ def evaluate(agent: FactorOnly, loops: list, data: dict, args) -> dict:
            "probe_mean": m["mean_realized"],
            "probe_mean_applied": m["mean_realized_applied"],
            "probe_slower": m["n_regress"], "probe_failed": m["n_failed"],
-           "probe_clipped": m["n_clipped"]}
+           "probe_clipped": m["n_clipped"], "per_loop": m["per_loop"]}
     for u, cat, label in BRANCHES:
         # ONLY loops whose true category IS this branch. Scoring an
         # unroll-only loop on the unmerge branch measures a decision the policy
@@ -435,6 +436,10 @@ def main() -> None:
                         "1 and --epochs are always emitted.")
     p.add_argument("--csv-out", type=str, default=None,
                    help="Per-split rows, fit_* and test_* prefixed.")
+    p.add_argument("--picks-out", type=str, default=None,
+                   help="PER-LOOP probe records for the fit and held-out "
+                        "splits — one row per loop, every aggregate "
+                        "recomputable from it.")
     p.add_argument("--curve-out", type=str, default=None,
                    help="Per-epoch Q-loss, epsilon and coverage.")
     args = p.parse_args()
@@ -446,7 +451,7 @@ def main() -> None:
              len(data["loops"]), len(data["benchmarks"]),
              data["n_labelled_loops"], 2 * len(loops))
 
-    rows, curve = [], []
+    rows, curve, loop_rows = [], [], []
     for sp in range(args.splits):
         sseed = args.split_seed + sp
         tr_b, te_b = random_split(data["benchmarks"], args.test_frac, sseed)
@@ -458,8 +463,14 @@ def main() -> None:
         for si in range(args.seeds):
             seed = args.base_seed + si
             agent, cov, hist = train(fit_l, data, args, seed)
-            fit, test = evaluate(agent, fit_l, data, args), \
-                evaluate(agent, test_l, data, args)
+            want = bool(args.picks_out)
+            fit = evaluate(agent, fit_l, data, args, collect=want)
+            test = evaluate(agent, test_l, data, args, collect=want)
+            if want:
+                for tag, ev in (("fit", fit), ("test", test)):
+                    for rec in ev["per_loop"]:
+                        loop_rows.append(dict(split=sp + 1, seed=seed,
+                                              eval_split=tag, **rec))
             rows.append({"split": sp + 1, "split_seed": sseed, "seed": seed,
                          "n_fit_loops": len(fit_l), "n_test_loops": len(test_l),
                          "n_test_benchmarks": len(te_b), "coverage": cov,
@@ -478,6 +489,9 @@ def main() -> None:
     if args.csv_out and rows:
         write_csv(Path(args.csv_out), [flatten(r) for r in rows])
         log.info("\n  per-split rows: %s", args.csv_out)
+    if args.picks_out and loop_rows:
+        write_csv(Path(args.picks_out), loop_rows)
+        log.info("  per-loop picks: %s  (%d rows)", args.picks_out, len(loop_rows))
     if args.curve_out and curve:
         write_csv(Path(args.curve_out), curve)
         log.info("  q-loss curve  : %s", args.curve_out)

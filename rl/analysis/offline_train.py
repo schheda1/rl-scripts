@@ -896,6 +896,7 @@ def run_cv(data: dict, args) -> None:
     union: dict = {}          # seed -> list of held-out picks
     curve_rows: list = []
     fold_rows, per_fold_scores = [], {s: [] for s in range(args.seeds)}
+    loop_rows: list = []
 
     for k, (tr_b, te_b) in enumerate(folds):
         fit_b, hold_b = holdout_split(tr_b, args.holdout_frac, args.fold_seed + k)
@@ -934,10 +935,12 @@ def run_cv(data: dict, args) -> None:
             def _sc(ls):
                 return score_decisions(
                     greedy_picks(agent, ls, data["normalizer"], data["postf"]),
-                    data["tables"], data["labels"], args.deadzone, _mr(args))
+                    data["tables"], data["labels"], args.deadzone, _mr(args),
+                    data.get("failures"), collect=bool(args.picks_out))
 
             m = score_decisions(picks, data["tables"], data["labels"],
-                                args.deadzone, _mr(args))
+                                args.deadzone, _mr(args), data.get("failures"),
+                                collect=bool(args.picks_out))
             per_fold_scores[s].append(m)
             # FIT and VAL are reported alongside TEST because they answer
             # different questions, and the remedy differs by which one fails:
@@ -951,6 +954,14 @@ def run_cv(data: dict, args) -> None:
             #   test — the fold, unseen in every capacity. The only estimate.
             # fit >> test is a generalization gap; fit ~ test ~ bad is underfitting.
             m_fit, m_val = _sc(fit_l), _sc(hold_l)
+            if args.picks_out:
+                # All three splits, tagged. fit and val are scored on the
+                # VAL-SELECTED checkpoint, same as the reported table, so the
+                # rows reproduce it exactly rather than a different model.
+                for tag, mm in (("fit", m_fit), ("val", m_val), ("test", m)):
+                    for rec in mm["per_loop"]:
+                        loop_rows.append(dict(fold=k + 1, seed=seed,
+                                              split=tag, **rec))
             # always-no-op on THIS fold's test loops. Its mean is 0.0000 by
             # construction on every split, so each MEAN REALIZED column already
             # IS the margin over doing nothing; only its ACCURACY varies by fold.
@@ -1195,7 +1206,7 @@ def run_cv(data: dict, args) -> None:
 
     log.info("\n  Read across the row, not down the column: 'capture' means "
              "nothing without the")
-    log.info("  oracle's 100%% and always-no-op's 0%% on the same table. "
+    log.info("  oracle's 100% and always-no-op's 0% on the same table. "
              "'mean' is the one number")
     log.info("  directly comparable to doing nothing, which scores exactly "
              "+0.0000.")
@@ -1206,7 +1217,7 @@ def run_cv(data: dict, args) -> None:
         acc2, n2 = pairwise_accuracy(mm)
         log.info("  seed %d | no-op vs unmerge+unroll alone: %.1f%% of %d loops"
                  "  (chance = 50%%)", s_, 100 * acc2, n2)
-    log.info("  Those two categories are ~86%% of the population. A 3-way "
+    log.info("  Those two categories are ~86% of the population. A 3-way "
              "accuracy that\n  looks reasonable can still sit at chance on the "
              "call that decides most loops.")
 
@@ -1235,6 +1246,9 @@ def run_cv(data: dict, args) -> None:
         _spread(vals, f"across folds (seed {args.base_seed + s})",
                 "data heterogeneity")
 
+    if args.picks_out and loop_rows:
+        write_csv(args.picks_out, loop_rows)
+        log.info("\n  per-loop picks: %s  (%d rows)", args.picks_out, len(loop_rows))
     if args.csv_out:
         write_csv(args.csv_out, fold_rows)
         log.info("\n  per-fold: %s", args.csv_out)
@@ -1470,6 +1484,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "be ranked. Below ~2 there is no preference to express.")
     p.add_argument("--rank-steps", type=int, default=8)
     p.add_argument("--rank-batch", type=int, default=128)
+    p.add_argument("--picks-out", type=str, default=None,
+                   help="PER-LOOP records for the fit, val and test splits: "
+                        "one row per (fold, seed, split, benchmark, loop) with "
+                        "truth, prediction, chosen action, realized, oracle "
+                        "and the failed/clipped/slower flags. Every aggregate "
+                        "in the report is recomputable from it, so tables and "
+                        "figures can be rebuilt without re-running.")
     p.add_argument("--train-floor-penalty", type=float, default=None,
                    help="Remap the -1.0 clip floor to this value in the "
                         "ROLLOUT reward only. 744 of 8,352 cells sit there "

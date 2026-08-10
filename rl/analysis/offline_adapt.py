@@ -509,9 +509,12 @@ def run(data: dict, args) -> None:
     pa: dict = {}
     rows, leaks = [], 0
 
-    def _sc(picks):
+    loop_rows: list = []
+
+    def _sc(picks, collect=False):
         return score_decisions(picks, data["tables"], data["labels"],
-                               args.deadzone, _mr(args))
+                               args.deadzone, _mr(args), data.get("failures"),
+                               collect=collect)
 
     for k, (tr_b, te_b) in enumerate(folds):
         fit_b, hold_b = holdout_split(tr_b, args.holdout_frac, args.fold_seed + k)
@@ -546,6 +549,14 @@ def run(data: dict, args) -> None:
                                    args.adapt_unfreeze)
                 ad = greedy_picks(tuned, eval_l, data["normalizer"],
                                   data["postf"])
+                if adapt_l and args.picks_out:
+                    # Paired: zero-shot and adapted on IDENTICAL loops, so a
+                    # per-loop join reproduces the delta exactly.
+                    for tag, pk in (("zero_shot", zs), ("adapted", ad)):
+                        for rec in _sc(pk, collect=True)["per_loop"]:
+                            loop_rows.append(dict(fold=k + 1, seed=seed,
+                                                  benchmark=bench, phase=tag,
+                                                  n_adapt_loops=len(adapt_l), **rec))
                 if adapt_l:
                     zero.setdefault(seed, []).extend(zs)
                     adapt.setdefault(seed, []).extend(ad)
@@ -707,6 +718,9 @@ def run(data: dict, args) -> None:
              "category, never beside always-no-op\n  or the zero-shot policy "
              "as if it were a peer.")
 
+    if args.picks_out and loop_rows:
+        write_csv(args.picks_out, loop_rows)
+        log.info("\n  per-loop picks: %s  (%d rows)", args.picks_out, len(loop_rows))
     if args.csv_out:
         write_csv(args.csv_out, rows)
         log.info("\n  per-benchmark: %s", args.csv_out)

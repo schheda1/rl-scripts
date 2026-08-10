@@ -145,7 +145,7 @@ def split_for_adaptation(loops: list, rng: random.Random) -> tuple:
 
 def run(data: dict, args) -> None:
     loops = labelled_loops(data)
-    rows, curve = [], []
+    rows, curve, loop_rows = [], [], []
     for sp in range(args.splits):
         sseed = args.split_seed + sp
         tr_b, te_b = random_split(data["benchmarks"], args.test_frac, sseed)
@@ -166,16 +166,25 @@ def run(data: dict, args) -> None:
                 if not ev_l:
                     continue
                 pooled_ev.extend(ev_l)
-                zs = evaluate(base, ev_l, data, args)
+                want = bool(args.picks_out)
+                zs = evaluate(base, ev_l, data, args, collect=want)
                 if ad_l:
                     # A FRESH copy per benchmark: adapting the shared base would
                     # carry one target's fine-tuning into the next, which is
                     # incremental training over the fold, not few-shot.
                     tuned = copy.deepcopy(base)
                     tuned, n_cells, l0, l1 = adapt_in_place(tuned, ad_l, data, args)
-                    ad = evaluate(tuned, ev_l, data, args)
+                    ad = evaluate(tuned, ev_l, data, args, collect=want)
                 else:
                     n_cells, l0, l1, ad = 0, float("nan"), float("nan"), zs
+                if want:
+                    # Paired on IDENTICAL loops, so joining zero_shot to adapted
+                    # on (benchmark, loop_idx) reproduces the delta exactly.
+                    for tag, ev in (("zero_shot", zs), ("adapted", ad)):
+                        for rec in ev["per_loop"]:
+                            loop_rows.append(dict(split=sp + 1, seed=seed,
+                                                  phase=tag,
+                                                  n_adapt_loops=len(ad_l), **rec))
                 here.append({
                     "split": sp + 1, "seed": seed, "benchmark": b,
                     "n_adapt_loops": len(ad_l), "n_eval_loops": len(ev_l),
@@ -204,6 +213,9 @@ def run(data: dict, args) -> None:
     if args.csv_out and rows:
         write_csv(Path(args.csv_out), [flatten(r) for r in rows])
         log.info("\n  per-benchmark rows: %s", args.csv_out)
+    if args.picks_out and loop_rows:
+        write_csv(Path(args.picks_out), loop_rows)
+        log.info("  per-loop picks: %s  (%d rows)", args.picks_out, len(loop_rows))
     if args.curve_out and curve:
         write_csv(Path(args.curve_out), curve)
         log.info("  base-training q-loss curve: %s", args.curve_out)
@@ -353,6 +365,9 @@ def main() -> None:
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--log-every", type=int, default=0)
     p.add_argument("--csv-out", type=str, default=None)
+    p.add_argument("--picks-out", type=str, default=None,
+                   help="PER-LOOP records, zero-shot and adapted, on the same "
+                        "evaluation loops.")
     p.add_argument("--curve-out", type=str, default=None)
     g = p.add_argument_group("few-shot adaptation")
     g.add_argument("--adapt-lr", type=float, default=1e-3)

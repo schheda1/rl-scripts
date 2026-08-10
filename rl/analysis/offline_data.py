@@ -554,7 +554,8 @@ def best_constant_factor(loops: list, tables: dict, labels: dict,
 
 def score_decisions(picks: list, tables: dict, labels: dict,
                     deadzone: float, missing_reward: "float | None" = None,
-                    failures: "dict | None" = None) -> dict:
+                    failures: "dict | None" = None,
+                    collect: bool = False) -> dict:
     """
     Both evaluation levels over one set of (bench, loop_idx, action) picks.
 
@@ -571,6 +572,12 @@ def score_decisions(picks: list, tables: dict, labels: dict,
             measure how much of a result rides on those cells.
     """
     failures = failures or {}
+    # collect=True adds a PER-LOOP record for every scored pick. Every
+    # aggregate in every report is recomputable from it, which is what lets
+    # tables and figures be rebuilt without re-running the sweep. Off by
+    # default because score_decisions is also called once per epoch for the
+    # learning curves, where the records would be thrown away.
+    per_loop: list = []
     conf = {t: {p: 0 for p in CATEGORIES} for t in CATEGORIES}
     is_fail_value = lambda v: any(abs(v - x) < 1e-9 for x in FAILURE_VALUES)
     realized_sum = oracle_sum = 0.0
@@ -664,6 +671,22 @@ def score_decisions(picks: list, tables: dict, labels: dict,
         realized_sum_applied += r_applied
         if not failed:
             realized_ran_masked.append(r_masked)
+        if collect:
+            per_loop.append({
+                "benchmark": bench, "loop_idx": li,
+                "truth": truth, "predicted": pred,
+                "unmerge": action[0], "factor": action[1],
+                "correct": int(pred == truth),
+                # realized  = what the cell stores (training encoding)
+                # realized_applied = the performance delta: a pick that did
+                #   not build realises 0.0, because the original stands
+                "realized": round(r, 6),
+                "realized_applied": round(r_applied, 6),
+                "oracle": round(orc, 6),
+                "has_headroom": int(orc > deadzone),
+                "failed": int(failed), "at_clip_floor": int(at_floor),
+                "slower": int((not failed) and r < -deadzone),
+            })
         b = per_bench.setdefault(bench, {"realized": 0.0, "oracle": 0.0,
                                          "loops": 0, "regress": 0})
         b["loops"] += 1
@@ -757,6 +780,7 @@ def score_decisions(picks: list, tables: dict, labels: dict,
         # excluded: a slowdown is a real performance delta. Only compile
         # failures and absent cells are held out of the numbers.
         "n_clipped": n_clipped,
+        "per_loop": per_loop,
         "n_benchmarks": len(per_bench),
         "per_bench": per_bench,
     }
