@@ -346,20 +346,39 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
 def evaluate(agent: FactorOnly, loops: list, data: dict, args) -> dict:
     """Probe on the true branch, plus each state population separately."""
     m = score_decisions(probe_picks(agent, loops, data), data["tables"],
-                        data["labels"], args.deadzone, args.missing)
+                        data["labels"], args.deadzone, args.missing,
+                        data.get("failures"))
     _, bar, _ = best_constant_factor(loops, data["tables"], data["labels"],
                                      args.deadzone, args.missing)
-    out = {"probe": m["capture"], "probe_n": m["loops_with_headroom"],
+    out = {"probe": m["capture_applied"], "probe_n": m["loops_with_headroom"],
            "probe_bar": bar,
            # Sums, so callers can POOL rather than average per-benchmark
            # ratios — with one or two evaluation loops apiece, a mean of
            # capture ratios is decided by whichever denominators are smallest.
-           "probe_realized": m["realized_sum"], "probe_oracle": m["oracle_sum"],
-           "probe_mean": m["mean_realized"], "probe_slower": m["n_regress"]}
+           # `probe_realized` uses the APPLIED semantics: a pick that failed
+           # to build contributes 0.0, because the original program stands.
+           "probe_realized": m["realized_sum_applied"],
+           "probe_oracle": m["oracle_sum"],
+           # `probe_slower` counts only picks that BUILT AND RAN — a compile
+           # failure carries the same reward as a slowdown, and 31.4% of cells
+           # in this cache are failures, so the raw n_regress counts programs
+           # that never ran. `probe_failed` is that population, reported apart.
+           "probe_mean": m["mean_realized"],
+           "probe_mean_ran": m["mean_realized_ran"],
+           "probe_slower": m["n_regress_ran"], "probe_failed": m["n_failed"],
+           "probe_ran": m["n_ran"]}
     for u, cat, label in BRANCHES:
-        picks = branch_picks(agent, loops, data, u, cat, args.missing)
+        # ONLY loops whose true category IS this branch. Scoring an
+        # unroll-only loop on the unmerge branch measures a decision the policy
+        # never makes, and its unmerge oracle is often barely above the deadzone
+        # — a single bad pick against a 0.01 denominator reads as -3000% and
+        # swamps the column.
+        want = "unmerge_unroll" if u else "unroll_only"
+        sub = [l for l in loops
+               if data["labels"].get((l["benchmark_name"], l["loop_idx"])) == want]
+        picks = branch_picks(agent, sub, data, u, cat, args.missing)
         c, n = branch_capture(picks, data["tables"], u, args.deadzone)
-        bf, bc = branch_bar(loops, data["tables"], u, cat, args.deadzone,
+        bf, bc = branch_bar(sub, data["tables"], u, cat, args.deadzone,
                             args.missing)
         out[f"u{u}"] = c
         out[f"u{u}_n"] = n
