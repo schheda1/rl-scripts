@@ -97,7 +97,20 @@ def train_on(kind: str, train_loops: list, data: dict, args, seed: int):
     torch.manual_seed(seed)
     random.seed(seed)
     agent = make_agent(kind, args)
-    buf = RolloutBuffer(capacity=args.buffer_size)
+    # BUFFER MUST BE RESIZED FOR THIS SCALE. --buffer-size defaults to 128,
+    # sized for the ~300 loops per epoch the cross-distribution runs collect.
+    # Here a 3-loop benchmark collects 2 samples an epoch, so 15 epochs give 30
+    # in total: buf.full() would never fire, run_epoch would never update, and
+    # the ONLY update would be the end-of-training flush — about 8 gradient
+    # steps on a network at initialisation. That is not a small bias, it is an
+    # untrained agent reported as a result.
+    #
+    # K/batch_size fixes the gradient-steps-per-sample ratio (2/8 = 0.25, the
+    # pipeline's own figure) for ANY buffer at or above one minibatch, so
+    # shrinking it changes update FREQUENCY and the advantage-normalisation
+    # batch, not the amount of learning per sample.
+    cap = max(args.batch_size, min(args.buffer_size, len(train_loops)))
+    buf = RolloutBuffer(capacity=cap)
     observed: dict = {}
     order = list(train_loops)
     for epoch in range(1, args.epochs + 1):
@@ -110,7 +123,7 @@ def train_on(kind: str, train_loops: list, data: dict, args, seed: int):
     for mod in (agent.unmerge_actor, agent.factor_actor, agent.critic):
         mod.eval()
     n_cells = sum(len(v) for v in observed.values())
-    return agent, n_cells
+    return agent, n_cells, cap
 
 
 def run(data: dict, args) -> None:
@@ -149,7 +162,7 @@ def run(data: dict, args) -> None:
                           if has_headroom(l, data["tables"], args.deadzone))
             for si in range(args.seeds):
                 seed = args.base_seed + si
-                agent, n_cells = train_on(args.agent, tr, data, args, seed)
+                agent, n_cells, cap = train_on(args.agent, tr, data, args, seed)
                 m = score_decisions(
                     greedy_picks(agent, ev, data["normalizer"], data["postf"]),
                     data["tables"], data["labels"], args.deadzone, _mr(args))
@@ -163,9 +176,16 @@ def run(data: dict, args) -> None:
                     "benchmark": b, "split": sp, "seed": seed,
                     "n_loops": len(ls), "n_train": len(tr), "n_eval": len(ev),
                     "n_eval_headroom": n_ev_hd, "cells_sampled": n_cells,
+                    "buffer": cap, "n_updates": (args.epochs * len(tr)) // cap,
                     "accuracy": round(m["accuracy"], 6),
                     "mean_realized": round(m["mean_realized"], 6),
                     "capture": round(m["capture"], 6),
+                    # Kept so the aggregate can be POOLED. A mean of per-benchmark
+                    # captures is dominated by near-zero denominators — a
+                    # benchmark whose oracle is +0.005 produces captures in the
+                    # thousands of percent and swamps every real result.
+                    "realized_sum": round(m["realized_sum"], 6),
+                    "oracle_sum": round(m["oracle_sum"], 6),
                     "oracle_mean_realized": round(orc["mean_realized"], 6),
                     "loops_slower": m["n_regress"],
                 })
@@ -187,6 +207,12 @@ def report(rows: list, args) -> None:
     by_b: dict = {}
     for r in rows:
         by_b.setdefault(r["benchmark"], []).append(r)
+    # Benchmarks whose headroom sits entirely in their TRAINING loops cannot be
+    # scored on capture — the eval set has nothing to recover. Reported apart
+    # rather than folded in as nan, which would silently shrink the denominator.
+    scored = {b: rs for b, rs in by_b.items()
+              if sum(r["oracle_sum"] for r in rs) > 0}
+    unscorable = {b: rs for b, rs in by_b.items() if b not in scored}
 
     log.info("=" * 84)
     log.info("  PER-BENCHMARK RL — trained on a few of the application's loops, "
@@ -196,9 +222,12 @@ def report(rows: list, args) -> None:
              "benchmark", "loops", "eval", "hd", "acc", "agent", "oracle",
              "capture", "slower")
     log.info("  " + "-" * 82)
-    for b in sorted(by_b):
-        rs = by_b[b]
-        log.info("  %-24s %5d %5d %4.0f | %5.1f%% | %+8.4f %+8.4f %6.1f%% %6.1f",
+    for b in sorted(scored):
+        rs = scored[b]
+        # %4.1f, not %4.0f: hd is a MEAN across split draws, so a benchmark whose
+        # single eval loop has headroom on one draw in three reads 0.3, and
+        # rounding it to 0 made a positive oracle look impossible.
+        log.info("  %-24s %5d %5d %4.1f | %5.1f%% | %+8.4f %+8.4f %6.1f%% %6.1f",
                  b[:24], rs[0]["n_loops"], rs[0]["n_eval"],
                  _mean([r["n_eval_headroom"] for r in rs]),
                  100 * _mean([r["accuracy"] for r in rs]),
@@ -206,27 +235,74 @@ def report(rows: list, args) -> None:
                  _mean([r["oracle_mean_realized"] for r in rs]),
                  100 * _mean([r["capture"] for r in rs]),
                  _mean([r["loops_slower"] for r in rs]))
+    srows = [r for rs in scored.values() for r in rs]
+    den = sum(r["oracle_sum"] for r in srows)
     log.info("  " + "-" * 82)
     log.info("  %-24s %5s %5s %4s | %5.1f%% | %+8.4f %+8.4f %6.1f%% %6.1f",
-             f"MEAN over {len(by_b)} bm", "", "", "",
-             100 * _mean([r["accuracy"] for r in rows]),
-             _mean([r["mean_realized"] for r in rows]),
-             _mean([r["oracle_mean_realized"] for r in rows]),
-             100 * _mean([r["capture"] for r in rows]),
-             _mean([r["loops_slower"] for r in rows]))
+             f"MEAN over {len(scored)} bm", "", "", "",
+             100 * _mean([r["accuracy"] for r in srows]),
+             _mean([r["mean_realized"] for r in srows]),
+             _mean([r["oracle_mean_realized"] for r in srows]),
+             100 * _mean([r["capture"] for r in srows]),
+             _mean([r["loops_slower"] for r in srows]))
+    log.info("  %-24s %5s %5s %4s | %5s  | %8s %8s %6.1f%%",
+             "POOLED over loops", "", "", "", "", "", "",
+             100 * sum(r["realized_sum"] for r in srows) / den if den else float("nan"))
+    log.info("\n  Read POOLED, not MEAN, for capture. The per-benchmark mean is "
+             "dominated by\n  near-zero denominators — a benchmark whose oracle is "
+             "+0.005 yields captures in\n  the thousands of percent. Pooled weights "
+             "each benchmark by the headroom it\n  actually has.")
     log.info("\n  always-no-op is exactly +0.0000 on every row by construction, so "
              "the agent column\n  IS its margin over doing nothing. Every fixed "
              "action on this population is\n  negative, so any gain here comes "
              "from per-loop decisions.")
     log.info("  Mean cells sampled per benchmark: %.0f  (%d epochs x %d train "
              "loops, with replacement)",
-             _mean([r["cells_sampled"] for r in rows]), args.epochs,
-             round(_mean([r["n_train"] for r in rows])))
+             _mean([r["cells_sampled"] for r in srows]), args.epochs,
+             round(_mean([r["n_train"] for r in srows])))
+    log.info("  Buffer auto-sized to %d-%d (NOT --buffer-size %d, which is sized "
+             "for the\n  cross-distribution runs and would never fill here); "
+             "%.0f updates per run on average.",
+             min(r["buffer"] for r in srows), max(r["buffer"] for r in srows),
+             args.buffer_size, _mean([r["n_updates"] for r in srows]))
+    if unscorable:
+        log.info("\n  %d benchmark(s) not scored — all their headroom is in the "
+                 "TRAINING loops, so\n  the evaluation set has nothing to recover: "
+                 "%s", len(unscorable), ", ".join(sorted(unscorable))[:200])
     if args.no_headroom:
         log.info("\n  NO-HEADROOM GROUP: capture is undefined — there was nothing "
                  "to recover.\n  Read `agent` and `slower`: the correct policy "
                  "declines everywhere and scores\n  exactly +0.0000 with 0 loops "
                  "made slower.")
+
+
+def warn_inert(args) -> None:
+    """
+    Flags this runner inherits from build_parser but does NOT act on.
+
+    build_parser is shared with the cross-distribution runner, so every one of
+    its flags parses here whether or not it does anything. A silently ignored
+    flag costs a whole sweep to discover, and three of these would look like
+    they had been applied.
+    """
+    if args.supcon_coef > 0 or args.rank_coef > 0:
+        log.warning("NOTE --supcon-coef/--rank-coef are IGNORED here: this "
+                    "runner calls run_epoch only,\n     not supcon_step or "
+                    "rank_step. Those terms live in offline_train.train_agent.")
+    if args.factor_head != "mlp":
+        log.warning("NOTE --factor-head %s is IGNORED here: the head swap "
+                    "happens in\n     offline_train.train_agent, and this runner "
+                    "builds its agent with make_agent.", args.factor_head)
+    if args.agent.startswith("category") and args.bandit_warm_epochs > 0:
+        log.warning("NOTE --bandit-warm-epochs %d is IGNORED for %s — "
+                    "build_warm_start_entries encodes\n     action1 as an unmerge "
+                    "bit, which a 3-way head reads as a category index.",
+                    args.bandit_warm_epochs, args.agent)
+    log.warning("NOTE --folds/--holdout-frac/--patience/--curve-every do nothing "
+                "here: the split is\n     per benchmark (--splits) and there is "
+                "no validation selection — with 2 training\n     loops there is "
+                "nothing to select on, and selecting on the evaluation loops "
+                "would\n     leak them. The FINAL-epoch agent is scored.\n")
 
 
 def main() -> None:
@@ -241,6 +317,7 @@ def main() -> None:
                         "Nothing to recover; the only correct behaviour is to "
                         "decline, so this measures damage.")
     args = p.parse_args()
+    warn_inert(args)
     torch.set_num_threads(max(1, args.threads))
     data = load_run(args.run_dir, args.deadzone, args.labels)
     log.info("Loaded %d loops / %d benchmarks | %d labelled\n",
