@@ -345,6 +345,11 @@ def main() -> None:
     p.add_argument("--epsilon", type=float, default=0.3)
     p.add_argument("--epsilon-final", type=float, default=0.05)
     p.add_argument("--missing", type=float, default=-0.161)
+    p.add_argument("--train-floor-penalty", type=float, default=None,
+                   help="Remap the -1.0 clip floor in the BASE-TRAINING "
+                        "rollout reward only. REQUIRED here because "
+                        "factor_only.train reads it; adaptation itself fits "
+                        "measured cells and is unaffected. Off by default.")
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--log-every", type=int, default=0)
     p.add_argument("--csv-out", type=str, default=None)
