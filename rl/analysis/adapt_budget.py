@@ -396,25 +396,33 @@ def main() -> None:
     print("  capture of the oracle; picks are committed and charged, so compare")
     print("  these to factor_only's `probe` row, not to its top-k rows.\n")
     print(f"  {'loops':>5} {'fac':>4} {'cost':>5} {'tgts':>5} {'eval':>5} | "
-          f"{'global':>7} {'adapted':>8} {'gain':>7} | {'unshrunk':>9} "
-          f"{'randsel':>8}")
-    best = (None, -float("inf"))
+          f"{'global':>7} {'adapted':>8} {'gain +- sd across splits':>26} | "
+          f"{'unshrunk':>9} {'randsel':>8}")
+    best = (None, -float("inf"), 0.0)
     for n_loops, n_cand in configs:
         c = rows.get((n_loops, n_cand, "central"))
         if not c:
             continue
         rnd = rows.get((n_loops, n_cand, "random"))
         g, a = stats.fmean(c["g"]), stats.fmean(c["a"])
-        # randsel is shown as its OWN gain: it is scored on a different eval set
-        # (different loops were spent on adaptation), so only the delta against
-        # its own bar is comparable to the central one.
-        rd = (stats.fmean(rnd["a"]) - stats.fmean(rnd["g"])) if rnd else float("nan")
+        # Per-split gain, not the difference of the two means. A gain smaller
+        # than its own spread across splits is not a gain, and the mean alone
+        # cannot show that.
+        gains = [x - y for x, y in zip(c["a"], c["g"])]
+        sd = stats.pstdev(gains) if len(gains) > 1 else 0.0
+        rd = (stats.fmean([x - y for x, y in zip(rnd["a"], rnd["g"])])
+              if rnd else float("nan"))
+        tg = stats.fmean(c["tgt"])
+        # A row built from a couple of unusual benchmarks is not the same
+        # experiment as the rows above it, and looks identical unless flagged.
+        thin = "  <- few targets" if tg < 5 else ""
         print(f"  {n_loops:>5} {n_cand:>4} {n_loops * n_cand:>5} "
-              f"{stats.fmean(c['tgt']):>5.0f} {stats.fmean(c['ev']):>5.0f} | "
-              f"{g:6.1%} {a:7.1%} {a - g:+6.1%} | "
-              f"{stats.fmean(c['r']):8.1%} {rd:+7.1%}")
+              f"{tg:>5.0f} {stats.fmean(c['ev']):>5.0f} | "
+              f"{g:6.1%} {a:7.1%} {a - g:+9.1%} +- {sd:5.1%} "
+              f"[{min(gains):+.1%}, {max(gains):+.1%}] | "
+              f"{stats.fmean(c['r']):8.1%} {rd:+7.1%}{thin}")
         if a - g > best[1]:
-            best = ((n_loops, n_cand), a - g)
+            best = ((n_loops, n_cand), a - g, sd)
 
     print("\n  global    best legal factor by the TRAIN prior, shipped "
           "everywhere. The bar.")
@@ -423,11 +431,25 @@ def main() -> None:
     print("  gain      adapted minus global on the SAME eval loops.")
     print("  randsel   gain when adaptation loops are chosen at random instead.")
 
-    cfg, gain = best
-    print(f"\n  READ: best is {cfg[0]} loop(s) x {cfg[1]} factors at "
-          f"{gain:+.1%} over the global\n  constant. Adaptation earns its "
-          f"compiles only if that gain is positive and\n  bigger than the "
-          f"spread across your splits.")
+    cfg, gain, sd = best
+    print(f"\n  READ: best is {cfg[0]} loop(s) x {cfg[1]} factors, "
+          f"{gain:+.1%} +- {sd:.1%} over the\n  global constant, for "
+          f"{cfg[0] * cfg[1]} compiles per target.")
+    if sd > 0 and gain < sd:
+        print(f"  That gain is SMALLER than its own spread across splits. It is "
+              f"not yet a\n  result — it is one or two lucky splits. More "
+              f"splits would tell you which.")
+    elif gain > 0:
+        print(f"  The gain clears its own spread, so it is a real effect at "
+              f"this budget.\n  Whether it is worth {cfg[0] * cfg[1]} compiles "
+              f"per application is a separate\n  question, and the answer "
+              f"depends on how often you recompile.")
+    else:
+        print("  No configuration beats shipping the global constant. Adaptation "
+              "does not\n  earn its compiles on this data.")
+    print("\n  Rows marked 'few targets' come from a handful of unusually "
+          "loop-rich\n  benchmarks, not the population above them. Do not read "
+          "them as a trend.")
     if t2 <= 1e-9:
         print("\n  tau^2 is zero: applications do NOT differ in factor "
               "preference here, so\n  no adaptation can beat the global "
