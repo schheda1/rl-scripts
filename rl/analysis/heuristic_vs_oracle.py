@@ -42,6 +42,7 @@ import json
 import statistics as st
 import sys
 from pathlib import Path
+from offline_data import CLIP_FLOOR, FAILURE_VALUES
 
 CATEGORIES = ("noop", "unroll_only", "unmerge_unroll")
 LABEL = {"noop": "no-op", "unroll_only": "unroll-only",
@@ -94,6 +95,8 @@ def main() -> None:
     p.add_argument("--labels", type=Path, default=None,
                    help="default: RUN_DIR/loop_labels.csv")
     p.add_argument("--csv-out", type=Path, default=None)
+    p.add_argument("--picks-out", type=Path, default=None,
+                   help="PER-LOOP records in the SAME schema the RL runners emit,\n so the baseline and the policy can be compared row for row.")
     args = p.parse_args()
 
     dec_f = args.decisions or (args.run_dir / "heuristic_decisions.csv")
@@ -149,9 +152,24 @@ def main() -> None:
                 excluded_oracle += oracle
                 continue
             realized = float(rewards[cell])
+        # SAME treatment as the RL runners (offline_data.score_decisions), or
+        # the baseline and the policy are scored on different rules and the
+        # comparison is meaningless. A compile failure realises 0.0 — the
+        # transform did not build, the original stands. A clip-floor cell RAN
+        # and counts, but is flagged: it is censored at ">=100% slower or timed
+        # out" and the two cannot be separated in this cache.
+        failed = any(abs(realized - v) < 1e-9 for v in FAILURE_VALUES)
+        at_floor = (not failed) and realized <= CLIP_FLOOR + 1e-9
         rows.append({"benchmark": key[0], "loop_idx": key[1], "truth": truth,
-                     "pred": pred, "factor": factor if factor is not None else "",
-                     "oracle": oracle, "realized": realized})
+                     "pred": pred, "predicted": pred,
+                     "factor": factor if factor is not None else "",
+                     "unmerge": 0 if factor is None else 1,
+                     "correct": int(pred == truth),
+                     "oracle": oracle, "has_headroom": int(oracle > dz),
+                     "realized": realized,
+                     "realized_applied": 0.0 if failed else realized,
+                     "failed": int(failed), "at_clip_floor": int(at_floor),
+                     "slower": int((not failed) and realized < -dz)})
 
     if skipped_conflict:
         print(f"  labelled loops with a conflict    : {skipped_conflict}"
@@ -198,7 +216,7 @@ def main() -> None:
     print("  ERROR MODES")
     print("=" * 74)
     harmful = [x for x in rows if x["truth"] == "noop"
-               and x["pred"] != "noop" and x["realized"] < -dz]
+               and x["pred"] != "noop" and x["slower"]]
     benign = [x for x in rows if x["truth"] == "noop"
               and x["pred"] != "noop" and x["realized"] >= -dz]
     missed = [x for x in rows if x["truth"] != "noop" and x["pred"] == "noop"]
@@ -231,7 +249,7 @@ def main() -> None:
         o, r_ = sum(x["oracle"] for x in hit), sum(x["realized"] for x in hit)
         print(f"    oracle {o:+.3f} -> realized {r_:+.3f}   "
               f"capture {100 * r_ / o if o else float('nan'):.1f}%")
-        worse = [x for x in hit if x["realized"] < -dz]
+        worse = [x for x in hit if x["slower"]]
         if worse:
             print(f"    of these, {len(worse)} ended up SLOWER despite headroom "
                   f"existing:")
@@ -251,21 +269,39 @@ def main() -> None:
     assert len(head) == sum(1 for x in rows if x["truth"] != "noop"), \
         "headroom set and non-noop categories disagree — label invariant broken"
     o = sum(x["oracle"] for x in head)
-    r_ = sum(x["realized"] for x in head)
+    # realized_applied: a pick that never built realises 0.0, not the penalty.
+    r_ = sum(x["realized_applied"] for x in head)
+    r_masked = sum(0.0 if x["at_clip_floor"] else x["realized_applied"]
+                   for x in head)
     print(f"  loops with headroom      : {len(head)}")
     print(f"  oracle available         : {o:+.3f}")
     print(f"  heuristic realized       : {r_:+.3f}")
     print(f"  capture ratio            : "
           f"{100 * r_ / o if o else float('nan'):.1f}%")
-    reg = [x for x in rows if x["realized"] < -dz]
+    print(f"  capture bound            : "
+          f"{100 * r_ / o if o else float('nan'):.1f}% .. "
+          f"{100 * r_masked / o if o else float('nan'):.1f}%"
+          f"   (clip cells as slowdowns .. as timeouts)")
+    reg = [x for x in rows if x["slower"]]
+    n_fail = sum(x["failed"] for x in rows)
+    n_clip = sum(x["at_clip_floor"] for x in rows)
     print(f"  loops made SLOWER        : {len(reg)}  {pct(len(reg), len(rows))}")
     if reg:
         print(f"  total cost of those      : "
               f"{sum(x['realized'] for x in reg):+.3f}")
+    print(f"  never built              : {n_fail}  {pct(n_fail, len(rows))}"
+          f"   <- compile failures, excluded from the delta")
+    print(f"  at the -1.0 clip floor   : {n_clip}"
+          f"   <- counted, magnitude censored")
     print(f"  mean realized, all loops : "
-          f"{st.mean([x['realized'] for x in rows]):+.4f}"
+          f"{st.mean([x['realized_applied'] for x in rows]):+.4f}"
           f"   (oracle {st.mean([x['oracle'] for x in rows]):+.4f})")
 
+    if args.picks_out:
+        with open(args.picks_out, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w.writeheader(); w.writerows(rows)
+        print(f"\n  per-loop picks: {args.picks_out}  ({len(rows)} rows)")
     if args.csv_out:
         by: dict = {}
         for x in rows:
@@ -276,7 +312,7 @@ def main() -> None:
             b["loops"] += 1
             b["fired"] += int(x["pred"] != "noop")
             b["harmful"] += int(x["truth"] == "noop" and x["pred"] != "noop"
-                                and x["realized"] < -dz)
+                                and x["slower"])
             b["missed"] += int(x["truth"] != "noop" and x["pred"] == "noop")
             b["oracle"] += x["oracle"]
             b["realized"] += x["realized"]
