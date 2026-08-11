@@ -114,6 +114,7 @@ class FactorOnly:
         # meaningless and the curve is the only place it shows.
         self.last_rankable = float("nan")
         self.last_cells = float("nan")
+        self.last_floor = float("nan")
         decay, no_decay = [], []
         for p in self.factor_actor.parameters():
             (decay if p.ndim >= 2 else no_decay).append(p)
@@ -180,6 +181,25 @@ class FactorOnly:
             T.append(torch.softmax(rv / self.rank_temp, dim=0))
         return S, T, M
 
+    @staticmethod
+    def target_entropy(T: list) -> float:
+        """
+        Mean H(target) over the rows in a batch — the FLOOR of the loss.
+
+        Cross-entropy against a soft target cannot go below the target's own
+        entropy, and that entropy grows as a row fills: two measured cells give
+        a near-binary target with a low floor, eight cells spread over a tenth
+        of reward give a much flatter one. So the raw loss RISES as cells/row
+        rises even when the fit is improving, and comparing it across epochs is
+        meaningless. The excess over this floor is the part the model owns.
+        """
+        tot = 0.0
+        for t in T:
+            # 0*log(0) is 0, not NaN — the unobserved positions carry zero mass.
+            tot += float(-(torch.where(t > 0, t * torch.log(t),
+                                       torch.zeros_like(t))).sum())
+        return tot / len(T) if T else float("nan")
+
     def update(self, buf: list, observed: dict) -> float:
         """
         One pass of K epochs over the buffer. Buffer entries are
@@ -201,6 +221,7 @@ class FactorOnly:
                           loss term.
         """
         tot, n = 0.0, 0
+        floor_sum = 0.0
         rows, cells, seen_rows = 0, 0, 0
         for _ in range(self.K):
             order = list(range(len(buf)))
@@ -228,6 +249,7 @@ class FactorOnly:
                 logits = self.factor_actor.forward(torch.stack(S))
                 tot += self._step(rank_loss(logits, torch.stack(T),
                                             torch.stack(M)))
+                floor_sum += self.target_entropy(T)
                 n += 1
                 rows += len(S)
                 cells += int(sum(int(m.sum()) for m in M))
@@ -236,6 +258,16 @@ class FactorOnly:
         # single measured cell early on — and climbs as the table fills. It is
         # the direct check that the change took effect.
         self.last_rankable = rows / seen_rows if seen_rows else float("nan")
+        # The loss floor for this update's targets. Under 'cell' there is no
+        # target distribution and so no floor; excess then equals the loss.
+        # NaN when nothing was usable, so the epoch mean drops it — returning
+        # 0.0 there would pull the floor down while the LOSS mean excluded the
+        # same update, and `excess` would come out wrong in the one place it
+        # matters most, the early epochs.
+        if self.loss_mode == "cell":
+            self.last_floor = 0.0
+        else:
+            self.last_floor = floor_sum / n if n else float("nan")
         self.last_cells = cells / rows if rows else float("nan")
         # NaN, not 0.0, when no batch was usable. A zero loss reads as a perfect
         # fit and is the exact opposite of what an empty epoch means — and epoch
@@ -534,7 +566,7 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
         # transfer. Those are different results and the final table cannot tell
         # them apart.
         loss_sum, n_upd = 0.0, 0
-        rank, cpr = [], []
+        rank, cpr, flo = [], [], []
         for i in order:
             l, u, s, m = cells[i]
             idx = agent.select(s, m)
@@ -556,6 +588,7 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
                     loss_sum += _l; n_upd += 1
                 rank.append(agent.last_rankable)
                 cpr.append(agent.last_cells)
+                flo.append(agent.last_floor)
                 buf = []
         if buf:
             _l = agent.update(buf, observed)
@@ -563,12 +596,24 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
                 loss_sum += _l; n_upd += 1
             rank.append(agent.last_rankable)
             cpr.append(agent.last_cells)
+            flo.append(agent.last_floor)
             buf = []
         cov = len(seen) / n_legal if n_legal else float("nan")
         ok = [c for c in cpr if c == c]
         rk = [c for c in rank if c == c]
+        fl = [c for c in flo if c == c]
+        _loss = loss_sum / n_upd if n_upd else float("nan")
+        _floor = (sum(fl) / len(fl)) if fl else float("nan")
         history.append({"epoch": epoch,
-                        "loss": loss_sum / n_upd if n_upd else float("nan"),
+                        "loss": _loss,
+                        # H(target): the lowest the loss can go on these rows.
+                        # It RISES as rows fill, so `loss` rising is not by
+                        # itself bad news.
+                        "floor": _floor,
+                        # loss - floor = KL(target || prediction). This is the
+                        # only one of the three that is comparable across
+                        # epochs, and the one that should fall.
+                        "excess": _loss - _floor,
                         "epsilon": agent.epsilon, "coverage": cov,
                         "updates": n_upd,
                         # Rows the loss actually consumed this epoch, and how
@@ -580,9 +625,11 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
                         "cells_per_row": (sum(ok) / len(ok)) if ok else float("nan")})
         if args.log_every and (epoch % args.log_every == 0
                                or epoch in (1, args.epochs)):
-            log.info("      epoch %4d | loss %.5f | eps %.3f | coverage %5.1f%% "
-                     "| rankable %5.1f%% | cells/row %.2f",
-                     epoch, history[-1]["loss"], agent.epsilon, 100 * cov,
+            log.info("      epoch %4d | loss %.4f floor %.4f EXCESS %.4f | "
+                     "eps %.3f | coverage %5.1f%% | rankable %5.1f%% | "
+                     "cells/row %.2f",
+                     epoch, history[-1]["loss"], history[-1]["floor"],
+                     history[-1]["excess"], agent.epsilon, 100 * cov,
                      100 * history[-1]["rankable"], history[-1]["cells_per_row"])
     return agent, (len(seen) / n_legal if n_legal else float("nan")), history
 
@@ -775,6 +822,8 @@ def main() -> None:
                          "n_test_benchmarks": len(te_b), "coverage": cov,
                          "loss_first": hist[0]["loss"],
                          "loss_final": hist[-1]["loss"],
+                         "excess_first": hist[0]["excess"],
+                         "excess_final": hist[-1]["excess"],
                          # Final-epoch supervision width. Under --loss row this
                          # is the whole point of the change, so it belongs in
                          # the summary and not only in the curve file.

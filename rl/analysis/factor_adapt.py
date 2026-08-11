@@ -53,6 +53,7 @@ import torch.nn as nn                                            # noqa: E402
 import torch.nn.functional as F                                  # noqa: E402
 
 from agent import FACTOR_VALUES                                  # noqa: E402
+from factor_rank import rank_loss                                # noqa: E402
 from factor_only import (best_constant_factor, evaluate,        # noqa: E402
                          labelled_loops, load_run, loops_for,
                          random_split, states_for, train)
@@ -99,31 +100,79 @@ def adaptation_rows(loops: list, data: dict) -> list:
     was never paid for. That differs from TRAINING, where an absent cell is
     charged the penalty because collection there was exhaustive — the asymmetry
     is deliberate and is what keeps the adaptation budget honest.
+
+    Entries are (state, factor_index, reward, row_key) — the same 4-tuple shape
+    factor_only's training buffer uses, so the row loss can be rebuilt from them
+    without a second, drifting copy of the packing rules.
     """
     rows = []
     for l in loops:
-        table = data["tables"][(l["benchmark_name"], l["loop_idx"])]
+        key = (l["benchmark_name"], l["loop_idx"])
+        table = data["tables"][key]
         for u, s2, mask in states_for(l, data):
             for i, f in enumerate(FACTOR_VALUES):
                 if bool(mask[i]) and (u, f) in table:
-                    rows.append((s2, i, table[(u, f)]))
+                    rows.append((s2, i, table[(u, f)], (key[0], key[1], u)))
     return rows
 
 
 def adapt_in_place(agent, loops: list, data: dict, args):
-    """Fine-tune a COPY's trailing layers on the adaptation loops' measured cells."""
+    """
+    Fine-tune a COPY's trailing layers on the adaptation loops' measured cells.
+
+    THE LOSS MUST MATCH THE ONE THE BASE WAS TRAINED WITH.
+
+    Under agent.loss_mode == 'row' the head's outputs are logits of a soft
+    distribution: their SCALE is arbitrary and only their ordering means
+    anything. Fine-tuning such a head with MSE against raw reward drags those
+    logits toward reward magnitudes and destroys the ordering the base model
+    learned, to fix a scale that was never meaningful. It makes the adapted
+    model reliably WORSE than zero-shot — not noisily, systematically.
+
+    So the objective is taken from the agent, not hardcoded.
+    """
     trainable = freeze_for_adaptation(agent, args.adapt_unfreeze)
     rows = adaptation_rows(loops, data)
     if not rows or not trainable:
         return agent, 0, float("nan"), float("nan")
+
+    mode = getattr(agent, "loss_mode", "cell")
     s = torch.stack([r[0] for r in rows])
     a = torch.tensor([r[1] for r in rows], dtype=torch.long)
     r = torch.tensor([r[2] for r in rows], dtype=torch.float32)
+
+    if mode == "row":
+        # Rebuild the same soft targets the base was trained on. `observed` is
+        # the target's measured table; the buffer is one entry PER ROW, not per
+        # cell, so a row with eight measured cells is one loss term rather than
+        # eight identical ones.
+        observed: dict = {}
+        for _st, idx, rew, key in rows:
+            observed.setdefault(key, {})[FACTOR_VALUES[idx]] = rew
+        seen_keys, buf = set(), []
+        for st, idx, rew, key in rows:
+            if key not in seen_keys:
+                seen_keys.add(key)
+                buf.append((st, idx, rew, key))
+        # agent._row_batch, not a local copy: the temperature, the min-cells
+        # rule and the -inf masking then cannot drift apart from training.
+        S, T, M = agent._row_batch(buf, observed)
+        if not S:
+            return agent, len(rows), float("nan"), float("nan")
+        S_, T_, M_ = torch.stack(S), torch.stack(T), torch.stack(M)
+
+        def loss_fn():
+            return rank_loss(agent.factor_actor.forward(S_), T_, M_)
+    else:
+        def loss_fn():
+            q = agent.factor_actor.forward(s).gather(
+                1, a.unsqueeze(1)).squeeze(1)
+            return F.mse_loss(q, r)
+
     opt = torch.optim.AdamW(trainable, lr=args.adapt_lr)
     first = last = float("nan")
     for step in range(args.adapt_steps):
-        q = agent.factor_actor.forward(s).gather(1, a.unsqueeze(1)).squeeze(1)
-        l_ = F.mse_loss(q, r)
+        l_ = loss_fn()
         opt.zero_grad()
         l_.backward()
         if agent.max_grad_norm > 0:
@@ -251,14 +300,20 @@ def report(rows: list, args) -> None:
         h = len(xs) // 2
         return xs[h] if len(xs) % 2 else (xs[h - 1] + xs[h]) / 2
 
-    nparams = {1: 650, 2: 9034}[args.adapt_unfreeze]
+    # net[6] is Linear(64,10)=650 on the mlp head but Linear(64,1)=65 on the
+    # scorer, so this is keyed by BOTH the head and the level. A single table
+    # would misreport the scorer arm tenfold in the one line stating the budget.
+    #   net[3] Linear(128,64) = 8256   net[4] LayerNorm(64) = 128
+    nparams = {("mlp", 1): 650, ("mlp", 2): 9034,
+               ("scorer", 1): 65, ("scorer", 2): 8449}[
+        (getattr(args, "factor_head", "mlp"), args.adapt_unfreeze)]
     log.info("\n" + "=" * 74)
     log.info("  FEW-SHOT ADAPTATION — isolated unroller, factor head only")
     log.info("=" * 74)
     log.info("  %d runs with adaptation loops | %d control (single-loop) | "
              "%d scorable", len(ad), len(ctrl), len(scored))
     log.info("  budget: %.1f loops, %.0f measured cells, %d steps, "
-             "%d layer(s) = %d params\n",
+             "%d layer(s) = %.0f params\n",
              _mean([r["n_adapt_loops"] for r in ad]),
              _mean([r["adapt_cells"] for r in ad]),
              args.adapt_steps, args.adapt_unfreeze, nparams)
