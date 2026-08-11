@@ -100,6 +100,10 @@ def main() -> None:
 
     n_fail = n_clip = n_illegal = 0
     arms: dict = {}
+    # Same grouping, but keeping the FACTOR so the smoothness test can order by
+    # it. Kept separate from `arms` so the variance decomposition below reads
+    # exactly as the plain snippet did.
+    arm_cells: dict = {}
     for key, v in rewards.items():
         parts = key.split("|")
         if len(parts) != 4:
@@ -120,6 +124,7 @@ def main() -> None:
             n_illegal += 1
             continue
         arms.setdefault((b, li, u), []).append(v)
+        arm_cells.setdefault((b, li, u), []).append((f, v))
 
     # An arm with one cell has no within-variance and no factor question.
     single = sum(1 for v in arms.values() if len(v) < 2)
@@ -156,10 +161,65 @@ def main() -> None:
           f"{flat}/{len(arms)} ({flat / len(arms):.0%})")
     print("  On those the factor genuinely does not matter, whatever a model "
           "predicts.")
-    print("\n  Compare the median against your measurement noise. The cache has "
-          "one\n  measurement per cell and no replicates, so that noise is "
-          "unmeasured — if\n  the two are the same size, the factor is not "
-          "learnable and that is the result.")
+
+    # A range over k cells is inflated by k. For k iid draws E[range] = d2(k)*sigma,
+    # so the median range alone cannot tell a real spread from noise -- report the
+    # sigma that would explain it entirely and let the reader judge the harness.
+    k = len(allv) / len(arms)
+    d2 = {2: 1.128, 3: 1.693, 4: 2.059, 5: 2.326, 6: 2.534, 7: 2.704,
+          8: 2.847, 9: 2.970, 10: 3.078}.get(round(k), 2.847)
+    print(f"\n  {k:.1f} cells per arm on average. Pure noise with sigma = "
+          f"{q(0.50) / d2:.4f} would\n  produce this median range on its own "
+          f"(E[range] = {d2:.2f}*sigma at k={round(k)}). The\n  smoothness test "
+          f"below is what separates that case from a real response.")
+
+    print("\nIS THE RESPONSE SMOOTH IN THE FACTOR?")
+    print("  Each arm is centred, then adjacent-factor rewards are correlated.")
+    print("  A real response curve gives a clear positive, because neighbouring")
+    print("  factors do similar things to the same loop.")
+    # The null is NOT zero. Centring inside an arm forces its residuals to sum
+    # to zero, which induces a correlation of -1/(k-1) between any two of them.
+    # At k=8 that is -0.14, so a raw rho of 0.00 is already ABOVE chance and
+    # comparing against zero would report white noise as weak structure.
+    null = -1.0 / (k - 1) if k > 1 else 0.0
+    xs, ys = [], []
+    for (b, li, u), v in arms.items():
+        # Re-read the arm in FACTOR ORDER; `arms` was filled in cache order.
+        cells = sorted((f, r) for f, r in arm_cells[(b, li, u)])
+        if len(cells) < 2:
+            continue
+        m = stats.fmean(r for _, r in cells)
+        for (f1, r1), (f2, r2) in zip(cells, cells[1:]):
+            if f2 - f1 != 1:            # adjacency in f, not merely in the list
+                continue
+            xs.append(r1 - m)
+            ys.append(r2 - m)
+    if len(xs) >= 3 and stats.pstdev(xs) > 0 and stats.pstdev(ys) > 0:
+        mx, my = stats.fmean(xs), stats.fmean(ys)
+        cov = sum((a - mx) * (b_ - my) for a, b_ in zip(xs, ys)) / len(xs)
+        rho = cov / (stats.pstdev(xs) * stats.pstdev(ys))
+        print(f"\n  lag-1 correlation in f: {rho:+.3f}   over {len(xs)} "
+              f"adjacent pairs")
+        print(f"  white-noise null       : {null:+.3f}   (centring artefact, "
+              f"-1/(k-1) at k={k:.1f})")
+        print(f"  excess over null       : {rho - null:+.3f}   <- this is the "
+              f"number to read")
+        rho = rho - null
+        if rho > 0.25:
+            print("  -> SMOOTH. The within-arm variation is structure, not "
+                  "noise, and it is\n     expressible by a head that takes the "
+                  "factor as an INPUT. Ten free\n     output logits cannot "
+                  "represent it without rediscovering it per neuron.")
+        elif rho > 0.10:
+            print("  -> WEAK. Some structure, but most of the within-arm "
+                  "variation behaves\n     like noise in f. Expect a low "
+                  "ceiling.")
+        else:
+            print("  -> FLAT. Adjacent factors are uncorrelated: the within-arm "
+                  "variation is\n     white noise in f. No model can learn it, "
+                  "and that is the result.")
+    else:
+        print("\n  too few adjacent pairs to correlate")
 
     if args.csv:
         with open(args.csv, "w", newline="") as fh:
