@@ -55,6 +55,7 @@ import torch.nn.functional as F                                  # noqa: E402
 
 from adapt_eval import make_state                                # noqa: E402
 from agent import FACTOR_VALUES, N_FACTORS, FactorActor          # noqa: E402
+from factor_rank import rank_loss                                # noqa: E402
 from category_agent import (UNMERGE_UNROLL, UNROLL_ONLY,         # noqa: E402
                             category_factor_mask)
 from offline_data import (IDX_TRIP_COUNT, IDX_TRIP_KNOWN, NOOP,  # noqa: E402
@@ -83,11 +84,31 @@ class FactorOnly:
     """`factor_actor` and its optimizer. Nothing else exists."""
 
     def __init__(self, lr: float, weight_decay: float, max_grad_norm: float,
-                 epsilon: float, batch_size: int, K: int) -> None:
-        self.factor_actor = FactorActor(logit_cap=0.0).to(DEVICE)
+                 epsilon: float, batch_size: int, K: int,
+                 loss_mode: str = "row", rank_temp: float = 0.1,
+                 row_min_cells: int = 2, head: str = "mlp",
+                 feats: str = "basic") -> None:
+        if head == "scorer":
+            # Shares weights across the ten factors instead of learning ten
+            # independent output rows. Drop-in: it subclasses FactorActor and
+            # overrides only forward, so select/update/probe_topk are unchanged.
+            from factor_scorer import FactorScorer
+            self.factor_actor = FactorScorer(feats=feats, logit_cap=0.0).to(DEVICE)
+        else:
+            self.factor_actor = FactorActor(logit_cap=0.0).to(DEVICE)
+        self.head, self.feats = head, feats
+        self.loss_mode = loss_mode
+        self.rank_temp = rank_temp
+        self.row_min_cells = row_min_cells
         self.epsilon = epsilon
         self.max_grad_norm = max_grad_norm
         self.batch_size, self.K = batch_size, K
+        # Set by update() so the epoch line can show whether the row loss is
+        # actually being fed. Early on most rows have too few observed cells to
+        # rank and the loss sees nothing; if that never changes the run is
+        # meaningless and the curve is the only place it shows.
+        self.last_rows = 0
+        self.last_cells = float("nan")
         decay, no_decay = [], []
         for p in self.factor_actor.parameters():
             (decay if p.ndim >= 2 else no_decay).append(p)
@@ -109,11 +130,73 @@ class FactorOnly:
             q = q.masked_fill(~mask, float("-inf"))
         return int(q.argmax())
 
-    def update(self, buf: list) -> float:
-        """MSE(Q[chosen], reward) over the buffer. Mirrors the bandit's Q2 term
-        (category_agent.py:392-394) with Q1, the critic and the bootstrap gone —
-        there is no first stage to back a value up from."""
+    def _step(self, loss: torch.Tensor) -> float:
+        self.optimizer.zero_grad()
+        loss.backward()
+        if self.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self._all_params, self.max_grad_norm)
+        self.optimizer.step()
+        return float(loss)
+
+    def _row_batch(self, batch: list, observed: dict) -> tuple:
+        """
+        (states, targets, masks) for the rows in this minibatch.
+
+        One row per buffer entry = one (loop, branch). The target is
+        softmax(r / temp) over the cells MEASURED SO FAR for that row, with the
+        unmeasured positions at -inf so they take exactly zero target mass.
+
+        Two properties of this target worth being explicit about, because both
+        are load-bearing:
+
+          * softmax is shift-invariant, so adding a constant to the whole row
+            changes nothing. The loop's overall level -- 74.7% of the variance
+            in this cache, and invisible to argmax -- drops out for free. No
+            separate centring step is needed.
+          * a cell at -1.0 gets essentially zero target mass at temp=0.1, so it
+            stops dominating the gradient. That is the whole reason this is not
+            MSE: the large-magnitude cells here are the very negative ones, and
+            no decision ever reads whether -1.0 was predicted as -0.9.
+
+        Rows with fewer than `row_min_cells` measurements are dropped: with one
+        observed cell the target is one-hot over a single unmasked position, the
+        log-softmax is 0, and the row contributes nothing but bookkeeping.
+        """
+        S, T, M = [], [], []
+        for s, _idx, _r, key in batch:
+            row = observed.get(key, {})
+            if len(row) < self.row_min_cells:
+                continue
+            rv = torch.full((N_FACTORS,), float("-inf"))
+            for f, rew in row.items():
+                rv[FACTOR_VALUES.index(f)] = rew
+            S.append(s)
+            M.append(torch.isfinite(rv))
+            T.append(torch.softmax(rv / self.rank_temp, dim=0))
+        return S, T, M
+
+    def update(self, buf: list, observed: dict) -> float:
+        """
+        One pass of K epochs over the buffer. Buffer entries are
+        (state, factor_idx, reward, row_key).
+
+        loss_mode='cell'  MSE(Q[chosen], reward) — the original. Each sample
+                          supervises ONE of the ten outputs and is then dropped,
+                          so each output row is fitted from roughly a tenth of
+                          the data and nothing ever compares the ten outputs of
+                          the same loop to each other.
+
+        loss_mode='row'   Soft cross-entropy over every cell measured so far for
+                          that loop-branch. Same measurements, same budget: the
+                          agent still only ever sees cells it paid for. What
+                          changes is that a measurement keeps contributing after
+                          the step in which it was taken, so every output is
+                          supervised on every loop the agent has data for, and
+                          the ten outputs of one loop finally appear in the same
+                          loss term.
+        """
         tot, n = 0.0, 0
+        rows, cells = 0, 0
         for _ in range(self.K):
             order = list(range(len(buf)))
             random.shuffle(order)
@@ -121,20 +204,29 @@ class FactorOnly:
                 batch = [buf[j] for j in order[i:i + self.batch_size]]
                 if not batch:
                     continue
-                s = torch.stack([b[0] for b in batch])
-                a = torch.tensor([b[1] for b in batch], dtype=torch.long)
-                r = torch.tensor([b[2] for b in batch], dtype=torch.float32)
-                q = self.factor_actor.forward(s).gather(
-                    1, a.unsqueeze(1)).squeeze(1)
-                loss = F.mse_loss(q, r)
-                self.optimizer.zero_grad()
-                loss.backward()
-                if self.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(self._all_params,
-                                                   self.max_grad_norm)
-                self.optimizer.step()
-                tot += float(loss)
+                if self.loss_mode == "cell":
+                    s = torch.stack([b[0] for b in batch])
+                    a = torch.tensor([b[1] for b in batch], dtype=torch.long)
+                    r = torch.tensor([b[2] for b in batch], dtype=torch.float32)
+                    q = self.factor_actor.forward(s).gather(
+                        1, a.unsqueeze(1)).squeeze(1)
+                    tot += self._step(F.mse_loss(q, r))
+                    n += 1
+                    rows += len(batch)
+                    cells += len(batch)          # one supervised cell per sample
+                    continue
+
+                S, T, M = self._row_batch(batch, observed)
+                if not S:
+                    continue                     # no rankable row in this batch
+                logits = self.factor_actor.forward(torch.stack(S))
+                tot += self._step(rank_loss(logits, torch.stack(T),
+                                            torch.stack(M)))
                 n += 1
+                rows += len(S)
+                cells += int(sum(int(m.sum()) for m in M))
+        self.last_rows = rows
+        self.last_cells = cells / rows if rows else float("nan")
         return tot / max(n, 1)
 
 
@@ -393,7 +485,10 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
     torch.manual_seed(seed)
     random.seed(seed)
     agent = FactorOnly(args.lr, args.weight_decay, args.max_grad_norm,
-                       args.epsilon, args.batch_size, args.K)
+                       args.epsilon, args.batch_size, args.K,
+                       loss_mode=args.loss, rank_temp=args.rank_temp,
+                       row_min_cells=args.row_min_cells,
+                       head=args.factor_head, feats=args.factor_feats)
 
     cells = [(l, u, s, m) for l in loops for u, s, m in states_for(l, data)]
     # Denominator for coverage: every LEGAL (loop, branch, factor) cell. Legal,
@@ -401,6 +496,12 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
     # there would cap coverage below 100% and make a full sweep look partial.
     n_legal = sum(int(m.sum()) for _, _, _, m in cells)
     seen = set()
+    # The measured table, built as the agent goes. Keyed per (loop, branch), so
+    # one entry is one row of the factor response. Grows monotonically and is
+    # never read for a cell the agent has not paid for — that is what keeps the
+    # row loss inside the see-as-you-go rule rather than peeking at
+    # data["tables"].
+    observed: dict = {}
 
     buf = []
     history = []
@@ -415,6 +516,7 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
         # transfer. Those are different results and the final table cannot tell
         # them apart.
         loss_sum, n_upd = 0.0, 0
+        n_rows, cpr = 0, []
         for i in order:
             l, u, s, m = cells[i]
             idx = agent.select(s, m)
@@ -425,21 +527,39 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
             r, _ = reward_for(data["tables"][key], u, f, args.missing,
                               args.train_floor_penalty)
             seen.add((key, u, f))
-            buf.append((s, idx, r))
+            observed.setdefault((key[0], key[1], u), {})[f] = r
+            # The row KEY, not a snapshot of the row: rows grow as the agent
+            # measures, and a snapshot taken at append time would train against
+            # a stale, smaller row than the one now available.
+            buf.append((s, idx, r, (key[0], key[1], u)))
             if len(buf) >= args.buffer_size:
-                loss_sum += agent.update(buf); n_upd += 1
+                loss_sum += agent.update(buf, observed); n_upd += 1
+                n_rows += agent.last_rows
+                cpr.append(agent.last_cells)
                 buf = []
         if buf:
-            loss_sum += agent.update(buf); n_upd += 1
+            loss_sum += agent.update(buf, observed); n_upd += 1
+            n_rows += agent.last_rows
+            cpr.append(agent.last_cells)
             buf = []
         cov = len(seen) / n_legal if n_legal else float("nan")
+        ok = [c for c in cpr if c == c]
         history.append({"epoch": epoch, "q_loss": loss_sum / max(n_upd, 1),
                         "epsilon": agent.epsilon, "coverage": cov,
-                        "updates": n_upd})
+                        "updates": n_upd,
+                        # Rows the loss actually consumed this epoch, and how
+                        # many measured cells each carried. Under --loss cell
+                        # cells_per_row is 1 by construction; under --loss row
+                        # it is the supervision multiplier, and if it does not
+                        # climb the row loss is starved and the run says nothing.
+                        "rows_used": n_rows,
+                        "cells_per_row": (sum(ok) / len(ok)) if ok else float("nan")})
         if args.log_every and (epoch % args.log_every == 0
                                or epoch in (1, args.epochs)):
-            log.info("      epoch %4d | q_loss %.5f | eps %.3f | coverage %5.1f%%",
-                     epoch, history[-1]["q_loss"], agent.epsilon, 100 * cov)
+            log.info("      epoch %4d | loss %.5f | eps %.3f | coverage %5.1f%% "
+                     "| rows %5d | cells/row %.2f",
+                     epoch, history[-1]["q_loss"], agent.epsilon, 100 * cov,
+                     n_rows, history[-1]["cells_per_row"])
     return agent, (len(seen) / n_legal if n_legal else float("nan")), history
 
 
@@ -546,6 +666,26 @@ def main() -> None:
                    help="Set equal to --epsilon for flat exploration, or both "
                         "to 1.0 for uniform sampling — that arm separates "
                         "'cannot learn' from 'did not revisit'.")
+    p.add_argument("--loss", choices=("row", "cell"), default="row",
+                   help="'row' (default): soft cross-entropy over every cell "
+                        "measured so far for that loop-branch. 'cell': the "
+                        "original MSE on the single chosen cell — keep it to "
+                        "reproduce earlier runs.")
+    p.add_argument("--rank-temp", type=float, default=0.1,
+                   help="Temperature of the softmax target over rewards. Small "
+                        "makes near-ties stay ties and pushes very negative "
+                        "cells to zero target mass. (--loss row only)")
+    p.add_argument("--row-min-cells", type=int, default=2,
+                   help="A row needs this many measured cells to be rankable. "
+                        "Below 2 the target is one-hot over one position and "
+                        "the loss is identically zero. (--loss row only)")
+    p.add_argument("--factor-head", choices=("mlp", "scorer"), default="mlp",
+                   help="'scorer' shares weights across the ten factors and "
+                        "takes the factor as an INPUT, so every sample teaches "
+                        "something about every factor.")
+    p.add_argument("--factor-feats", choices=("basic", "interact"),
+                   default="basic", help="Factor features for --factor-head "
+                                         "scorer.")
     p.add_argument("--missing", type=float, default=-0.161,
                    help="Reward for a cell absent from the cache. After "
                         "exhaustive collection an absent row means it FAILED.")
@@ -565,9 +705,28 @@ def main() -> None:
     torch.set_num_threads(max(1, args.threads))
     data = load_run(args.run_dir, args.deadzone, args.labels)
     loops = labelled_loops(data)
-    log.info("Loaded %d loops / %d benchmarks | %d labelled | %d states\n",
+    log.info("Loaded %d loops / %d benchmarks | %d labelled | %d states",
              len(data["loops"]), len(data["benchmarks"]),
              data["n_labelled_loops"], 2 * len(loops))
+    # Printed before anything runs so a log file says what produced it.
+    if args.loss == "row":
+        log.info("LOSS  row  — soft cross-entropy over every cell measured so "
+                 "far for a\n            (loop, branch), target softmax(r/%.2f). "
+                 "Rows need >=%d cells.\n            Level-invariant, so no "
+                 "separate centring; very negative cells get\n            "
+                 "near-zero target mass instead of dominating the gradient.",
+                 args.rank_temp, args.row_min_cells)
+    else:
+        log.info("LOSS  cell — MSE on the single chosen cell (the original). "
+                 "One output\n            supervised per sample.")
+    if args.factor_head == "scorer":
+        log.info("HEAD  scorer (%s) — factor is an INPUT, weights shared across "
+                 "the ten.", args.factor_feats)
+    else:
+        log.info("HEAD  mlp — 93 -> 128 -> 64 -> 10, factor is an output index.")
+    log.info("      epochs %d | lr %g | eps %.2f->%.2f | buffer %d | batch %d | "
+             "K %d\n", args.epochs, args.lr, args.epsilon, args.epsilon_final,
+             args.buffer_size, args.batch_size, args.K)
 
     rows, curve = [], []
     for sp in range(args.splits):
@@ -592,6 +751,11 @@ def main() -> None:
                          "n_test_benchmarks": len(te_b), "coverage": cov,
                          "q_loss_first": hist[0]["q_loss"],
                          "q_loss_final": hist[-1]["q_loss"],
+                         # Final-epoch supervision width. Under --loss row this
+                         # is the whole point of the change, so it belongs in
+                         # the summary and not only in the curve file.
+                         "cells_per_row": hist[-1]["cells_per_row"],
+                         "rows_used": hist[-1]["rows_used"],
                          "fit": fit, "test": test})
             curve.extend(dict(split=sp + 1, seed=seed, **h) for h in hist)
             log.info("  split %d/%d seed %d | %3d/%3d loops | coverage %5.1f%% | "
@@ -601,7 +765,7 @@ def main() -> None:
                      100 * fit["probe"], 100 * fit["probe_bar"],
                      100 * test["probe"], 100 * test["probe_bar"])
 
-    report(rows)
+    report(rows, args)
     if args.csv_out and rows:
         write_csv(Path(args.csv_out), [flatten(r) for r in rows])
         log.info("\n  per-split rows: %s", args.csv_out)
@@ -636,7 +800,14 @@ def _mode(rows: list, split: str, key: str) -> int:
     return max(sorted(set(vals)), key=vals.count)
 
 
-def report(rows: list) -> None:
+def _plain(rows: list, key: str) -> float:
+    """Mean over a TOP-LEVEL row field (coverage, cells_per_row, ...). `_mean`
+    reaches into rows[split][key] and cannot see these."""
+    v = [r[key] for r in rows if key in r and r[key] == r[key]]
+    return sum(v) / len(v) if v else float("nan")
+
+
+def report(rows: list, args=None) -> None:
     if not rows:
         log.error("no folds produced a result")
         return
@@ -644,10 +815,20 @@ def report(rows: list) -> None:
     log.info("\n" + "=" * 78)
     log.info("  UNROLLER IN ISOLATION — no category head")
     log.info("=" * 78)
+    if args is not None:
+        log.info("  loss=%s  head=%s%s", args.loss, args.factor_head,
+                 f" ({args.factor_feats})" if args.factor_head == "scorer" else "")
     log.info("  mean cell coverage %.1f%% of legal (loop, branch, factor) cells."
              "\n  High coverage with a poor result is a LEARNING failure; low "
              "coverage is an\n  exploration failure. That is what this column "
-             "is for.\n", 100 * cov)
+             "is for.", 100 * cov)
+    cpr = _plain(rows, "cells_per_row")
+    log.info("  supervision: %.2f measured cells per row at the last epoch, "
+             "%.0f rows/epoch.\n  Under loss=cell this is 1.00 by "
+             "construction. Under loss=row it is the\n  multiplier on how much "
+             "of each measurement the loss actually uses — if it\n  is near 1 "
+             "the rows never filled and the change did not take effect.\n",
+             cpr, _plain(rows, "rows_used"))
     log.info("                              FIT                    HELD-OUT")
     log.info("                     learned     bar    n      learned"
              "     bar    n")
