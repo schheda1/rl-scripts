@@ -44,6 +44,7 @@ import argparse
 import logging
 import random
 import sys
+from itertools import combinations
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -59,7 +60,7 @@ from category_agent import (UNMERGE_UNROLL, UNROLL_ONLY,         # noqa: E402
 from offline_data import (IDX_TRIP_COUNT, IDX_TRIP_KNOWN, NOOP,  # noqa: E402
                           best_constant_factor,
                           labelled_loops, load_run, loops_for,
-                          score_decisions)
+                          oracle_of_gated, score_decisions)
 from offline_train import write_csv                              # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
@@ -274,6 +275,94 @@ def probe_picks(agent: FactorOnly, loops: list, data: dict) -> list:
     return out
 
 
+def probe_arms(loops: list, data: dict, deadzone: float) -> list:
+    """
+    [(state, u, table, oracle, mask)] for the loops the probe scores.
+
+    Built once so the model's top-k and the constant-k bar below read the same
+    population, the same true branch and the same denominator. Only loops with
+    headroom on the gated oracle are kept — a loop with nothing to win has no
+    factor question and would sit in the denominator contributing zero.
+    """
+    out = []
+    for l in loops:
+        key = (l["benchmark_name"], l["loop_idx"])
+        truth = data["labels"].get(key)
+        if truth is None or truth == "noop":
+            continue
+        table = data["tables"][key]
+        _, orc = oracle_of_gated(table, deadzone)
+        if orc <= deadzone:
+            continue
+        u = 1 if truth == "unmerge_unroll" else 0
+        cat = UNMERGE_UNROLL if u else UNROLL_ONLY
+        raw = l["pre_features_raw"]
+        _, s2 = make_state(l, data["normalizer"], data["postf"], u)
+        mask = category_factor_mask(cat, raw[IDX_TRIP_KNOWN] > 0.5,
+                                    int(raw[IDX_TRIP_COUNT]))
+        if not bool(mask.any()):
+            # A known trip count of 1 leaves unroll_only with no legal factor.
+            # torch.topk would raise on an empty selection, and the arm has no
+            # factor question to answer anyway.
+            continue
+        out.append((s2, u, table, orc, mask))
+    return out
+
+
+def _tried(table: dict, u: int, factors) -> float:
+    """What trying `factors` on one arm earns. Declining is free, so anything
+    worse than the no-op costs 0.0 — and a cell absent from the cache never
+    built, which also leaves the program unchanged at 0.0."""
+    got = [table[(u, f)] for f in factors if (u, f) in table]
+    return max(0.0, max(got)) if got else 0.0
+
+
+def probe_topk(agent: FactorOnly, arms: list, k: int) -> float:
+    """
+    Capture when the head nominates its k best LEGAL factors and the best of
+    them is kept.
+
+    k=1 is NOT the probe row and will normally sit above it. The probe commits
+    blind to one factor and is charged whatever that factor does, so a genuine
+    slowdown costs its real value (score_decisions applies r_applied, which only
+    zeroes cells that never BUILT). Top-k measures its candidates before
+    choosing, so it can decline — `_tried` clamps at 0.0. Two different
+    deployment stories: "predict and ship" versus "shortlist, measure, keep the
+    best". Compare each against its own bar, never against the other.
+    """
+    num = den = 0.0
+    for s2, u, table, orc, mask in arms:
+        with torch.no_grad():
+            q = agent.factor_actor.forward(s2.unsqueeze(0))[0]
+            q = q.masked_fill(~mask.to(q.device), float("-inf"))
+        idx = torch.topk(q, min(k, int(mask.sum()))).indices.tolist()
+        num += _tried(table, u, [FACTOR_VALUES[i] for i in idx])
+        den += orc
+    return num / den if den > 0 else float("nan")
+
+
+def constant_topk_bar(arms: list, k: int) -> tuple:
+    """
+    (capture, set) for the best FIXED k factors — "always try {2,4,8}".
+
+    Without it a top-k number cannot be read: trying more candidates raises
+    capture whatever the candidates are, so the question is never "is top-3
+    better than top-1" but "is the head's top-3 better than ANY three".
+    Exhaustive over C(10,k) <= 252 sets, so no search heuristic to distrust.
+    """
+    best = (float("-inf"), None)
+    for S in combinations(FACTOR_VALUES, k):
+        num = den = 0.0
+        for _s2, u, table, orc, mask in arms:
+            legal = [f for f in S if mask[FACTOR_VALUES.index(f)]]
+            num += _tried(table, u, legal)
+            den += orc
+        c = num / den if den > 0 else float("nan")
+        if c == c and c > best[0]:
+            best = (c, S)
+    return best
+
+
 def branch_picks(agent: FactorOnly, loops: list, data: dict,
                  u: int, cat: int, missing: float) -> list:
     """[(key, realized_reward)] for one state population, greedy."""
@@ -355,7 +444,24 @@ def evaluate(agent: FactorOnly, loops: list, data: dict, args) -> dict:
                         data.get("failures"))
     _, bar, _ = best_constant_factor(loops, data["tables"], data["labels"],
                                      args.deadzone, args.missing)
-    out = {"probe": m["capture"], "probe_n": m["loops_with_headroom"],
+    # TOP-k. The head nominates its k best legal factors instead of collapsing
+    # to argmax; the best of them is kept. Deployable as a pruned autotuning
+    # budget -- k compiles instead of 19 -- and it asks a coarser question than
+    # top-1, which the head may be able to answer even if it cannot rank.
+    #
+    # Each k carries the best FIXED set of k factors beside it, because trying
+    # more candidates raises capture whatever they are. top1 must reproduce
+    # `probe` above; if it does not, the two are measuring different things.
+    arms = probe_arms(loops, data, args.deadzone)
+    out = {}
+    for k in (1, 2, 3):
+        out[f"top{k}"] = probe_topk(agent, arms, k)
+        c, S = constant_topk_bar(arms, k)
+        out[f"top{k}_bar"] = c
+        out[f"top{k}_set"] = "/".join(str(f) for f in S) if S else ""
+    out["topk_n"] = len(arms)
+
+    out.update({"probe": m["capture"], "probe_n": m["loops_with_headroom"],
            "probe_bar": bar,
            # Sums, so callers can POOL rather than average per-benchmark
            # ratios — with one or two evaluation loops apiece, a mean of
@@ -371,7 +477,7 @@ def evaluate(agent: FactorOnly, loops: list, data: dict, args) -> dict:
            "probe_mean": m["mean_realized"],
            "probe_mean_applied": m["mean_realized_applied"],
            "probe_slower": m["n_regress"], "probe_failed": m["n_failed"],
-           "probe_clipped": m["n_clipped"]}
+           "probe_clipped": m["n_clipped"]})
     for u, cat, label in BRANCHES:
         # ONLY loops whose true category IS this branch. Scoring an
         # unroll-only loop on the unmerge branch measures a decision the policy
@@ -537,6 +643,26 @@ def report(rows: list) -> None:
                  100 * _mean(rows, "test", k + "_bar"),
                  _mean(rows, "test", k + "_n"))
     log.info("  " + "-" * 68)
+
+    # TOP-k: the head nominates k factors, the best is kept. Read each row
+    # against its OWN bar, not against top-1 — capture rises with k whatever is
+    # nominated, so "top-3 beats top-1" is not a result.
+    log.info("\n  TOP-k — head nominates k factors, best of them is kept")
+    log.info("                       FIT                    HELD-OUT")
+    log.info("       k      learned     bar        learned     bar    best set")
+    for k in (1, 2, 3):
+        log.info("       %d     %6.1f%%  %6.1f%%       %6.1f%%  %6.1f%%    %s",
+                 k,
+                 100 * _mean(rows, "fit", f"top{k}"),
+                 100 * _mean(rows, "fit", f"top{k}_bar"),
+                 100 * _mean(rows, "test", f"top{k}"),
+                 100 * _mean(rows, "test", f"top{k}_bar"),
+                 _mode(rows, "test", f"top{k}_set"))
+    log.info("    Costs k compiles per loop, and assumes you MEASURE the "
+             "shortlist and keep\n    the best — so unlike the probe row it may "
+             "decline afterwards, and it will\n    normally read higher. Not "
+             "comparable to the probe; comparable to its bar.")
+
     # Which constant wins on each population. If the two differ, a head that
     # cannot tell the states apart cannot beat both bars at once — that is the
     # concrete form of "does it need to differentiate the branches".
