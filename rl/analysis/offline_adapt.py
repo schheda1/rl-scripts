@@ -554,8 +554,9 @@ def run(data: dict, args) -> None:
                     # per-loop join reproduces the delta exactly.
                     for tag, pk in (("zero_shot", zs), ("adapted", ad)):
                         for rec in _sc(pk, collect=True)["per_loop"]:
-                            loop_rows.append(dict(fold=k + 1, seed=seed,
-                                                  benchmark=bench, phase=tag,
+                            # `rec` already carries benchmark and loop_idx —
+                            # passing benchmark again is a duplicate keyword.
+                            loop_rows.append(dict(fold=k + 1, seed=seed, phase=tag,
                                                   n_adapt_loops=len(adapt_l), **rec))
                 if adapt_l:
                     zero.setdefault(seed, []).extend(zs)
