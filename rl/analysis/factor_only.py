@@ -98,6 +98,11 @@ class FactorOnly:
             self.factor_actor = FactorActor(logit_cap=0.0).to(DEVICE)
         self.head, self.feats = head, feats
         self.loss_mode = loss_mode
+        if loss_mode == "row" and rank_temp <= 0:
+            # r/0 is +-inf, and a softmax over a vector holding both +inf and
+            # -inf is NaN, which would poison every weight in one step and show
+            # up only as a silent flatline in the loss column.
+            raise ValueError(f"--rank-temp must be > 0, got {rank_temp}")
         self.rank_temp = rank_temp
         self.row_min_cells = row_min_cells
         self.epsilon = epsilon
@@ -107,7 +112,7 @@ class FactorOnly:
         # actually being fed. Early on most rows have too few observed cells to
         # rank and the loss sees nothing; if that never changes the run is
         # meaningless and the curve is the only place it shows.
-        self.last_rows = 0
+        self.last_rankable = float("nan")
         self.last_cells = float("nan")
         decay, no_decay = [], []
         for p in self.factor_actor.parameters():
@@ -196,7 +201,7 @@ class FactorOnly:
                           loss term.
         """
         tot, n = 0.0, 0
-        rows, cells = 0, 0
+        rows, cells, seen_rows = 0, 0, 0
         for _ in range(self.K):
             order = list(range(len(buf)))
             random.shuffle(order)
@@ -204,6 +209,7 @@ class FactorOnly:
                 batch = [buf[j] for j in order[i:i + self.batch_size]]
                 if not batch:
                     continue
+                seen_rows += len(batch)
                 if self.loss_mode == "cell":
                     s = torch.stack([b[0] for b in batch])
                     a = torch.tensor([b[1] for b in batch], dtype=torch.long)
@@ -225,9 +231,16 @@ class FactorOnly:
                 n += 1
                 rows += len(S)
                 cells += int(sum(int(m.sum()) for m in M))
-        self.last_rows = rows
+        # Fraction of buffer entries the loss could actually use. Under 'cell'
+        # this is 1.0 always. Under 'row' it starts near 0 — most rows have a
+        # single measured cell early on — and climbs as the table fills. It is
+        # the direct check that the change took effect.
+        self.last_rankable = rows / seen_rows if seen_rows else float("nan")
         self.last_cells = cells / rows if rows else float("nan")
-        return tot / max(n, 1)
+        # NaN, not 0.0, when no batch was usable. A zero loss reads as a perfect
+        # fit and is the exact opposite of what an empty epoch means — and epoch
+        # 1 of a row run is often empty.
+        return tot / n if n else float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -484,11 +497,16 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
     """(agent, coverage_fraction). Coverage is over (loop, branch, factor)."""
     torch.manual_seed(seed)
     random.seed(seed)
+    # getattr, not attribute access: factor_adapt.py builds its OWN argparse and
+    # calls this function, so a flag added here would otherwise crash that
+    # script on its first split. The defaults match this module's parser.
     agent = FactorOnly(args.lr, args.weight_decay, args.max_grad_norm,
                        args.epsilon, args.batch_size, args.K,
-                       loss_mode=args.loss, rank_temp=args.rank_temp,
-                       row_min_cells=args.row_min_cells,
-                       head=args.factor_head, feats=args.factor_feats)
+                       loss_mode=getattr(args, "loss", "row"),
+                       rank_temp=getattr(args, "rank_temp", 0.1),
+                       row_min_cells=getattr(args, "row_min_cells", 2),
+                       head=getattr(args, "factor_head", "mlp"),
+                       feats=getattr(args, "factor_feats", "basic"))
 
     cells = [(l, u, s, m) for l in loops for u, s, m in states_for(l, data)]
     # Denominator for coverage: every LEGAL (loop, branch, factor) cell. Legal,
@@ -516,7 +534,7 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
         # transfer. Those are different results and the final table cannot tell
         # them apart.
         loss_sum, n_upd = 0.0, 0
-        n_rows, cpr = 0, []
+        rank, cpr = [], []
         for i in order:
             l, u, s, m = cells[i]
             idx = agent.select(s, m)
@@ -533,18 +551,24 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
             # a stale, smaller row than the one now available.
             buf.append((s, idx, r, (key[0], key[1], u)))
             if len(buf) >= args.buffer_size:
-                loss_sum += agent.update(buf, observed); n_upd += 1
-                n_rows += agent.last_rows
+                _l = agent.update(buf, observed)
+                if _l == _l:                      # skip empty updates in the mean
+                    loss_sum += _l; n_upd += 1
+                rank.append(agent.last_rankable)
                 cpr.append(agent.last_cells)
                 buf = []
         if buf:
-            loss_sum += agent.update(buf, observed); n_upd += 1
-            n_rows += agent.last_rows
+            _l = agent.update(buf, observed)
+            if _l == _l:
+                loss_sum += _l; n_upd += 1
+            rank.append(agent.last_rankable)
             cpr.append(agent.last_cells)
             buf = []
         cov = len(seen) / n_legal if n_legal else float("nan")
         ok = [c for c in cpr if c == c]
-        history.append({"epoch": epoch, "q_loss": loss_sum / max(n_upd, 1),
+        rk = [c for c in rank if c == c]
+        history.append({"epoch": epoch,
+                        "loss": loss_sum / n_upd if n_upd else float("nan"),
                         "epsilon": agent.epsilon, "coverage": cov,
                         "updates": n_upd,
                         # Rows the loss actually consumed this epoch, and how
@@ -552,14 +576,14 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
                         # cells_per_row is 1 by construction; under --loss row
                         # it is the supervision multiplier, and if it does not
                         # climb the row loss is starved and the run says nothing.
-                        "rows_used": n_rows,
+                        "rankable": (sum(rk) / len(rk)) if rk else float("nan"),
                         "cells_per_row": (sum(ok) / len(ok)) if ok else float("nan")})
         if args.log_every and (epoch % args.log_every == 0
                                or epoch in (1, args.epochs)):
             log.info("      epoch %4d | loss %.5f | eps %.3f | coverage %5.1f%% "
-                     "| rows %5d | cells/row %.2f",
-                     epoch, history[-1]["q_loss"], agent.epsilon, 100 * cov,
-                     n_rows, history[-1]["cells_per_row"])
+                     "| rankable %5.1f%% | cells/row %.2f",
+                     epoch, history[-1]["loss"], agent.epsilon, 100 * cov,
+                     100 * history[-1]["rankable"], history[-1]["cells_per_row"])
     return agent, (len(seen) / n_legal if n_legal else float("nan")), history
 
 
@@ -749,13 +773,13 @@ def main() -> None:
             rows.append({"split": sp + 1, "split_seed": sseed, "seed": seed,
                          "n_fit_loops": len(fit_l), "n_test_loops": len(test_l),
                          "n_test_benchmarks": len(te_b), "coverage": cov,
-                         "q_loss_first": hist[0]["q_loss"],
-                         "q_loss_final": hist[-1]["q_loss"],
+                         "loss_first": hist[0]["loss"],
+                         "loss_final": hist[-1]["loss"],
                          # Final-epoch supervision width. Under --loss row this
                          # is the whole point of the change, so it belongs in
                          # the summary and not only in the curve file.
                          "cells_per_row": hist[-1]["cells_per_row"],
-                         "rows_used": hist[-1]["rows_used"],
+                         "rankable": hist[-1]["rankable"],
                          "fit": fit, "test": test})
             curve.extend(dict(split=sp + 1, seed=seed, **h) for h in hist)
             log.info("  split %d/%d seed %d | %3d/%3d loops | coverage %5.1f%% | "
@@ -824,11 +848,11 @@ def report(rows: list, args=None) -> None:
              "is for.", 100 * cov)
     cpr = _plain(rows, "cells_per_row")
     log.info("  supervision: %.2f measured cells per row at the last epoch, "
-             "%.0f rows/epoch.\n  Under loss=cell this is 1.00 by "
+             "%.0f%% of rows rankable.\n  Under loss=cell this is 1.00 by "
              "construction. Under loss=row it is the\n  multiplier on how much "
              "of each measurement the loss actually uses — if it\n  is near 1 "
              "the rows never filled and the change did not take effect.\n",
-             cpr, _plain(rows, "rows_used"))
+             cpr, 100 * _plain(rows, "rankable"))
     log.info("                              FIT                    HELD-OUT")
     log.info("                     learned     bar    n      learned"
              "     bar    n")

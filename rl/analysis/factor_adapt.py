@@ -344,6 +344,24 @@ def main() -> None:
     p.add_argument("--K", type=int, default=2)
     p.add_argument("--epsilon", type=float, default=0.3)
     p.add_argument("--epsilon-final", type=float, default=0.05)
+    # Passed straight through to factor_only.train, which builds the head and
+    # picks the loss. Declared here rather than left to getattr defaults so the
+    # base model this script adapts is stated in its own --help and log, not
+    # inherited invisibly from another file.
+    p.add_argument("--loss", choices=("row", "cell"), default="row",
+                   help="Base-model loss. 'row': soft cross-entropy over every "
+                        "cell measured so far for a (loop, branch). 'cell': the "
+                        "original MSE on the single chosen cell.")
+    p.add_argument("--rank-temp", type=float, default=0.1)
+    p.add_argument("--row-min-cells", type=int, default=2)
+    p.add_argument("--factor-head", choices=("mlp", "scorer"), default="mlp",
+                   help="NOTE --adapt-unfreeze counts LINEAR layers of the head. "
+                        "On 'mlp' net[6] is Linear(64,10) = 650 parameters; on "
+                        "'scorer' it is Linear(64,1) = 65, so level 1 adapts a "
+                        "tenth as many and the two are not comparable at the "
+                        "same setting.")
+    p.add_argument("--factor-feats", choices=("basic", "interact"),
+                   default="basic")
     p.add_argument("--missing", type=float, default=-0.161)
     p.add_argument("--train-floor-penalty", type=float, default=None,
                    help="Remap the -1.0 clip floor in the BASE-TRAINING "
