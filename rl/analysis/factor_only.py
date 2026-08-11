@@ -341,6 +341,17 @@ def probe_topk(agent: FactorOnly, arms: list, k: int) -> float:
     return num / den if den > 0 else float("nan")
 
 
+def set_capture(arms: list, S) -> float:
+    """Capture of one FIXED factor set on a population. Factors the arm's mask
+    forbids are simply not tried there."""
+    num = den = 0.0
+    for _s2, u, table, orc, mask in arms:
+        num += _tried(table, u,
+                      [f for f in S if mask[FACTOR_VALUES.index(f)]])
+        den += orc
+    return num / den if den > 0 else float("nan")
+
+
 def constant_topk_bar(arms: list, k: int) -> tuple:
     """
     (capture, set) for the best FIXED k factors — "always try {2,4,8}".
@@ -352,12 +363,7 @@ def constant_topk_bar(arms: list, k: int) -> tuple:
     """
     best = (float("-inf"), None)
     for S in combinations(FACTOR_VALUES, k):
-        num = den = 0.0
-        for _s2, u, table, orc, mask in arms:
-            legal = [f for f in S if mask[FACTOR_VALUES.index(f)]]
-            num += _tried(table, u, legal)
-            den += orc
-        c = num / den if den > 0 else float("nan")
+        c = set_capture(arms, S)
         if c == c and c > best[0]:
             best = (c, S)
     return best
@@ -437,7 +443,8 @@ def train(loops: list, data: dict, args, seed: int) -> tuple:
     return agent, (len(seen) / n_legal if n_legal else float("nan")), history
 
 
-def evaluate(agent: FactorOnly, loops: list, data: dict, args) -> dict:
+def evaluate(agent: FactorOnly, loops: list, data: dict, args,
+             xfer_sets: "dict | None" = None) -> dict:
     """Probe on the true branch, plus each state population separately."""
     m = score_decisions(probe_picks(agent, loops, data), data["tables"],
                         data["labels"], args.deadzone, args.missing,
@@ -459,6 +466,16 @@ def evaluate(agent: FactorOnly, loops: list, data: dict, args) -> dict:
         c, S = constant_topk_bar(arms, k)
         out[f"top{k}_bar"] = c
         out[f"top{k}_set"] = "/".join(str(f) for f in S) if S else ""
+        # `bar` above is chosen ON this population, so it knows the answer and
+        # is an upper bound on any fixed strategy rather than a baseline anyone
+        # could ship. `xfer` is the set chosen on the FIT split scored here,
+        # which is what a constant policy would actually deliver. The learned
+        # row has to beat THAT to be worth anything.
+        if xfer_sets and xfer_sets.get(k):
+            out[f"top{k}_xfer"] = set_capture(
+                arms, tuple(int(x) for x in xfer_sets[k].split("/")))
+        else:
+            out[f"top{k}_xfer"] = float("nan")
     out["topk_n"] = len(arms)
 
     out.update({"probe": m["capture"], "probe_n": m["loops_with_headroom"],
@@ -564,8 +581,12 @@ def main() -> None:
         for si in range(args.seeds):
             seed = args.base_seed + si
             agent, cov, hist = train(fit_l, data, args, seed)
-            fit, test = evaluate(agent, fit_l, data, args), \
-                evaluate(agent, test_l, data, args)
+            fit = evaluate(agent, fit_l, data, args)
+            # Test is scored a second way as well: under the constant set the
+            # FIT split chose. That is the only constant baseline that could
+            # actually be shipped, and it is the one the learned row must beat.
+            test = evaluate(agent, test_l, data, args,
+                            xfer_sets={k: fit[f"top{k}_set"] for k in (1, 2, 3)})
             rows.append({"split": sp + 1, "split_seed": sseed, "seed": seed,
                          "n_fit_loops": len(fit_l), "n_test_loops": len(test_l),
                          "n_test_benchmarks": len(te_b), "coverage": cov,
@@ -648,20 +669,24 @@ def report(rows: list) -> None:
     # against its OWN bar, not against top-1 — capture rises with k whatever is
     # nominated, so "top-3 beats top-1" is not a result.
     log.info("\n  TOP-k — head nominates k factors, best of them is kept")
-    log.info("                       FIT                    HELD-OUT")
-    log.info("       k      learned     bar        learned     bar    best set")
+    log.info("                 HELD-OUT")
+    log.info("       k    learned   shippable    oracle-bar   fit's set")
     for k in (1, 2, 3):
-        log.info("       %d     %6.1f%%  %6.1f%%       %6.1f%%  %6.1f%%    %s",
-                 k,
-                 100 * _mean(rows, "fit", f"top{k}"),
-                 100 * _mean(rows, "fit", f"top{k}_bar"),
+        log.info("       %d   %7.1f%%   %8.1f%%   %10.1f%%   %s", k,
                  100 * _mean(rows, "test", f"top{k}"),
+                 100 * _mean(rows, "test", f"top{k}_xfer"),
                  100 * _mean(rows, "test", f"top{k}_bar"),
-                 _mode(rows, "test", f"top{k}_set"))
-    log.info("    Costs k compiles per loop, and assumes you MEASURE the "
-             "shortlist and keep\n    the best — so unlike the probe row it may "
-             "decline afterwards, and it will\n    normally read higher. Not "
-             "comparable to the probe; comparable to its bar.")
+                 _mode(rows, "fit", f"top{k}_set"))
+    log.info("\n    shippable  = the constant set chosen on FIT, scored on "
+             "held-out. This is\n                 the only column the learned "
+             "row has to beat.")
+    log.info("    oracle-bar = the best constant set chosen ON the held-out "
+             "loops. It knows\n                 the answer, so it is a ceiling "
+             "for any fixed policy, not a rival.")
+    log.info("    Costs k compiles per loop and assumes you MEASURE the "
+             "shortlist and keep\n    the best, so unlike the probe row above "
+             "it may decline afterwards and will\n    normally read higher. "
+             "Compare it to these bars, never to the probe.")
 
     # Which constant wins on each population. If the two differ, a head that
     # cannot tell the states apart cannot beat both bars at once — that is the
