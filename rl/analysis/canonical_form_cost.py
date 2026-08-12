@@ -4,14 +4,13 @@ Which downstream optimisations does UU switch off, and what did the loop gain?
 One question, one table. For every eligible loop whose ORACLE-BEST action is a
 transform, compile it twice and diff the optimisation remarks:
 
-    531 distinct eligible loops
+    1. baseline   plain -O3                       -> what fires normally
+    2. best       -O3 + UU at the oracle action   -> what still fires
+
+Population (531 distinct eligible loops):
       265  oracle-best is a transform   <- IN SCOPE, 530 compiles
       174  oracle-best is no-op         <- nothing to compare against
        92  every measured cell failed   <- no usable table at all
-
-
-    1. baseline   plain -O3                       -> what fires normally
-    2. best       -O3 + UU at the oracle action   -> what still fires
 
 `opts_lost` = Passed remarks present at baseline and absent under UU: the
 optimisations this transform cost. Beside it sits `gain`, the measured speedup
@@ -146,7 +145,7 @@ def scope(run_dir: Path, deadzone: float) -> list:
     return cases
 
 
-def parse_remarks(path: Path) -> Counter:
+def parse_remarks(path: Path) -> tuple:
     """
     LLVM optimisation-record YAML -> Counter of (kind, Pass, Name, Function).
 
@@ -201,27 +200,42 @@ def parse_remarks(path: Path) -> Counter:
     return counts, reasons
 
 
-def device_compile(src: Path, arch: str, uu_flags: str, yaml_out: Path,
-                   ptx_out: Path):
+def device_compile(bench: Path, filename: str, arch: str, uu_flags: str,
+                   yaml_out: Path, ptx_out: Path):
     """
     Compile ONE translation unit for the device only. Returns (ok, stderr).
 
-    Mirrors hecbench._make's flags (-O3, -std=c++17, the CUDA include dir and
-    --cuda-gpu-arch) so the code being measured is the code that was measured,
-    and adds --cuda-device-only so there is a single cc1 job and the record path
-    cannot be clobbered by the host half.
+    Run from INSIDE the benchmark directory with the source named RELATIVELY,
+    exactly as hecbench._make does (cwd=benchmark_dir, the Makefile compiling
+    `main.cu`). This is not cosmetic: the UU pass is scoped by
+    -uu-match-filename=main.cu, which is compared against the source name the
+    module records. Hand clang an ABSOLUTE path and that name becomes the full
+    path, the match fails, and the pass silently does nothing — the compile
+    succeeds, the PTX is byte-identical to the baseline, and every diff is zero.
+    Measured: identical flags fired from the benchmark dir and did not fire from
+    outside it.
+
+    Flags otherwise mirror _make (-O3 -std=c++17 -Wall, the CUDA include dir,
+    --cuda-gpu-arch) so the code measured here is the code that was measured
+    then, plus --cuda-device-only so there is a single cc1 job and the record
+    path cannot be clobbered by the host half.
     """
+    inc = ["-I.", "-I" + CUDA_HOME + "/include"]
+    # A source under a subdirectory ('./kernel/kernel.cu') needs its own
+    # directory on the include path; the Makefile supplies that when it builds.
+    d = os.path.dirname(filename)
+    if d:
+        inc.insert(1, "-I" + d)
     cmd = ["clang++", "-x", "cuda", "--cuda-device-only", "-S",
            "-O3", "-std=c++17", "-Wall",
-           "--cuda-gpu-arch=" + arch,
-           "-I" + str(src.parent), "-I" + CUDA_HOME + "/include",
+           "--cuda-gpu-arch=" + arch] + inc + [
            "-fsave-optimization-record",
-           "-foptimization-record-file=" + str(yaml_out)]
+           "-foptimization-record-file=" + str(yaml_out.resolve())]
     cmd += shlex.split(uu_flags)
-    cmd += [str(src), "-o", str(ptx_out)]
+    cmd += [filename, "-o", str(ptx_out.resolve())]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=COMPILE_TIMEOUT)
+                           timeout=COMPILE_TIMEOUT, cwd=str(bench))
     except subprocess.TimeoutExpired:
         return False, "TIMEOUT"
     return r.returncode == 0, r.stderr
@@ -231,33 +245,40 @@ def _delta(b: Counter, u: Counter, kind: str, funcs=None):
     """Counts present in `b` but reduced in `u` (or the reverse for gains)."""
     def keep(k):
         return k[0] == kind and (funcs is None or k[3] in funcs)
-    lost = sorted((("%s/%s" % (k[1], k[2])), b[k] - u.get(k, 0))
-                  for k in b if keep(k) and b[k] > u.get(k, 0))
-    return sorted(lost, key=lambda kv: -kv[1])
+    return sorted(((("%s/%s" % (k[1], k[2])), b[k] - u.get(k, 0))
+                   for k in b if keep(k) and b[k] > u.get(k, 0)),
+                  key=lambda kv: -kv[1])
 
 
 def run_case(bench: Path, c: dict, arch: str, workdir: Path,
              keep: "Path | None" = None) -> dict:
     """Two device-only compiles of one TU, one diff. No make, no tree copy."""
-    src = bench / (c["filename"] or "main.cu")
+    rel = c["filename"] or "main.cu"
+    src = bench / rel
     tag = "%s_%d" % (bench.name, c["loop_idx"])
     base_y, uu_y = workdir / (tag + "_base.yaml"), workdir / (tag + "_uu.yaml")
     base_p, uu_p = workdir / (tag + "_base.ptx"), workdir / (tag + "_uu.ptx")
 
     if not src.exists():
+        # Same key set as the success path. A partial dict would not break the
+        # CSV (restval fills it) but would KeyError the moment this row was ever
+        # counted as usable, and "never usable" is an invariant one edit away
+        # from being false.
         return {"baseline_ok": 0, "uu_ok": 0, "usable": 0, "uu_fired": 0,
-                "why_baseline": "missing source %s" % src.name, "why_uu": "",
+                "why_baseline": "missing source %s" % rel, "why_uu": "",
                 "remarks_baseline": 0, "remarks_uu": 0, "n_opts_lost": 0,
                 "n_opts_gained": 0, "n_missed_new": 0, "n_lost_in_kernel": 0,
-                "n_missed_in_kernel": 0, "lost_passes": "", "missed_new": "",
-                "_lost": [], "_missed": []}
+                "n_missed_in_kernel": 0, "n_flipped": 0, "lost_passes": "",
+                "missed_new": "", "flipped_passes": "", "top_reason": "",
+                "_lost": [], "_missed": [], "_lost_kernel": [],
+                "_missed_kernel": [], "_flipped": [], "_why": []}
 
-    ok_base, err_base = device_compile(src, arch, "", base_y, base_p)
+    ok_base, err_base = device_compile(bench, rel, arch, "", base_y, base_p)
     flags = _build_extra_cflags(enable_uu=True, filename=c["filename"],
                                 triple=c["triple"], loop_indices=[c["loop_idx"]],
                                 unmerge_flags=[c["unmerge"]],
                                 unroll_factors=[c["factor"]])
-    ok_uu, err_uu = device_compile(src, arch, flags, uu_y, uu_p)
+    ok_uu, err_uu = device_compile(bench, rel, arch, flags, uu_y, uu_p)
 
     b, br = parse_remarks(base_y)
     u, ur = parse_remarks(uu_y)
@@ -279,17 +300,17 @@ def run_case(bench: Path, c: dict, arch: str, workdir: Path,
     # UU. Not "the count went down" — the pass ran, looked at the same code, and
     # explicitly declined. Paired by Pass name, so `loop-vectorize` passing then
     # missing is one entry regardless of the Name field either side used.
-    ran = {k[1] for k in b if k[0] == "Passed" and (not funcs or k[3] in funcs)}
+    ran = {k[1] for k in b if k[0] == "Passed" and k[3] in funcs}
     now_missed = collections.defaultdict(int)
     for k, v in u.items():
-        if k[0] == "Missed" and k[1] in ran and (not funcs or k[3] in funcs):
-            now_missed[k[1]] += v - b.get(("Missed",) + k[1:], 0)
+        if k[0] == "Missed" and k[1] in ran and k[3] in funcs:
+            now_missed[k[1]] += v - b.get(k, 0)
     flipped = sorted(((p, n) for p, n in now_missed.items() if n > 0),
                      key=lambda kv: -kv[1])
     # and why, in LLVM's words — new Missed reasons inside the kernel
     why = sorted(((("%s: %s" % (k[0], k[2])), v - br.get(k, 0))
                   for k, v in ur.items()
-                  if (not funcs or k[1] in funcs) and v > br.get(k, 0)),
+                  if k[1] in funcs and v > br.get(k, 0)),
                  key=lambda kv: -kv[1])
 
     usable = int(bool(ok_base and ok_uu and b and fired))
