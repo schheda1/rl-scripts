@@ -2,8 +2,13 @@
 Which downstream optimisations does UU switch off, and what did the loop gain?
 
 One question, one table. For every eligible loop whose ORACLE-BEST action is a
-transform (265 of 443; the other 178 are best left alone and have nothing to
-compare), compile it twice and diff the optimisation remarks:
+transform, compile it twice and diff the optimisation remarks:
+
+    531 distinct eligible loops
+      265  oracle-best is a transform   <- IN SCOPE, 530 compiles
+      174  oracle-best is no-op         <- nothing to compare against
+       92  every measured cell failed   <- no usable table at all
+
 
     1. baseline   plain -O3                       -> what fires normally
     2. best       -O3 + UU at the oracle action   -> what still fires
@@ -48,7 +53,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from analyze_compile_failures import _compile, parse_remarks     # noqa: E402
 from hecbench import (ARCH, HECBENCH_SRC, _build_extra_cflags,   # noqa: E402
-                      discover_benchmarks)
+                      discover_benchmarks, extract_error_signature)
 from offline_data import NOOP, oracle_of_gated                   # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -133,7 +138,8 @@ def _compile_guarded(work: Path, flags: str, arch: str, rec: Path):
         return False, "TIMEOUT"
 
 
-def run_case(bench: Path, c: dict, arch: str, workdir: Path) -> dict:
+def run_case(bench: Path, c: dict, arch: str, workdir: Path,
+             keep: "Path | None" = None) -> dict:
     """Two compiles, one diff."""
     work = workdir / ("%s_%d" % (bench.name, c["loop_idx"]))
     if work.exists():
@@ -146,12 +152,12 @@ def run_case(bench: Path, c: dict, arch: str, workdir: Path) -> dict:
     base_rec = workdir / ("rec_%s_base" % work.name)
     uu_rec = workdir / ("rec_%s_uu" % work.name)
 
-    ok_base, _ = _compile_guarded(work, "", arch, base_rec)
+    ok_base, err_base = _compile_guarded(work, "", arch, base_rec)
     flags = _build_extra_cflags(enable_uu=True, filename=c["filename"],
                                 triple=c["triple"], loop_indices=[c["loop_idx"]],
                                 unmerge_flags=[c["unmerge"]],
                                 unroll_factors=[c["factor"]])
-    ok_uu, _ = _compile_guarded(work, flags, arch, uu_rec)
+    ok_uu, err_uu = _compile_guarded(work, flags, arch, uu_rec)
 
     b, u = parse_remarks(base_rec), parse_remarks(uu_rec)
     lost = sorted(((("%s/%s" % (k[1], k[2])), b[k] - u.get(k, 0))
@@ -178,10 +184,31 @@ def run_case(bench: Path, c: dict, arch: str, workdir: Path) -> dict:
                     "baseline_remarks=%d) — excluded from the summary",
                     bench.name, c["loop_idx"], ok_base, ok_uu, sum(b.values()))
 
+    if keep is not None:
+        # Diagnosis hook: an all-zero diff can mean "UU changed nothing" or
+        # "we captured the wrong records". Only the YAML tells them apart.
+        keep.mkdir(parents=True, exist_ok=True)
+        for src_dir, tag in ((base_rec, "base"), (uu_rec, "uu")):
+            dst = keep / ("%s_%s" % (work.name, tag))
+            if src_dir.is_dir():
+                shutil.copytree(src_dir, dst, dirs_exist_ok=True)
+        log.info("     kept records in %s", keep)
     shutil.rmtree(work, ignore_errors=True)
     shutil.rmtree(base_rec, ignore_errors=True)
     shutil.rmtree(uu_rec, ignore_errors=True)
+    # A build that fails HERE but produced a measured reward during collection
+    # is a discrepancy worth seeing, and a timeout is a different problem from a
+    # real diagnostic. The reason was previously discarded.
+    def _why(ok, err):
+        if ok:
+            return ""
+        if err == "TIMEOUT":
+            return "timeout"
+        return extract_error_signature(err)[:120] if err else "unknown"
+
     return {"baseline_ok": int(ok_base), "uu_ok": int(ok_uu), "usable": usable,
+            "why_baseline": _why(ok_base, err_base),
+            "why_uu": _why(ok_uu, err_uu),
             "remarks_baseline": sum(b.values()), "remarks_uu": sum(u.values()),
             "n_opts_lost": sum(n for _, n in lost),
             "n_opts_gained": sum(n for _, n in gained),
@@ -200,6 +227,9 @@ def main() -> None:
     p.add_argument("--arch", default=ARCH)
     p.add_argument("--deadzone", type=float, default=0.005)
     p.add_argument("--limit", type=int, default=0, help="max loops (0 = all)")
+    p.add_argument("--keep-records", type=Path, default=None,
+                   help="copy every .opt.yaml here instead of deleting it, so an "
+                        "all-zero diff can be diagnosed (use with --limit 1)")
     p.add_argument("--out-dir", type=Path, default=Path("uu_canonical"))
     args = p.parse_args()
 
@@ -223,7 +253,7 @@ def main() -> None:
         log.info("[%d/%d] %s loop=%d  unmerge=%d factor=%d  gain=%+.4f",
                  i, len(cases), c["benchmark"], c["loop_idx"], c["unmerge"],
                  c["factor"], c["gain"])
-        r = run_case(bench, c, args.arch, workdir)
+        r = run_case(bench, c, args.arch, workdir, args.keep_records)
         rows.append(dict(c, **r))
         log.info("     -> lost %d, gained %d, new-missed %d%s",
                  r["n_opts_lost"], r["n_opts_gained"], r["n_missed_new"],
@@ -232,7 +262,7 @@ def main() -> None:
     cols = ["benchmark", "loop_idx", "unmerge", "factor", "gain",
             "n_opts_lost", "n_opts_gained", "n_missed_new", "remarks_baseline",
             "remarks_uu", "lost_passes", "missed_new", "usable", "baseline_ok",
-            "uu_ok", "filename", "triple"]
+            "uu_ok", "why_baseline", "why_uu", "filename", "triple"]
     with open(args.out_dir / "canonical_form_cost.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore", restval="")
         w.writeheader()
