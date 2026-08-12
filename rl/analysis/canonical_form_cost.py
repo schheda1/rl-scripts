@@ -41,6 +41,10 @@ import argparse
 import csv
 import json
 import logging
+import os
+import re
+import shlex
+import collections
 import shutil
 import subprocess
 import statistics as st
@@ -51,7 +55,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from analyze_compile_failures import _compile, parse_remarks     # noqa: E402
 from hecbench import (ARCH, HECBENCH_SRC, _build_extra_cflags,   # noqa: E402
                       discover_benchmarks, extract_error_signature)
 from offline_data import NOOP, oracle_of_gated                   # noqa: E402
@@ -63,22 +66,22 @@ log = logging.getLogger("uu-canonical")
 
 FAILURE_VALUES = (-0.16, -0.161)
 
-# Without this the whole study measures the WRONG PIPELINE.
+# WHY THIS COMPILES THE DEVICE SIDE DIRECTLY INSTEAD OF RUNNING make.
 #
-# clang compiles a .cu twice: once for nvptx (device), once for the host. It
-# derives each optimisation-record path from that sub-compilation's OUTPUT file,
-# and the device output is a TEMPORARY outside the build tree — so
-# `bench.rglob("*.opt.yaml")` in analyze_compile_failures._compile only ever
-# finds the host record. UU is scoped to the device triple, so it changes
-# nothing the host record can see and every loop diffs to zero.
+# `clang++ -###` on a normal CUDA build shows both cc1 jobs -- nvptx64 and
+# x86_64 -- being handed the SAME -opt-record-file, derived from -o. The device
+# job runs first and writes it; the host job then overwrites it. Harvesting
+# *.opt.yaml from the build tree therefore yields HOST remarks only, and since
+# UU is scoped to the device triple the diff is empty for every loop. That is
+# not a property of UU; it is the driver clobbering one record with the other.
 #
-# Confirmed empirically: the captured records name `main`, `nvtx*`, host STL,
-# and `__device_stub__...` (the host-side launcher) — not one device kernel.
-#
-# -save-temps=obj keeps the device intermediates beside the object file inside
-# the build tree, so the device record is written there and harvested with the
-# rest. Applied to BOTH compiles, so the diff stays symmetric.
-SAVE_TEMPS = "-save-temps=obj"
+# --cuda-device-only issues exactly ONE cc1 job, so -foptimization-record-file
+# is unambiguous. Measured on adamw-cuda loop 0: 405 device records (167 in the
+# loop's own kernel, none in `main`), and with UU applied the PTX grows 647 ->
+# 853 lines and the records 405 -> 421 -- so the transform fires and the loop
+# numbering survives.
+CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+COMPILE_TIMEOUT = 600
 
 
 def is_failure(v: float) -> bool:
@@ -108,8 +111,9 @@ def scope(run_dir: Path, deadzone: float) -> list:
     for bench, recs in elig.get("loop_records", {}).items():
         if bench in keep:
             for rec in recs:
-                meta[(bench, int(rec["loop_idx"]))] = (rec.get("filename", ""),
-                                                       rec.get("triple", ""))
+                meta[(bench, int(rec["loop_idx"]))] = (
+                    rec.get("filename", ""), rec.get("triple", ""),
+                    rec.get("kernel_parents") or [])
 
     tables = {}
     for key, val in rewards.items():
@@ -131,104 +135,181 @@ def scope(run_dir: Path, deadzone: float) -> list:
         if (bench, li) not in meta:
             no_meta += 1
             continue
-        fn, tri = meta[(bench, li)]
+        fn, tri, kp = meta[(bench, li)]
         cases.append({"benchmark": bench, "loop_idx": li,
                       "unmerge": action[0], "factor": action[1],
-                      "filename": fn, "triple": tri, "gain": gain})
+                      "filename": fn, "triple": tri, "kernel_parents": kp,
+                      "gain": gain})
     if no_meta:
         log.warning("%d loops had no record (no filename/triple) — skipped",
                     no_meta)
     return cases
 
 
-def _compile_guarded(work: Path, flags: str, arch: str, rec: Path):
+def parse_remarks(path: Path) -> Counter:
     """
-    _compile, but a build timeout is a result and not a crash.
+    LLVM optimisation-record YAML -> Counter of (kind, Pass, Name, Function).
 
-    hecbench._make passes timeout=300 to subprocess.run, which RAISES
-    TimeoutExpired; neither it nor _compile catches it. Uncaught, one slow
-    benchmark out of 265 would abort the whole sweep after hours of work.
+    A local parser rather than analyze_compile_failures.parse_remarks, which
+    drops the Function field. Without it the diff cannot be scoped to the loop's
+    own kernel, and a module-wide count mixes in every cub/BlockReduce template
+    the TU instantiates.
+
+    Same dependency-free line scan; records look like
+        --- !Passed
+        Pass:            loop-unroll
+        Name:            FullyUnrolled
+        Function:        _Z17fused_4bit_kernelIfLi64EE...
+
+    Returns (counts, reasons):
+      counts  Counter[(kind, Pass, Name, Function)]
+      reasons Counter[(Pass, Function, reason)] for Missed records only — the
+              Args block, which is where LLVM states WHY it declined ("loop not
+              vectorized: could not determine number of loop iterations"). That
+              sentence is the mechanism evidence; the pass name alone is not.
     """
+    counts, reasons = Counter(), Counter()
+    if not path.exists():
+        return counts, reasons
+    kind = p = n = fn = None
+    args, in_args = [], False
+
+    def flush():
+        if kind and p:
+            counts[(kind, p, n or "", fn or "")] += 1
+            if kind == "Missed" and args:
+                reasons[(p, fn or "", " ".join(args)[:160])] += 1
+
+    for line in path.read_text(errors="replace").splitlines():
+        if line.startswith("--- !"):
+            flush()
+            kind, p, n, fn = line[5:].strip(), None, None, None
+            args, in_args = [], False
+        elif line.startswith("Pass:"):
+            p = line.split(":", 1)[1].strip().strip("'\"")
+        elif line.startswith("Name:"):
+            n = line.split(":", 1)[1].strip().strip("'\"")
+        elif line.startswith("Function:"):
+            fn = line.split(":", 1)[1].strip().strip("'\"")
+        elif line.startswith("Args:"):
+            in_args = True
+        elif in_args:
+            m = re.search(r"String:\s*'?([^'\n]*)'?\s*$", line)
+            if m and m.group(1).strip():
+                args.append(m.group(1).strip())
+    flush()
+    return counts, reasons
+
+
+def device_compile(src: Path, arch: str, uu_flags: str, yaml_out: Path,
+                   ptx_out: Path):
+    """
+    Compile ONE translation unit for the device only. Returns (ok, stderr).
+
+    Mirrors hecbench._make's flags (-O3, -std=c++17, the CUDA include dir and
+    --cuda-gpu-arch) so the code being measured is the code that was measured,
+    and adds --cuda-device-only so there is a single cc1 job and the record path
+    cannot be clobbered by the host half.
+    """
+    cmd = ["clang++", "-x", "cuda", "--cuda-device-only", "-S",
+           "-O3", "-std=c++17", "-Wall",
+           "--cuda-gpu-arch=" + arch,
+           "-I" + str(src.parent), "-I" + CUDA_HOME + "/include",
+           "-fsave-optimization-record",
+           "-foptimization-record-file=" + str(yaml_out)]
+    cmd += shlex.split(uu_flags)
+    cmd += [str(src), "-o", str(ptx_out)]
     try:
-        return _compile(work, flags, arch, rec)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=COMPILE_TIMEOUT)
     except subprocess.TimeoutExpired:
         return False, "TIMEOUT"
+    return r.returncode == 0, r.stderr
+
+
+def _delta(b: Counter, u: Counter, kind: str, funcs=None):
+    """Counts present in `b` but reduced in `u` (or the reverse for gains)."""
+    def keep(k):
+        return k[0] == kind and (funcs is None or k[3] in funcs)
+    lost = sorted((("%s/%s" % (k[1], k[2])), b[k] - u.get(k, 0))
+                  for k in b if keep(k) and b[k] > u.get(k, 0))
+    return sorted(lost, key=lambda kv: -kv[1])
 
 
 def run_case(bench: Path, c: dict, arch: str, workdir: Path,
-             keep: "Path | None" = None, save_temps: str = SAVE_TEMPS) -> dict:
-    """Two compiles, one diff."""
-    work = workdir / ("%s_%d" % (bench.name, c["loop_idx"]))
-    if work.exists():
-        shutil.rmtree(work)
-    shutil.copytree(bench, work)
-    # Record dirs live OUTSIDE the work tree — see _compile. Both compiles run
-    # in the SAME tree, which is safe because hecbench._make runs `make clean`
-    # first: the second build genuinely recompiles rather than reusing objects
-    # and emitting no records.
-    base_rec = workdir / ("rec_%s_base" % work.name)
-    uu_rec = workdir / ("rec_%s_uu" % work.name)
+             keep: "Path | None" = None) -> dict:
+    """Two device-only compiles of one TU, one diff. No make, no tree copy."""
+    src = bench / (c["filename"] or "main.cu")
+    tag = "%s_%d" % (bench.name, c["loop_idx"])
+    base_y, uu_y = workdir / (tag + "_base.yaml"), workdir / (tag + "_uu.yaml")
+    base_p, uu_p = workdir / (tag + "_base.ptx"), workdir / (tag + "_uu.ptx")
 
-    ok_base, err_base = _compile_guarded(work, save_temps, arch, base_rec)
+    if not src.exists():
+        return {"baseline_ok": 0, "uu_ok": 0, "usable": 0, "uu_fired": 0,
+                "why_baseline": "missing source %s" % src.name, "why_uu": "",
+                "remarks_baseline": 0, "remarks_uu": 0, "n_opts_lost": 0,
+                "n_opts_gained": 0, "n_missed_new": 0, "n_lost_in_kernel": 0,
+                "n_missed_in_kernel": 0, "lost_passes": "", "missed_new": "",
+                "_lost": [], "_missed": []}
+
+    ok_base, err_base = device_compile(src, arch, "", base_y, base_p)
     flags = _build_extra_cflags(enable_uu=True, filename=c["filename"],
                                 triple=c["triple"], loop_indices=[c["loop_idx"]],
                                 unmerge_flags=[c["unmerge"]],
                                 unroll_factors=[c["factor"]])
-    ok_uu, err_uu = _compile_guarded(work, (flags + " " + save_temps).strip(),
-                                     arch, uu_rec)
+    ok_uu, err_uu = device_compile(src, arch, flags, uu_y, uu_p)
 
-    b, u = parse_remarks(base_rec), parse_remarks(uu_rec)
-    lost = sorted(((("%s/%s" % (k[1], k[2])), b[k] - u.get(k, 0))
-                   for k in b if k[0] == "Passed" and b[k] > u.get(k, 0)),
-                  key=lambda kv: -kv[1])
-    gained = sorted(((("%s/%s" % (k[1], k[2])), u[k] - b.get(k, 0))
-                     for k in u if k[0] == "Passed" and u[k] > b.get(k, 0)),
-                    key=lambda kv: -kv[1])
-    # A Missed remark that is NEW under UU is the strongest mechanism evidence
-    # there is: the pass ran, looked at the loop, and declined — LLVM usually
-    # says why ("could not determine number of loop iterations"), which is
-    # canonical-form damage stated in the compiler's own words.
-    missed = sorted(((("%s/%s" % (k[1], k[2])), u[k] - b.get(k, 0))
-                     for k in u if k[0] == "Missed" and u[k] > b.get(k, 0)),
-                    key=lambda kv: -kv[1])
+    b, br = parse_remarks(base_y)
+    u, ur = parse_remarks(uu_y)
+    # Identical PTX means the transform never applied to this loop, so a zero
+    # diff says nothing about UU. This is the check whose absence let a whole
+    # host-pipeline run be reported as a result.
+    fired = 0
+    if ok_base and ok_uu and base_p.exists() and uu_p.exists():
+        fired = int(base_p.read_bytes() != uu_p.read_bytes())
 
-    # usable=0 means the DIFF IS MEANINGLESS, not that nothing was lost. If the
-    # UU build failed or timed out, every baseline remark is absent from the UU
-    # side and the row would otherwise read as a total wipe-out of downstream
-    # optimisation. Same if the baseline emitted no records at all.
-    usable = int(bool(ok_base and ok_uu and b))
-    # Guard against silently repeating the host-only run: if the harvested
-    # records name no device function, the diff describes the wrong pipeline.
-    # Device kernels are Itanium-mangled (_Z...) and are NOT the host-side
-    # `__device_stub__` launchers clang emits under the same mangling scheme.
-    dev = 0
-    for y in sorted(base_rec.glob("*.opt.yaml")) if base_rec.is_dir() else []:
-        for ln in y.read_text(errors="replace").splitlines():
-            if ln.startswith("Function:") and "__device_stub__" not in ln:
-                if ln.split(":", 1)[1].strip().startswith("_Z"):
-                    dev += 1
-        if dev:
-            break
+    funcs = set(c.get("kernel_parents") or [])
+    lost = _delta(b, u, "Passed")
+    gained = _delta(u, b, "Passed")
+    missed = _delta(u, b, "Missed")
+    lost_k = _delta(b, u, "Passed", funcs) if funcs else []
+    missed_k = _delta(u, b, "Missed", funcs) if funcs else []
+
+    # THE DIRECT ANSWER: a pass that PASSED in the baseline and is MISSED under
+    # UU. Not "the count went down" — the pass ran, looked at the same code, and
+    # explicitly declined. Paired by Pass name, so `loop-vectorize` passing then
+    # missing is one entry regardless of the Name field either side used.
+    ran = {k[1] for k in b if k[0] == "Passed" and (not funcs or k[3] in funcs)}
+    now_missed = collections.defaultdict(int)
+    for k, v in u.items():
+        if k[0] == "Missed" and k[1] in ran and (not funcs or k[3] in funcs):
+            now_missed[k[1]] += v - b.get(("Missed",) + k[1:], 0)
+    flipped = sorted(((p, n) for p, n in now_missed.items() if n > 0),
+                     key=lambda kv: -kv[1])
+    # and why, in LLVM's words — new Missed reasons inside the kernel
+    why = sorted(((("%s: %s" % (k[0], k[2])), v - br.get(k, 0))
+                  for k, v in ur.items()
+                  if (not funcs or k[1] in funcs) and v > br.get(k, 0)),
+                 key=lambda kv: -kv[1])
+
+    usable = int(bool(ok_base and ok_uu and b and fired))
     if not usable:
-        log.warning("  %s loop=%d: UNUSABLE diff (baseline_ok=%s uu_ok=%s "
-                    "baseline_remarks=%d) — excluded from the summary",
-                    bench.name, c["loop_idx"], ok_base, ok_uu, sum(b.values()))
+        log.warning("  %s loop=%d: UNUSABLE (baseline_ok=%s uu_ok=%s "
+                    "baseline_records=%d uu_fired=%d)", bench.name,
+                    c["loop_idx"], ok_base, ok_uu, sum(b.values()), fired)
 
     if keep is not None:
-        # Diagnosis hook: an all-zero diff can mean "UU changed nothing" or
-        # "we captured the wrong records". Only the YAML tells them apart.
         keep.mkdir(parents=True, exist_ok=True)
-        for src_dir, tag in ((base_rec, "base"), (uu_rec, "uu")):
-            dst = keep / ("%s_%s" % (work.name, tag))
-            if src_dir.is_dir():
-                shutil.copytree(src_dir, dst, dirs_exist_ok=True)
+        for f in (base_y, uu_y, base_p, uu_p):
+            if f.exists():
+                shutil.copy2(f, keep / f.name)
         log.info("     kept records in %s", keep)
-    shutil.rmtree(work, ignore_errors=True)
-    shutil.rmtree(base_rec, ignore_errors=True)
-    shutil.rmtree(uu_rec, ignore_errors=True)
-    # A build that fails HERE but produced a measured reward during collection
-    # is a discrepancy worth seeing, and a timeout is a different problem from a
-    # real diagnostic. The reason was previously discarded.
+    for f in (base_y, uu_y, base_p, uu_p):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
     def _why(ok, err):
         if ok:
             return ""
@@ -237,16 +318,23 @@ def run_case(bench: Path, c: dict, arch: str, workdir: Path,
         return extract_error_signature(err)[:120] if err else "unknown"
 
     return {"baseline_ok": int(ok_base), "uu_ok": int(ok_uu), "usable": usable,
-            "device_records": int(dev > 0),
+            "uu_fired": fired,
             "why_baseline": _why(ok_base, err_base),
             "why_uu": _why(ok_uu, err_uu),
             "remarks_baseline": sum(b.values()), "remarks_uu": sum(u.values()),
             "n_opts_lost": sum(n for _, n in lost),
             "n_opts_gained": sum(n for _, n in gained),
             "n_missed_new": sum(n for _, n in missed),
+            "n_lost_in_kernel": sum(n for _, n in lost_k),
+            "n_missed_in_kernel": sum(n for _, n in missed_k),
             "lost_passes": ";".join("%s x%d" % (k, n) for k, n in lost[:8]),
             "missed_new": ";".join("%s x%d" % (k, n) for k, n in missed[:8]),
-            "_lost": lost, "_missed": missed}
+            "n_flipped": sum(n for _, n in flipped),
+            "flipped_passes": ";".join("%s x%d" % (p, n) for p, n in flipped),
+            "top_reason": why[0][0] if why else "",
+            "_lost": lost, "_missed": missed,
+            "_lost_kernel": lost_k, "_missed_kernel": missed_k,
+            "_flipped": flipped, "_why": why}
 
 
 def main() -> None:
@@ -258,10 +346,6 @@ def main() -> None:
     p.add_argument("--arch", default=ARCH)
     p.add_argument("--deadzone", type=float, default=0.005)
     p.add_argument("--limit", type=int, default=0, help="max loops (0 = all)")
-    p.add_argument("--no-save-temps", action="store_true",
-                   help="drop -save-temps=obj; the device optimisation record "
-                        "then lands outside the build tree and only HOST "
-                        "remarks are harvested (the original, wrong behaviour)")
     p.add_argument("--keep-records", type=Path, default=None,
                    help="copy every .opt.yaml here instead of deleting it, so an "
                         "all-zero diff can be diagnosed (use with --limit 1)")
@@ -288,18 +372,20 @@ def main() -> None:
         log.info("[%d/%d] %s loop=%d  unmerge=%d factor=%d  gain=%+.4f",
                  i, len(cases), c["benchmark"], c["loop_idx"], c["unmerge"],
                  c["factor"], c["gain"])
-        r = run_case(bench, c, args.arch, workdir, args.keep_records,
-                     "" if args.no_save_temps else SAVE_TEMPS)
+        r = run_case(bench, c, args.arch, workdir, args.keep_records)
         rows.append(dict(c, **r))
-        log.info("     -> lost %d, gained %d, new-missed %d%s",
-                 r["n_opts_lost"], r["n_opts_gained"], r["n_missed_new"],
+        log.info("     -> module lost %d / missed %d | in-kernel lost %d / "
+                 "missed %d%s", r["n_opts_lost"], r["n_missed_new"],
+                 r["n_lost_in_kernel"], r["n_missed_in_kernel"],
                  "" if r["usable"] else "   [UNUSABLE]")
 
     cols = ["benchmark", "loop_idx", "unmerge", "factor", "gain",
-            "n_opts_lost", "n_opts_gained", "n_missed_new", "remarks_baseline",
-            "remarks_uu", "lost_passes", "missed_new", "usable", "device_records",
-            "baseline_ok",
-            "uu_ok", "why_baseline", "why_uu", "filename", "triple"]
+            "n_lost_in_kernel", "n_missed_in_kernel",
+            "n_opts_lost", "n_opts_gained", "n_missed_new",
+            "remarks_baseline", "remarks_uu", "lost_passes", "missed_new",
+            "n_flipped", "flipped_passes", "top_reason",
+            "usable", "uu_fired", "baseline_ok", "uu_ok",
+            "why_baseline", "why_uu", "filename", "triple"]
     with open(args.out_dir / "canonical_form_cost.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore", restval="")
         w.writeheader()
@@ -320,13 +406,13 @@ def main() -> None:
     if not good:
         log.warning("  nothing usable — check the LLVM build and TARGET_ARCH")
         return
-    n_dev = sum(r["device_records"] for r in good)
-    if n_dev < len(good):
+    n_nofire = sum(1 for r in rows if r["baseline_ok"] and r["uu_ok"]
+                   and not r["uu_fired"])
+    if n_nofire:
         log.warning("")
-        log.warning("  *** %d of %d usable rows harvested NO DEVICE remark. Those "
-                    "rows diff the HOST pipeline, which UU never touches, and "
-                    "their zeros mean nothing. Do not report them. ***",
-                    len(good) - n_dev, len(good))
+        log.warning("  *** %d rows compiled both ways but produced IDENTICAL PTX "
+                    "— UU did not fire at that loop index, so their zero diff "
+                    "says nothing. Excluded. ***", n_nofire)
     lost_any = [r for r in good if r["n_opts_lost"] > 0]
     rest = [r for r in good if r["n_opts_lost"] == 0]
     log.info("  %d of %d (%.0f%%) lost at least one optimisation",
@@ -346,9 +432,40 @@ def main() -> None:
     log.info("    every loop here gained more than the deadzone by construction "
              "— the oracle chose this action. The question is the magnitude.")
 
-    for key, label in (("_lost", "passes that STOPPED firing under UU"),
-                       ("_missed", "NEW 'missed' remarks under UU (the reason, "
-                                   "in the compiler's words)")):
+    lk = [r for r in good if r["n_lost_in_kernel"] > 0]
+    log.info("")
+    log.info("  SCOPED TO THE LOOP'S OWN KERNEL (kernel_parents)")
+    log.info("    %d of %d lost an optimisation inside it", len(lk), len(good))
+    log.info("    lost in-kernel per loop: mean %.1f  max %d",
+             st.fmean([r["n_lost_in_kernel"] for r in good]),
+             max(r["n_lost_in_kernel"] for r in good))
+    log.info("    new missed in-kernel   : mean %.1f  max %d",
+             st.fmean([r["n_missed_in_kernel"] for r in good]),
+             max(r["n_missed_in_kernel"] for r in good))
+
+    fl = [r for r in good if r["n_flipped"] > 0]
+    log.info("")
+    log.info("  PASSED IN BASELINE -> MISSED UNDER UU  (in the loop's kernel)")
+    log.info("    %d of %d loops have at least one", len(fl), len(good))
+    tal = collections.Counter()
+    for r in good:
+        for p, n in r["_flipped"]:
+            tal[p] += n
+    for p, n in tal.most_common(12):
+        log.info("      %6d  %s", n, p)
+    if fl:
+        log.info("    reasons LLVM gave (new Missed remarks in-kernel):")
+        rt = collections.Counter()
+        for r in good:
+            for txt, n in r["_why"]:
+                rt[txt] += n
+        for txt, n in rt.most_common(10):
+            log.info("      %6d  %s", n, txt)
+
+    for key, label in (("_lost_kernel", "passes that STOPPED firing IN THE KERNEL"),
+                       ("_missed_kernel", "NEW 'missed' remarks IN THE KERNEL "
+                                          "(the reason, in the compiler's words)"),
+                       ("_lost", "passes that stopped firing anywhere in the TU")):
         tally = Counter()
         for r in good:
             for name, n in r[key]:
@@ -359,11 +476,11 @@ def main() -> None:
             for name, n in tally.most_common(15):
                 log.info("    %6d  %s", n, name)
     log.info("")
-    log.info("  CAVEAT for the write-up: clang runs the pipeline for BOTH the "
-             "device (nvptx) and host sub-compilations and both emit records. "
-             "The diff is symmetric so it stays valid, but a lost remark is not "
-             "by itself proof a DEVICE optimisation was blocked — confirm "
-             "against the per-function names before claiming one.")
+    log.info("  Compiled with --cuda-device-only, so every remark above is from "
+             "the nvptx module; the host half is not compiled at all. The "
+             "in-kernel numbers are attributed to the loop's own kernel; the "
+             "module-wide ones include everything the TU instantiates (cub, "
+             "BlockReduce), which the loop may or may not reach.")
     log.info("Written: %s", args.out_dir.resolve())
     shutil.rmtree(workdir, ignore_errors=True)
 
