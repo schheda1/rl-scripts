@@ -269,6 +269,7 @@ def run_case(bench: Path, c: dict, arch: str, workdir: Path,
                 "remarks_baseline": 0, "remarks_uu": 0, "n_opts_lost": 0,
                 "n_opts_gained": 0, "n_missed_new": 0, "n_lost_in_kernel": 0,
                 "n_missed_in_kernel": 0, "n_flipped": 0, "lost_passes": "",
+                "ptx_lines_baseline": 0, "ptx_lines_uu": 0,
                 "missed_new": "", "flipped_passes": "", "top_reason": "",
                 "_lost": [], "_missed": [], "_lost_kernel": [],
                 "_missed_kernel": [], "_flipped": [], "_why": []}
@@ -286,8 +287,17 @@ def run_case(bench: Path, c: dict, arch: str, workdir: Path,
     # diff says nothing about UU. This is the check whose absence let a whole
     # host-pipeline run be reported as a result.
     fired = 0
+    ptx_b = ptx_u = 0
     if ok_base and ok_uu and base_p.exists() and uu_p.exists():
-        fired = int(base_p.read_bytes() != uu_p.read_bytes())
+        pb, pu = base_p.read_bytes(), uu_p.read_bytes()
+        fired = int(pb != pu)
+        # Code size, because it is the denominator the Missed counts need.
+        # Unrolling by 8 replicates the body, so the SLP vectoriser simply gets
+        # more candidates to decline and emits more NotPossible/NotBeneficial
+        # remarks. A raw rise in Missed is partly an artifact of there being
+        # more code, NOT evidence that anything was blocked. The Passed->absent
+        # direction has no such confound.
+        ptx_b, ptx_u = pb.count(b"\n"), pu.count(b"\n")
 
     funcs = set(c.get("kernel_parents") or [])
     lost = _delta(b, u, "Passed")
@@ -343,13 +353,16 @@ def run_case(bench: Path, c: dict, arch: str, workdir: Path,
             "why_baseline": _why(ok_base, err_base),
             "why_uu": _why(ok_uu, err_uu),
             "remarks_baseline": sum(b.values()), "remarks_uu": sum(u.values()),
+            "ptx_lines_baseline": ptx_b, "ptx_lines_uu": ptx_u,
             "n_opts_lost": sum(n for _, n in lost),
             "n_opts_gained": sum(n for _, n in gained),
             "n_missed_new": sum(n for _, n in missed),
             "n_lost_in_kernel": sum(n for _, n in lost_k),
             "n_missed_in_kernel": sum(n for _, n in missed_k),
-            "lost_passes": ";".join("%s x%d" % (k, n) for k, n in lost[:8]),
-            "missed_new": ";".join("%s x%d" % (k, n) for k, n in missed[:8]),
+            # Kernel-scoped, matching n_lost_in_kernel / n_missed_in_kernel.
+            # These were module-wide while the counts beside them were not.
+            "lost_passes": ";".join("%s x%d" % (k, n) for k, n in lost_k[:8]),
+            "missed_new": ";".join("%s x%d" % (k, n) for k, n in missed_k[:8]),
             "n_flipped": sum(n for _, n in flipped),
             "flipped_passes": ";".join("%s x%d" % (p, n) for p, n in flipped),
             "top_reason": why[0][0] if why else "",
@@ -403,7 +416,8 @@ def main() -> None:
     cols = ["benchmark", "loop_idx", "unmerge", "factor", "gain",
             "n_lost_in_kernel", "n_missed_in_kernel",
             "n_opts_lost", "n_opts_gained", "n_missed_new",
-            "remarks_baseline", "remarks_uu", "lost_passes", "missed_new",
+            "remarks_baseline", "remarks_uu", "ptx_lines_baseline",
+            "ptx_lines_uu", "lost_passes", "missed_new",
             "n_flipped", "flipped_passes", "top_reason",
             "usable", "uu_fired", "baseline_ok", "uu_ok",
             "why_baseline", "why_uu", "filename", "triple"]
@@ -434,74 +448,52 @@ def main() -> None:
         log.warning("  *** %d rows compiled both ways but produced IDENTICAL PTX "
                     "— UU did not fire at that loop index, so their zero diff "
                     "says nothing. Excluded. ***", n_nofire)
-    lost_any = [r for r in good if r["n_opts_lost"] > 0]
-    rest = [r for r in good if r["n_opts_lost"] == 0]
-    log.info("  %d of %d (%.0f%%) lost at least one optimisation",
-             len(lost_any), len(good), 100 * len(lost_any) / len(good))
-    log.info("  optimisations lost per loop: mean %.1f  median %.0f  max %d",
-             st.fmean([r["n_opts_lost"] for r in good]),
-             st.median([r["n_opts_lost"] for r in good]),
-             max(r["n_opts_lost"] for r in good))
+    # ONE list to read: passes that fired in the baseline and stopped, inside
+    # the loop's own kernel. Everything else here is context for it.
+    lk = [r for r in good if r["n_lost_in_kernel"] > 0]
+    log.info("  %d of %d loops (%.0f%%) lost an optimisation inside their own "
+             "kernel", len(lk), len(good), 100 * len(lk) / len(good))
     log.info("")
-    log.info("  THE CROSSING — was it worth it?")
-    log.info("    mean gain, loops that lost something : %+.4f  (n=%d)",
-             st.fmean([r["gain"] for r in lost_any]) if lost_any else float("nan"),
-             len(lost_any))
-    log.info("    mean gain, loops that lost nothing   : %+.4f  (n=%d)",
+    log.info("  PASSES THAT STOPPED FIRING IN THE KERNEL")
+    tally = Counter()
+    for r in good:
+        for name, n in r["_lost_kernel"]:
+            tally[name] += n
+    for name, n in tally.most_common(15):
+        log.info("    %6d  %s", n, name)
+    if not tally:
+        log.info("    (none)")
+
+    log.info("")
+    log.info("  and was it worth it")
+    rest = [r for r in good if r["n_lost_in_kernel"] == 0]
+    log.info("    mean gain, loops that lost one  : %+.4f  (n=%d)",
+             st.fmean([r["gain"] for r in lk]) if lk else float("nan"), len(lk))
+    log.info("    mean gain, loops that lost none : %+.4f  (n=%d)",
              st.fmean([r["gain"] for r in rest]) if rest else float("nan"),
              len(rest))
-    log.info("    every loop here gained more than the deadzone by construction "
-             "— the oracle chose this action. The question is the magnitude.")
 
-    lk = [r for r in good if r["n_lost_in_kernel"] > 0]
-    log.info("")
-    log.info("  SCOPED TO THE LOOP'S OWN KERNEL (kernel_parents)")
-    log.info("    %d of %d lost an optimisation inside it", len(lk), len(good))
-    log.info("    lost in-kernel per loop: mean %.1f  max %d",
-             st.fmean([r["n_lost_in_kernel"] for r in good]),
-             max(r["n_lost_in_kernel"] for r in good))
-    log.info("    new missed in-kernel   : mean %.1f  max %d",
-             st.fmean([r["n_missed_in_kernel"] for r in good]),
-             max(r["n_missed_in_kernel"] for r in good))
-
-    fl = [r for r in good if r["n_flipped"] > 0]
-    log.info("")
-    log.info("  PASSED IN BASELINE -> MISSED UNDER UU  (in the loop's kernel)")
-    log.info("    %d of %d loops have at least one", len(fl), len(good))
-    tal = collections.Counter()
+    # Context only. Unrolling replicates the body, so passes get more candidates
+    # to decline and Missed counts rise with code size, not with damage.
+    grow = 100 * st.fmean([(r["ptx_lines_uu"] - r["ptx_lines_baseline"])
+                           / max(r["ptx_lines_baseline"], 1) for r in good])
+    mt = Counter()
     for r in good:
-        for p, n in r["_flipped"]:
-            tal[p] += n
-    for p, n in tal.most_common(12):
-        log.info("      %6d  %s", n, p)
-    if fl:
-        log.info("    reasons LLVM gave (new Missed remarks in-kernel):")
-        rt = collections.Counter()
-        for r in good:
-            for txt, n in r["_why"]:
-                rt[txt] += n
-        for txt, n in rt.most_common(10):
-            log.info("      %6d  %s", n, txt)
-
-    for key, label in (("_lost_kernel", "passes that STOPPED firing IN THE KERNEL"),
-                       ("_missed_kernel", "NEW 'missed' remarks IN THE KERNEL "
-                                          "(the reason, in the compiler's words)"),
-                       ("_lost", "passes that stopped firing anywhere in the TU")):
-        tally = Counter()
-        for r in good:
-            for name, n in r[key]:
-                tally[name] += n
-        if tally:
-            log.info("")
-            log.info("  %s", label)
-            for name, n in tally.most_common(15):
-                log.info("    %6d  %s", n, name)
+        for name, n in r["_missed_kernel"]:
+            mt[name] += n
+    if mt:
+        log.info("")
+        log.info("  context, NOT damage — PTX is %+.0f%% larger, so passes have "
+                 "more to examine and decline:", grow)
+        log.info("    %s", ", ".join("%s %d" % (k, v) for k, v in mt.most_common(4)))
+    nf = sum(r["n_flipped"] for r in good)
+    if nf:
+        log.info("  %d of those are strict Passed->Missed flips on the same pass.",
+                 nf)
     log.info("")
-    log.info("  Compiled with --cuda-device-only, so every remark above is from "
-             "the nvptx module; the host half is not compiled at all. The "
-             "in-kernel numbers are attributed to the loop's own kernel; the "
-             "module-wide ones include everything the TU instantiates (cub, "
-             "BlockReduce), which the loop may or may not reach.")
+    log.info("  CSV: read n_lost_in_kernel and lost_passes. Both are scoped to "
+             "the loop's kernel; n_opts_lost is the whole TU and includes cub "
+             "and other templates the loop may never reach.")
     log.info("Written: %s", args.out_dir.resolve())
     shutil.rmtree(workdir, ignore_errors=True)
 
