@@ -63,6 +63,23 @@ log = logging.getLogger("uu-canonical")
 
 FAILURE_VALUES = (-0.16, -0.161)
 
+# Without this the whole study measures the WRONG PIPELINE.
+#
+# clang compiles a .cu twice: once for nvptx (device), once for the host. It
+# derives each optimisation-record path from that sub-compilation's OUTPUT file,
+# and the device output is a TEMPORARY outside the build tree — so
+# `bench.rglob("*.opt.yaml")` in analyze_compile_failures._compile only ever
+# finds the host record. UU is scoped to the device triple, so it changes
+# nothing the host record can see and every loop diffs to zero.
+#
+# Confirmed empirically: the captured records name `main`, `nvtx*`, host STL,
+# and `__device_stub__...` (the host-side launcher) — not one device kernel.
+#
+# -save-temps=obj keeps the device intermediates beside the object file inside
+# the build tree, so the device record is written there and harvested with the
+# rest. Applied to BOTH compiles, so the diff stays symmetric.
+SAVE_TEMPS = "-save-temps=obj"
+
 
 def is_failure(v: float) -> bool:
     return any(abs(v - x) < 1e-9 for x in FAILURE_VALUES)
@@ -139,7 +156,7 @@ def _compile_guarded(work: Path, flags: str, arch: str, rec: Path):
 
 
 def run_case(bench: Path, c: dict, arch: str, workdir: Path,
-             keep: "Path | None" = None) -> dict:
+             keep: "Path | None" = None, save_temps: str = SAVE_TEMPS) -> dict:
     """Two compiles, one diff."""
     work = workdir / ("%s_%d" % (bench.name, c["loop_idx"]))
     if work.exists():
@@ -152,12 +169,13 @@ def run_case(bench: Path, c: dict, arch: str, workdir: Path,
     base_rec = workdir / ("rec_%s_base" % work.name)
     uu_rec = workdir / ("rec_%s_uu" % work.name)
 
-    ok_base, err_base = _compile_guarded(work, "", arch, base_rec)
+    ok_base, err_base = _compile_guarded(work, save_temps, arch, base_rec)
     flags = _build_extra_cflags(enable_uu=True, filename=c["filename"],
                                 triple=c["triple"], loop_indices=[c["loop_idx"]],
                                 unmerge_flags=[c["unmerge"]],
                                 unroll_factors=[c["factor"]])
-    ok_uu, err_uu = _compile_guarded(work, flags, arch, uu_rec)
+    ok_uu, err_uu = _compile_guarded(work, (flags + " " + save_temps).strip(),
+                                     arch, uu_rec)
 
     b, u = parse_remarks(base_rec), parse_remarks(uu_rec)
     lost = sorted(((("%s/%s" % (k[1], k[2])), b[k] - u.get(k, 0))
@@ -179,6 +197,18 @@ def run_case(bench: Path, c: dict, arch: str, workdir: Path,
     # side and the row would otherwise read as a total wipe-out of downstream
     # optimisation. Same if the baseline emitted no records at all.
     usable = int(bool(ok_base and ok_uu and b))
+    # Guard against silently repeating the host-only run: if the harvested
+    # records name no device function, the diff describes the wrong pipeline.
+    # Device kernels are Itanium-mangled (_Z...) and are NOT the host-side
+    # `__device_stub__` launchers clang emits under the same mangling scheme.
+    dev = 0
+    for y in sorted(base_rec.glob("*.opt.yaml")) if base_rec.is_dir() else []:
+        for ln in y.read_text(errors="replace").splitlines():
+            if ln.startswith("Function:") and "__device_stub__" not in ln:
+                if ln.split(":", 1)[1].strip().startswith("_Z"):
+                    dev += 1
+        if dev:
+            break
     if not usable:
         log.warning("  %s loop=%d: UNUSABLE diff (baseline_ok=%s uu_ok=%s "
                     "baseline_remarks=%d) — excluded from the summary",
@@ -207,6 +237,7 @@ def run_case(bench: Path, c: dict, arch: str, workdir: Path,
         return extract_error_signature(err)[:120] if err else "unknown"
 
     return {"baseline_ok": int(ok_base), "uu_ok": int(ok_uu), "usable": usable,
+            "device_records": int(dev > 0),
             "why_baseline": _why(ok_base, err_base),
             "why_uu": _why(ok_uu, err_uu),
             "remarks_baseline": sum(b.values()), "remarks_uu": sum(u.values()),
@@ -227,6 +258,10 @@ def main() -> None:
     p.add_argument("--arch", default=ARCH)
     p.add_argument("--deadzone", type=float, default=0.005)
     p.add_argument("--limit", type=int, default=0, help="max loops (0 = all)")
+    p.add_argument("--no-save-temps", action="store_true",
+                   help="drop -save-temps=obj; the device optimisation record "
+                        "then lands outside the build tree and only HOST "
+                        "remarks are harvested (the original, wrong behaviour)")
     p.add_argument("--keep-records", type=Path, default=None,
                    help="copy every .opt.yaml here instead of deleting it, so an "
                         "all-zero diff can be diagnosed (use with --limit 1)")
@@ -253,7 +288,8 @@ def main() -> None:
         log.info("[%d/%d] %s loop=%d  unmerge=%d factor=%d  gain=%+.4f",
                  i, len(cases), c["benchmark"], c["loop_idx"], c["unmerge"],
                  c["factor"], c["gain"])
-        r = run_case(bench, c, args.arch, workdir, args.keep_records)
+        r = run_case(bench, c, args.arch, workdir, args.keep_records,
+                     "" if args.no_save_temps else SAVE_TEMPS)
         rows.append(dict(c, **r))
         log.info("     -> lost %d, gained %d, new-missed %d%s",
                  r["n_opts_lost"], r["n_opts_gained"], r["n_missed_new"],
@@ -261,7 +297,8 @@ def main() -> None:
 
     cols = ["benchmark", "loop_idx", "unmerge", "factor", "gain",
             "n_opts_lost", "n_opts_gained", "n_missed_new", "remarks_baseline",
-            "remarks_uu", "lost_passes", "missed_new", "usable", "baseline_ok",
+            "remarks_uu", "lost_passes", "missed_new", "usable", "device_records",
+            "baseline_ok",
             "uu_ok", "why_baseline", "why_uu", "filename", "triple"]
     with open(args.out_dir / "canonical_form_cost.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore", restval="")
@@ -283,6 +320,13 @@ def main() -> None:
     if not good:
         log.warning("  nothing usable — check the LLVM build and TARGET_ARCH")
         return
+    n_dev = sum(r["device_records"] for r in good)
+    if n_dev < len(good):
+        log.warning("")
+        log.warning("  *** %d of %d usable rows harvested NO DEVICE remark. Those "
+                    "rows diff the HOST pipeline, which UU never touches, and "
+                    "their zeros mean nothing. Do not report them. ***",
+                    len(good) - n_dev, len(good))
     lost_any = [r for r in good if r["n_opts_lost"] > 0]
     rest = [r for r in good if r["n_opts_lost"] == 0]
     log.info("  %d of %d (%.0f%%) lost at least one optimisation",
