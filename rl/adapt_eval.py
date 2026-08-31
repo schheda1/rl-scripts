@@ -398,7 +398,7 @@ def main() -> None:
     src = Path(args.hecbench_src) if args.hecbench_src else HECBENCH_SRC
     all_b, _, records, normalizer = precheck_benchmarks(
         discover_benchmarks(src), args.run_dir / "eligible_benchmarks.json",
-        skip=True)
+        skip=True, strict=True)
     train_b, val_b, test_b = split_benchmarks(
         all_b, args.val_ratio, args.test_ratio, args.split_seed)
 

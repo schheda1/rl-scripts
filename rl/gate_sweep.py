@@ -90,7 +90,7 @@ def main() -> None:
     src = Path(args.hecbench_src) if args.hecbench_src else HECBENCH_SRC
     benchmarks = discover_benchmarks(src)
     benchmarks, _, loop_records_map, normalizer = precheck_benchmarks(
-        benchmarks, run_dir / "eligible_benchmarks.json", skip=True)
+        benchmarks, run_dir / "eligible_benchmarks.json", skip=True, strict=True)
     train_b, val_b, test_b = split_benchmarks(
         benchmarks, args.val_ratio, args.test_ratio, args.split_seed)
     chosen = {"train": train_b, "val": val_b, "test": test_b}[args.split]

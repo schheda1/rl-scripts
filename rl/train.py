@@ -57,7 +57,7 @@ from hecbench import (
 # 2 for the legacy default (structural + emb) so existing caches remain valid,
 # and becomes a distinct string for any other block set — invalidating a stale
 # precheck cache (wrong pre_features_raw / normalizer dimensionality) on load.
-from features import FEATURES_VERSION                             # noqa: E402
+from features import FEATURES_VERSION, assert_matches            # noqa: E402
 
 # Eligibility marker: changing which loops are eligible (e.g. Study A's
 # numPaths>1 gate) does NOT change feature dims, so FEATURES_VERSION won't
@@ -316,6 +316,7 @@ def precheck_benchmarks(
     benchmarks: list[Path],
     cache_file: Path,
     skip: bool,
+    strict: bool = False,
 ) -> tuple[list[Path], dict[str, int], dict[str, list[dict]], "FeatureNormalizer"]:
     """
     Return (eligible_benchmarks, loop_counts, loop_records_map, normalizer).
@@ -335,6 +336,17 @@ def precheck_benchmarks(
 
     # --- Try to load from cache ---
     if skip and cache_file.exists():
+        if strict:
+            # Eval/analysis path: refuse a cache extracted under a DIFFERENT
+            # feature schema, loudly — instead of the training path's silent
+            # re-extract. sym and fa are both 93-dim, so a mismatch would NOT
+            # raise a shape error; it would feed the wrong embeddings to a model
+            # trained on the other block set.
+            try:
+                _fv = json.loads(cache_file.read_text()).get("features_version")
+            except Exception:
+                _fv = None
+            assert_matches(_fv, f"precheck cache {cache_file.name}")
         try:
             data = json.loads(cache_file.read_text())
             # Feature-schema version guard: a cache written before the IR2Vec

@@ -36,7 +36,7 @@ import offline_train as ot                                      # noqa: E402
 
 DZ = 0.005
 EPOCHS_SMOKE = 2
-N_FEAT = 93          # 18 structural + 75 IR2Vec; asserted against the real list
+from features import N_FEATURES as N_FEAT   # noqa: E402  fixture dim follows the real schema (18 + enabled blocks)
 
 
 def _features(loop_idx: int, trip_known: int = 0, trip_count: int = 0) -> list:

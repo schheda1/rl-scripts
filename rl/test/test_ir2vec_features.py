@@ -47,15 +47,22 @@ def l2(a: list, b: list) -> float:
 
 def test_schema() -> None:
     print("\nT1: schema")
-    check("FEATURE_COLUMNS length == 93", len(FEATURE_COLUMNS) == 93,
+    import features
+    n_struct, n_blocks = 18, len(features.ENABLED_BLOCKS)
+    check(f"FEATURE_COLUMNS length == {n_struct}+{n_blocks}x{IR2VEC_DIM}",
+          len(FEATURE_COLUMNS) == n_struct + n_blocks * IR2VEC_DIM,
           f"{len(FEATURE_COLUMNS)}")
-    check("agent.N_FEATURES == 93", agent.N_FEATURES == 93, f"{agent.N_FEATURES}")
+    check("agent.N_FEATURES == len(FEATURE_COLUMNS)",
+          agent.N_FEATURES == len(FEATURE_COLUMNS),
+          f"{agent.N_FEATURES} vs {len(FEATURE_COLUMNS)}")
     check("trip-count indices unmoved (10,11)",
           FEATURE_COLUMNS[10:12] == ["tripCountKnown", "tripCount"],
           str(FEATURE_COLUMNS[10:12]))
-    check("emb block appended (18=emb0 .. 92=emb74)",
-          FEATURE_COLUMNS[18] == "emb0" and FEATURE_COLUMNS[92] == "emb74",
-          f"{FEATURE_COLUMNS[18]}..{FEATURE_COLUMNS[92]}")
+    first = features.ENABLED_BLOCKS[0]
+    check(f"first embedding block '{first}' appended at {n_struct}",
+          FEATURE_COLUMNS[n_struct] == f"{first}0"
+          and FEATURE_COLUMNS[n_struct + IR2VEC_DIM - 1] == f"{first}{IR2VEC_DIM - 1}",
+          f"{FEATURE_COLUMNS[n_struct]}")
     check("IR2VEC_DIM == 75", IR2VEC_DIM == 75)
 
 

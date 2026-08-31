@@ -117,7 +117,7 @@ def main() -> None:
             run_dir,
         )
     all_benchmarks, _, loop_records_map, normalizer = precheck_benchmarks(
-        all_benchmarks, cache_file, skip=True,
+        all_benchmarks, cache_file, skip=True, strict=True,
     )
     if not all_benchmarks:
         log.error("No eligible benchmarks — cannot evaluate.")
