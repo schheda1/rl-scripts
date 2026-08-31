@@ -182,6 +182,11 @@ def _build_extra_cflags(
                 "IR2VEC_VOCAB env var in the launch script."
             )
         parts.append(f"-mllvm --ir2vec-vocab-path={IR2VEC_VOCAB}")
+        # Per-block emit flags (e.g. -loopcount-emit-fa) for whichever feature
+        # blocks are enabled. Keyed off enable_loopcount so BOTH the pre-loop
+        # extraction and the post-unmerge extraction (which also sets
+        # enable_loopcount) emit the same blocks — pre/post dims stay in lockstep.
+        parts.extend(EXTRA_LOOPCOUNT_FLAGS)
     if enable_uu:
         parts.append("-mllvm --enable-uu")
     if filename:
@@ -328,6 +333,13 @@ def compile_multi_loop(
 # LoopCount feature extraction
 # ---------------------------------------------------------------------------
 
+# The feature schema — columns, dimension, emit flags, cache version — lives in
+# ONE lightweight module (features.py) so hecbench and agent never desync from it.
+from features import (                                            # noqa: E402
+    FEATURE_COLUMNS, EXTRA_LOOPCOUNT_FLAGS,
+    ENABLED_BLOCK_FIRST_COLS, ENABLED_BLOCK_COLUMNS,
+)
+
 # Dimensionality of the IR2Vec loop-content embedding.  Must match IR2VecDim in
 # LoopCount.cpp and seedEmbeddingVocab75D.json.
 IR2VEC_DIM = 75
@@ -357,16 +369,9 @@ LOOPCOUNT_COLUMNS = [
     *_EMB_COLUMNS,
 ]
 
-FEATURE_COLUMNS = [
-    "loopDepth", "numPaths", "loopSize", "sizeIsValid", "containsPHI",
-    "exitBlocksContainPHI", "containsUseOutsideLoop", "containsBarrier",
-    "containsChildLoops", "containsBranch", "tripCountKnown", "tripCount",
-    "numBasicBlocks", "numMemoryInsts", "numComputeInsts", "numControlFlowInsts",
-    "containsCall", "numExits",
-    # IR2Vec embedding features — appended at the END so structural feature
-    # positions (and the trip-count mask indices 10/11 in agent.py) never move.
-    *_EMB_COLUMNS,
-]
+# FEATURE_COLUMNS is imported from features.py (the single schema source): it is
+# STRUCTURAL_COLUMNS (18, front, holding the trip indices 10/11) followed by the
+# enabled embedding block(s), appended so the structural positions never move.
 
 
 def parse_loopcount_output(stderr: str) -> dict[str, dict[str, pd.DataFrame]]:
@@ -435,11 +440,14 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
     # Stale-compiler guard: a pre-IR2Vec llvm emits no emb columns.  Catch it
     # here rather than let the missing FEATURE_COLUMNS surface as NaNs.
     _sample_df = next(iter(parsed[next(iter(parsed))].values()))
-    if "emb0" not in _sample_df.columns:
+    _missing_blocks = [c for c in ENABLED_BLOCK_FIRST_COLS
+                       if c not in _sample_df.columns]
+    if _missing_blocks:
         raise RuntimeError(
-            f"{benchmark_dir.name}: LoopCount output has no IR2Vec embedding "
-            "columns — rebuild llvm with the IR2Vec LoopCount changes, or check "
-            "--ir2vec-vocab-path."
+            f"{benchmark_dir.name}: LoopCount output missing enabled feature "
+            f"block(s) (first cols {_missing_blocks}) — rebuild llvm with the "
+            f"IR2Vec/FA LoopCount changes, or check --ir2vec-vocab-path and the "
+            f"emit flags (UU_FEATURE_BLOCKS)."
         )
 
     # Prefer the CUDA device triple when available; fall back to first triple.
@@ -484,7 +492,7 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
     # embeddings silently discards the whole point, so make it loud.
     if eligible:
         import logging as _logging
-        _emb_cols = [c for c in _EMB_COLUMNS
+        _emb_cols = [c for c in ENABLED_BLOCK_COLUMNS
                      if c in next(iter(eligible.values())).columns]
         all_zero = all(
             (df[_emb_cols].abs().to_numpy().sum() == 0)
@@ -777,8 +785,21 @@ def measure_kernel_time(
 # ---------------------------------------------------------------------------
 
 def _row_to_tensor(row: "pd.Series") -> torch.Tensor:
-    """Convert a LoopCount DataFrame row to a (N_FEATURES,) float32 tensor."""
-    values = [float(row.get(col, 0.0)) for col in FEATURE_COLUMNS]
+    """Convert a LoopCount DataFrame row to a (N_FEATURES,) float32 tensor.
+
+    Strict: every FEATURE_COLUMNS entry must be present in the row. A missing
+    column means an enabled feature block was not emitted (flag didn't take, or
+    the llvm build lacks it) — raise loudly rather than silently zero-fill, which
+    would corrupt the vector without any shape error.
+    """
+    missing = [c for c in FEATURE_COLUMNS if c not in row.index]
+    if missing:
+        raise KeyError(
+            f"_row_to_tensor: row missing {len(missing)} feature column(s) "
+            f"{missing[:4]}{'...' if len(missing) > 4 else ''} — an enabled "
+            f"feature block was not emitted (UU_FEATURE_BLOCKS vs compile flags)."
+        )
+    values = [float(row[col]) for col in FEATURE_COLUMNS]
     return torch.tensor(values, dtype=torch.float32)
 
 

@@ -55,19 +55,20 @@ import torch.nn.functional as F
 # timeouts in the first full run, for negligible policy value.  Reinstating
 # them changes the FactorActor output dim — old checkpoints become incompatible.
 FACTOR_VALUES: list[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-# 18 structural features + 75 IR2Vec embedding dims.  Must equal
-# len(FEATURE_COLUMNS) in hecbench.py (asserted at startup in train.py).
-# Checkpoints from the 18-feature runs are NOT loadable (input dim changed).
-N_FEATURES: int = 93
-N_FACTORS: int = len(FACTOR_VALUES)
-
-# Indices of tripCountKnown and tripCount within the RAW feature vector.
-# Must stay in sync with FEATURE_COLUMNS in hecbench.py.
-# NOTE: these indices are only meaningful on UN-normalised tensors.  The
+# Feature dimension and the trip-count indices come from the single schema
+# source (features.py) so they can never desync from FEATURE_COLUMNS; the
+# startup assertion in train.py cross-checks len(FEATURE_COLUMNS) == N_FEATURES.
+# Checkpoints are only loadable across runs with the SAME feature schema (input
+# dim / content changed → old checkpoints incompatible).
+# NOTE: the trip indices are meaningful only on UN-normalised tensors.  The
 # tensors fed to the networks are z-scored by FeatureNormalizer, so the mask
 # must never be derived from them — build_factor_mask takes raw scalars instead.
-_IDX_TRIP_COUNT_KNOWN: int = 10
-_IDX_TRIP_COUNT: int = 11
+from features import (                                            # noqa: E402
+    N_FEATURES,
+    IDX_TRIP_COUNT_KNOWN as _IDX_TRIP_COUNT_KNOWN,
+    IDX_TRIP_COUNT as _IDX_TRIP_COUNT,
+)
+N_FACTORS: int = len(FACTOR_VALUES)
 
 
 def build_factor_mask(trip_known: bool, trip_count: int) -> torch.Tensor:

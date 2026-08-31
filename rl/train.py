@@ -53,10 +53,11 @@ from hecbench import (
     discover_benchmarks,
 )
 
-# Bump when the feature schema changes so a --skip-precheck run cannot load a
-# cache whose pre_features_raw / normalizer are the wrong dimensionality.
-# v1 = 18 structural features; v2 = 18 structural + 75 IR2Vec embeddings.
-FEATURES_VERSION = 2
+# FEATURES_VERSION comes from the schema source (features.py): it stays the int
+# 2 for the legacy default (structural + emb) so existing caches remain valid,
+# and becomes a distinct string for any other block set — invalidating a stale
+# precheck cache (wrong pre_features_raw / normalizer dimensionality) on load.
+from features import FEATURES_VERSION                             # noqa: E402
 
 # Eligibility marker: changing which loops are eligible (e.g. Study A's
 # numPaths>1 gate) does NOT change feature dims, so FEATURES_VERSION won't
