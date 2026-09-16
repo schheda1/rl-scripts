@@ -544,7 +544,13 @@ def measure_baselines(
     if cache_file is not None and Path(cache_file).exists():
         try:
             saved = json.loads(Path(cache_file).read_text())
-            if saved.get("arch") == arch:
+            # Both arch AND n_runs must match: total_ms/per_kernel_ms are the
+            # MEDIAN of n_runs nsys profiles, so a cache measured with a
+            # different n_runs mixes two noise levels into the baselines the
+            # reward cache is scored against.  A mismatch on either re-measures
+            # rather than merge.  An old cache lacking "n_runs" fails the check
+            # and is re-measured once, which is the safe direction.
+            if saved.get("arch") == arch and saved.get("n_runs") == n_runs:
                 cache.update(saved.get("baselines", {}))
                 log.info(
                     "Loaded %d baselines from cache (%s) — measuring only the rest",
@@ -552,11 +558,33 @@ def measure_baselines(
                 )
             else:
                 log.warning(
-                    "Baseline cache arch mismatch (%s != %s) — re-measuring all",
-                    saved.get("arch"), arch,
+                    "Baseline cache mismatch (arch %s vs %s, n_runs %s vs %s) — "
+                    "re-measuring all",
+                    saved.get("arch"), arch, saved.get("n_runs"), n_runs,
                 )
         except Exception as e:
             log.warning("Could not read baseline cache (%s): %s", cache_file, e)
+
+    def _flush_cache() -> None:
+        """Atomically persist the baselines measured so far.
+
+        Without this the pass wrote only after the whole loop finished (~3h for
+        the full set), so a killed job lost every baseline it had measured and
+        restarted from scratch — while the loader above already skips anything
+        already on disk, so a mid-loop flush is all the resume path was missing.
+        tmp+replace (not a bare write_text) so a kill DURING the write cannot
+        truncate the cache.
+        """
+        if cache_file is None:
+            return
+        try:
+            p = Path(cache_file)
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps(
+                {"arch": arch, "n_runs": n_runs, "baselines": cache}, indent=2))
+            tmp.replace(p)
+        except Exception as e:
+            log.warning("Could not save baseline cache: %s", e)
 
     benchmarks = [b for b in benchmarks if b.name not in cache]
     log.info("Measuring baselines for %d benchmarks (once per run)...", len(benchmarks))
@@ -652,6 +680,8 @@ def measure_baselines(
             "  DONE  %-35s  total=%.3f ms  kernels_cached=%d",
             b.name, total_ms, len(per_kernel_ms),
         )
+        # Persist after EVERY benchmark so a kill resumes here, not from zero.
+        _flush_cache()
 
     # Accounting: len(benchmarks) is what was ATTEMPTED this call (the ones not
     # already cached), not what succeeded.  Report both — a benchmark without a
@@ -672,14 +702,11 @@ def measure_baselines(
             failed, _lost,
         )
 
+    # A final atomic flush: no-op data-wise after the per-benchmark flushes, but
+    # it also covers the all-cached path where the loop never ran.
+    _flush_cache()
     if cache_file is not None:
-        try:
-            Path(cache_file).write_text(json.dumps(
-                {"arch": arch, "n_runs": n_runs, "baselines": cache}, indent=2,
-            ))
-            log.info("Baseline cache saved: %s", cache_file)
-        except Exception as e:
-            log.warning("Could not save baseline cache: %s", e)
+        log.info("Baseline cache saved: %s", cache_file)
 
     return cache
 
