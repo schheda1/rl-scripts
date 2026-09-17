@@ -47,9 +47,10 @@ BLOCKS = {
     "emb":  ([f"emb{i}"  for i in range(IR2VEC_DIM)], [], True),   # SYM IR2Vec (emitted whenever loopcount+vocab)
     "femb": ([f"femb{i}" for i in range(IR2VEC_DIM)],
              ["-mllvm -loopcount-emit-fa", f"-mllvm -loopcount-fa-iters={_FA_ITERS}"], True),  # flow-aware IR2Vec
-    # FUTURE (§1e) — declared so the schema accounts for them, gated until the C++ emits them:
+    # Kernel-context embedding: the whole-__global__-kernel symbolic IR2Vec pool,
+    # shared by every loop of that kernel (LoopCount.cpp emits it AFTER emb/femb).
     "kemb": ([f"kemb{i}" for i in range(IR2VEC_DIM)],
-             ["-mllvm -loopcount-emit-kernel-emb"], False),        # kernel-context embedding (flag name TBD)
+             ["-mllvm -loopcount-emit-kernel-emb"], True),
     # "widths": (...) add when the IR-level type-width histogram lands (size TBD).
 }
 # Canonical concatenation order (structural is prepended separately, always first).

@@ -37,6 +37,9 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     _results.append((name, ok))
 
 
+_KEMB_COLUMNS = [f"kemb{i}" for i in range(IR2VEC_DIM)]
+
+
 def emb_subvector(row) -> list[float]:
     return [float(row[c]) for c in _EMB_COLUMNS]
 
@@ -58,11 +61,20 @@ def test_schema() -> None:
     check("trip-count indices unmoved (10,11)",
           FEATURE_COLUMNS[10:12] == ["tripCountKnown", "tripCount"],
           str(FEATURE_COLUMNS[10:12]))
-    first = features.ENABLED_BLOCKS[0]
-    check(f"first embedding block '{first}' appended at {n_struct}",
-          FEATURE_COLUMNS[n_struct] == f"{first}0"
-          and FEATURE_COLUMNS[n_struct + IR2VEC_DIM - 1] == f"{first}{IR2VEC_DIM - 1}",
-          f"{FEATURE_COLUMNS[n_struct]}")
+    # Verify EVERY enabled block is contiguous, in canonical order, right after
+    # the 18 structural columns — not just the first (so a mis-placed femb/kemb
+    # block is caught, not only a wrong leading block).
+    off, layout_ok = n_struct, True
+    for b in features.ENABLED_BLOCKS:
+        cols = features.BLOCKS[b][0]
+        if FEATURE_COLUMNS[off:off + len(cols)] != cols:
+            layout_ok = False
+            break
+        off += len(cols)
+    check("enabled blocks contiguous & in canonical order after structural",
+          layout_ok and off == len(FEATURE_COLUMNS),
+          "+".join(f"{b}({len(features.BLOCKS[b][0])})"
+                   for b in features.ENABLED_BLOCKS))
     check("IR2VEC_DIM == 75", IR2VEC_DIM == 75)
 
 
@@ -127,6 +139,73 @@ def test_device_embeddings(bench: Path) -> None:
               len(sigs) > 1, f"{len(sigs)} distinct / {len(dev)} loops")
 
 
+def test_kernel_embeddings(bench: Path) -> None:
+    """
+    kemb-specific coverage — runs ONLY when the kemb block is enabled
+    (UU_FEATURE_BLOCKS contains kemb); otherwise SKIP, so the default emb run is
+    unaffected.  Validates the load-bearing property that kemb is PER-KERNEL: kemb
+    is one whole-__global__-kernel pool shared by every loop of that kernel, so
+    every row with the same kernelParents MUST carry a byte-identical kemb.  Plus
+    two non-degeneracy checks: distinct kernels get distinct kemb (rules out one
+    constant vector), and kemb differs from the loop-local emb (rules out kemb
+    being accidentally the loop pool).  Uses the RAW parse (all loops, pre-
+    eligibility) so kernels expose as many loops as possible to the invariant.
+    """
+    import features
+    if "kemb" not in features.ENABLED_BLOCKS:
+        print("\nT6: kernel embeddings — SKIP (kemb not in UU_FEATURE_BLOCKS)")
+        return
+    print(f"\nT6: kernel embeddings ({bench.name}) [per-kernel invariant]")
+    res = compile_loopcount(bench)
+    parsed = parse_loopcount_output(res.stderr)
+    all_rows = [row for fm in parsed.values() for df in fm.values()
+                for _, row in df.iterrows()]
+    if not all_rows or "kemb0" not in all_rows[0].index:
+        check("raw output has kemb columns", False)
+        return
+    check("raw output has kemb columns", True)
+
+    def kvec(r):
+        return tuple(round(float(r[c]), 6) for c in _KEMB_COLUMNS)
+
+    dev = [r for r in all_rows if _is_device_row(r)]
+    dev_nz = sum(1 for r in dev if any(abs(float(r[c])) > 0 for c in _KEMB_COLUMNS))
+    check("device loops exist in output", len(dev) > 0, f"{len(dev)}")
+    check("EVERY device loop has a non-zero kemb",
+          len(dev) > 0 and dev_nz == len(dev), f"{dev_nz}/{len(dev)}")
+
+    # Per-kernel invariant: group device rows by kernelParents; kemb identical
+    # within each group.  Only groups with >=2 loops actually exercise it — report
+    # how many, so a vacuous pass (all kernels single-loop) is visible.
+    groups: dict[str, list] = {}
+    for r in dev:
+        groups.setdefault(str(r.get("kernelParents", "")).strip(), []).append(r)
+    multi = {k: v for k, v in groups.items() if len(v) > 1}
+    violated = [k for k, v in multi.items() if len({kvec(r) for r in v}) > 1]
+    print(f"  kernel groups: {len(groups)} | with >=2 loops (exercise invariant): "
+          f"{len(multi)}")
+    check("shared-kernel invariant: same kernelParents => identical kemb",
+          len(violated) == 0,
+          f"{len(multi)} multi-loop kernels checked, {len(violated)} violated")
+    if len(multi) == 0:
+        print("  NOTE: no kernel has >=2 device loops here — invariant not "
+              "exercised; run on a benchmark with a multi-loop kernel to test it.")
+
+    # Non-degeneracy: distinct kernels -> distinct kemb (one per group is enough).
+    if len(groups) > 1:
+        sigs = {kvec(v[0]) for v in groups.values()}
+        check("distinct kernels have distinct kemb (not one constant vector)",
+              len(sigs) > 1, f"{len(sigs)} distinct kemb / {len(groups)} kernels")
+
+    # kemb is the KERNEL pool, not a copy of the loop-local emb.
+    if "emb0" in all_rows[0].index:
+        def evec(r):
+            return tuple(round(float(r[c]), 6) for c in _EMB_COLUMNS)
+        differ = sum(1 for r in dev if kvec(r) != evec(r))
+        check("kemb differs from loop emb (kernel context != loop content)",
+              differ > 0, f"{differ}/{len(dev)} rows differ")
+
+
 def test_pre_post_unmerge(bench: Path, file_map) -> None:
     print(f"\nT3: pre vs post-unmerge ({bench.name})")
     # pick a multi-path loop (unmerge actually restructures it)
@@ -178,7 +257,7 @@ def test_pre_post_unmerge(bench: Path, file_map) -> None:
 
     pre_full = _row_to_tensor(pre_row).tolist()
     post_full = _row_to_tensor(post_row).tolist()
-    check("FULL 93-dim vector changes under unmerge",
+    check(f"FULL {len(pre_full)}-dim vector changes under unmerge",
           pre_full != post_full, f"L2={l2(pre_full, post_full):.4f}")
 
     emb_delta = l2(emb_subvector(pre_row), emb_subvector(post_row))
@@ -225,8 +304,9 @@ def test_dedup_delta(disc: dict, prefer: str) -> None:
         return
     full = [tuple(_row_to_tensor(r).tolist()) for r in rows]
     struct = [tuple(_row_to_tensor(r).tolist()[:18]) for r in rows]
-    print(f"  unique@18-dim: {len(set(struct))}  unique@93-dim: {len(set(full))}")
-    check("93-dim disambiguates >= 18-dim (fewer or equal dups)",
+    full_dim = len(FEATURE_COLUMNS)
+    print(f"  unique@18-dim: {len(set(struct))}  unique@{full_dim}-dim: {len(set(full))}")
+    check(f"{full_dim}-dim disambiguates >= 18-dim (fewer or equal dups)",
           len(set(full)) >= len(set(struct)),
           f"{len(set(full))} >= {len(set(struct))} unique")
 
@@ -243,7 +323,8 @@ def test_normalizer(disc: dict) -> None:
     tensors = [_row_to_tensor(r) for r in rows]
     n = FeatureNormalizer()
     n.fit(tensors)
-    check("normalizer mean length == 93", len(n.mean) == 93, f"{len(n.mean)}")
+    check(f"normalizer mean length == {len(FEATURE_COLUMNS)}",
+          len(n.mean) == len(FEATURE_COLUMNS), f"{len(n.mean)}")
     emb_std = n.std[18:].tolist()
     check("some embedding dims have std > 0", any(s > 1e-6 for s in emb_std),
           f"max emb std = {max(emb_std):.4g}")
@@ -286,6 +367,7 @@ def main() -> None:
     test_schema()
     fm = test_extraction(bench)
     test_device_embeddings(bench)          # the key device-vs-host check
+    test_kernel_embeddings(bench)          # kemb per-kernel invariant (skips if off)
     if fm:
         test_pre_post_unmerge(bench, fm)
     # T5/T4 pool loops across benchmarks — a single-loop benchmark gives a
