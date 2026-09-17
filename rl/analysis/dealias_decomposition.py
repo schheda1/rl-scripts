@@ -205,7 +205,10 @@ def print_report(res: dict, avail: list, missing: list) -> None:
     print("=" * 74)
     print("  De-alias decomposition (reward-independent, feature-side counting)")
     print("=" * 74)
+    d0 = res["stats"]["base"][0]
     print(f"  loops analysed         : {res['n_loops']}")
+    print(f"  distinct BASE vectors  : {d0}   redundant (elig-distinct): {res['n_loops'] - d0}"
+          f"   <- '#collisions' = eligible - dedups")
     print(f"  axes available         : {', '.join(res['axes']) or '(none)'}")
     if missing:
         print(f"  axes NOT YET available : {', '.join(missing)}  "
@@ -242,6 +245,99 @@ def print_report(res: dict, avail: list, missing: list) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Census — confirm the eligible-loop population (standalone, reward-independent)
+# ---------------------------------------------------------------------------
+
+def census(df: pd.DataFrame, ndp: int) -> None:
+    n = len(df)
+    d, colliding, groups, _ = _stats(_vecs(df, BASE_COLS, ndp))
+    print("=" * 74)
+    print("  Census — eligible-loop population (reward-independent)")
+    print("=" * 74)
+    print(f"  eligible loops (rows)        : {n}")
+    print(f"  distinct BASE vectors        : {d}")
+    print(f"  redundant (eligible-distinct): {n - d}   <- '#collisions' = eligible - dedups")
+    print(f"  colliding loops (groups >=2) : {colliding}   singletons: {n - colliding}")
+    print(f"  collision groups             : {groups}   "
+          f"(check: colliding - groups = {colliding - groups} = redundant)")
+    if "benchmark" in df.columns:
+        print(f"  benchmarks                   : {df['benchmark'].nunique()}")
+        vc = df["benchmark"].value_counts()
+        print(f"  loops/benchmark              : median {int(vc.median())}, "
+              f"max {int(vc.max())} ({vc.idxmax()}), min {int(vc.min())}")
+    if "numPaths" in df.columns:
+        npv = df["numPaths"].astype(float)
+        print(f"  numPaths split               : ==1 {int((npv == 1).sum())} | "
+              f"in (1,16] {int(((npv > 1) & (npv <= 16)).sum())} | "
+              f">16 {int((npv > 16).sum())}   "
+              f"(Study-A unmerge gate keeps only numPaths in (1,16])")
+    # duplicate PHYSICAL loops — a dup row inflates the census and every count
+    for key in (["benchmark", "__file", "loopIdx"],
+                ["benchmark", "function", "startLine", "startCol"]):
+        if set(key) <= set(df.columns):
+            ndup = int(df.duplicated(subset=key).sum())
+            print(f"  duplicate rows by {'|'.join(key):<38}: {ndup}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Floor naming — classify what still collides after +all (diagnostic; mangled
+# names are used ONLY to name the floor, never as a feature — per followup_plan.md)
+# ---------------------------------------------------------------------------
+
+def _is_lib(name: str) -> bool:
+    n = name.lower()
+    return "cub" in n or "thrust" in n
+
+
+def _classify_floor(df: pd.DataFrame, avail_axes: list, ndp: int, examples: int = 6):
+    """Classify the loops STILL colliding after +all by mangled-name identity.
+    Returns (counts, samples). Pure — no printing — so the self-test can assert."""
+    all_cols = BASE_COLS + [c for _, cols in avail_axes for c in cols]
+    _, _, _, coll = _stats(_vecs(df, all_cols, ndp))
+    funcs = df["function"].astype(str).tolist()
+    c = dict(ident_g=0, ident_l=0, distinct_g=0, distinct_l=0, lib_g=0, lib_l=0)
+    samples = []
+    for members in coll.values():
+        names = {funcs[p] for p in members}
+        if len(names) == 1:
+            c["ident_g"] += 1
+            c["ident_l"] += len(members)
+        else:
+            c["distinct_g"] += 1
+            c["distinct_l"] += len(members)
+            if any(_is_lib(funcs[p]) for p in members):
+                c["lib_g"] += 1
+                c["lib_l"] += len(members)
+            if len(samples) < examples:
+                samples.append((len(members), sorted(names)[:3]))
+    return c, samples
+
+
+def name_floor(df: pd.DataFrame, avail_axes: list, ndp: int, examples: int = 6) -> None:
+    if "function" not in df.columns:
+        sys.exit("--name-floor needs the 'function' column (diagnostic mangled names)")
+    c, samples = _classify_floor(df, avail_axes, ndp, examples)
+    axes_str = "+".join(["base"] + [n for n, _ in avail_axes])
+    print("=" * 74)
+    print(f"  Floor naming — still colliding after {axes_str} (diagnostic)")
+    print("=" * 74)
+    print(f"  floor: {c['ident_g'] + c['distinct_g']} groups / "
+          f"{c['ident_l'] + c['distinct_l']} loops")
+    print(f"    identical mangled name : {c['ident_g']} groups / {c['ident_l']} loops"
+          f"   <- SAME static code; only runtime context differs (static cannot reach)")
+    print(f"    distinct mangled names : {c['distinct_g']} groups / {c['distinct_l']} loops"
+          f"   <- different code collapsed to one vector; MORE features can split")
+    print(f"       of which cub/thrust : {c['lib_g']} groups / {c['lib_l']} loops"
+          f"   <- WIDTHS-resolvable candidates (type-instantiation aliasing)")
+    if samples:
+        print("  examples (distinct-name floor groups):")
+        for sz, names in samples:
+            print(f"    size {sz}: " + " | ".join(nm[:56] for nm in names))
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Self-test (no compiler / benchmarks needed) — verifies the counting logic
 # ---------------------------------------------------------------------------
 
@@ -256,7 +352,7 @@ def _synthetic_df() -> pd.DataFrame:
         F triple splits only PARTIALLY under +all -> residual floor (2 of 3)
         U       unique base                      -> never collides
     """
-    def loop(bidx, femb0, kemb0, lidx):
+    def loop(bidx, femb0, kemb0, lidx, fn):
         r = {c: 0.0 for c in BASE_COLS + FEMB + KEMB}
         r["emb0"] = float(bidx)      # base signature (a group shares it)
         r["femb0"] = float(femb0)
@@ -264,16 +360,20 @@ def _synthetic_df() -> pd.DataFrame:
         r["benchmark"] = "synth"
         r["__file"] = "s.cu"
         r["loopIdx"] = lidx          # int, as in real extractions
+        r["function"] = fn           # mangled-name stand-in (floor-naming diagnostic)
         return r
 
     rows = [
-        loop(10, 0, 1, 0), loop(10, 0, 2, 1),                       # A boundary-only
-        loop(20, 1, 0, 2), loop(20, 2, 0, 3),                       # B flow-only
-        loop(30, 0, 0, 4), loop(30, 0, 0, 5),                       # C floor (full)
-        loop(40, 1, 1, 6), loop(40, 2, 2, 7),                       # D either
-        loop(50, 0, 0, 8),                                          # U unique base
-        loop(60, 1, 1, 9), loop(60, 1, 2, 10), loop(60, 2, 1, 11),  # E combo-only
-        loop(70, 1, 1, 12), loop(70, 1, 1, 13), loop(70, 1, 2, 14),  # F partial floor
+        loop(10, 0, 1, 0, "kA"), loop(10, 0, 2, 1, "kA"),          # A boundary-only
+        loop(20, 1, 0, 2, "kB"), loop(20, 2, 0, 3, "kB"),          # B flow-only
+        loop(30, 0, 0, 4, "kC"), loop(30, 0, 0, 5, "kC"),          # C floor: SAME name
+        loop(40, 1, 1, 6, "kD"), loop(40, 2, 2, 7, "kD"),          # D either
+        loop(50, 0, 0, 8, "kU"),                                    # U unique base
+        loop(60, 1, 1, 9, "kE"), loop(60, 1, 2, 10, "kE"),
+        loop(60, 2, 1, 11, "kE"),                                   # E combo-only
+        # F partial floor: F1,F2 survive +all with DISTINCT names
+        loop(70, 1, 1, 12, "kF_float"), loop(70, 1, 1, 13, "kF_double"),
+        loop(70, 1, 2, 14, "kF_int"),
     ]
     return pd.DataFrame(rows)
 
@@ -341,6 +441,21 @@ def selftest() -> int:
           and res_dup["floor_loops"] == res["floor_loops"],
           "position-based counting is id-agnostic")
 
+    # Floor naming: floor = {C1,C2} (same name -> identical) + {F1,F2} (distinct names).
+    fc, _ = _classify_floor(df, axes, ndp=6)
+    check("floor naming: 1 identical-name group / 2 loops (C)",
+          fc["ident_g"] == 1 and fc["ident_l"] == 2, f"{fc['ident_g']}g/{fc['ident_l']}l")
+    check("floor naming: 1 distinct-name group / 2 loops (F)",
+          fc["distinct_g"] == 1 and fc["distinct_l"] == 2,
+          f"{fc['distinct_g']}g/{fc['distinct_l']}l")
+    check("floor naming: 0 cub/thrust (no lib names in synth)", fc["lib_g"] == 0,
+          f"{fc['lib_g']}")
+
+    # Redundant identity: eligible - distinct == colliding - groups (both = 1345-analog).
+    n, (d0, l0, g0) = res["n_loops"], res["stats"]["base"]
+    check("redundant identity: elig-distinct == colliding-groups",
+          (n - d0) == (l0 - g0), f"{n - d0} == {l0 - g0}")
+
     print(f"\n  {'ALL PASS' if ok else 'FAILURES ABOVE'}")
     return 0 if ok else 1
 
@@ -356,6 +471,12 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=0, help="cap benchmarks (0 = all)")
     p.add_argument("--round", type=int, default=6,
                    help="decimals for collision equality (CSV emits %%.6f)")
+    p.add_argument("--census", action="store_true",
+                   help="report the eligible-loop population (elig/distinct/redundant, "
+                        "numPaths split, duplicate-row check) — confirms the count")
+    p.add_argument("--name-floor", dest="name_floor", action="store_true",
+                   help="classify what still collides after +all by mangled name "
+                        "(identical-code floor vs distinct-name / cub type-aliasing)")
     p.add_argument("--selftest", action="store_true",
                    help="verify the counting logic with synthetic data; no compiler")
     args = p.parse_args()
@@ -404,9 +525,14 @@ def main() -> int:
               f"Fix the extraction (strict features should have none).\n",
               file=sys.stderr)
 
-    res = decompose(df, avail_axes, args.round)
-    assert_monotonic(res["stats"], res["axes"])
-    print_report(res, avail_axes, missing)
+    if args.census:
+        census(df, args.round)
+    if args.name_floor:
+        name_floor(df, avail_axes, args.round)
+    if not (args.census or args.name_floor):
+        res = decompose(df, avail_axes, args.round)
+        assert_monotonic(res["stats"], res["axes"])
+        print_report(res, avail_axes, missing)
     return 0
 
 
