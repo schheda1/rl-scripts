@@ -471,6 +471,9 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=0, help="cap benchmarks (0 = all)")
     p.add_argument("--round", type=int, default=6,
                    help="decimals for collision equality (CSV emits %%.6f)")
+    p.add_argument("--exclude-benchmarks", dest="exclude_benchmarks", default="",
+                   help="comma list of benchmark names to DROP before any analysis "
+                        "(e.g. logic-rewrite-cuda, to test an outlier's influence)")
     p.add_argument("--census", action="store_true",
                    help="report the eligible-loop population (elig/distinct/redundant, "
                         "numPaths split, duplicate-row check) — confirms the count")
@@ -493,8 +496,17 @@ def main() -> int:
     elif args.hecbench_src:
         df = extract_features(args.hecbench_src, args.limit)
         if args.save_features:
-            df.to_csv(args.save_features, index=False)
-            print(f"features written: {args.save_features}  ({len(df)} loops)\n")
+            out = Path(args.save_features).resolve()   # absolute, no CWD ambiguity
+            out.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(out, index=False)
+            if not out.exists() or out.stat().st_size == 0:
+                sys.exit(f"SAVE FAILED: {out} is missing or empty after to_csv")
+            print(f"features written: {out}  ({len(df)} loops, "
+                  f"{out.stat().st_size / 1e6:.1f} MB)\n")
+        else:
+            print("WARNING: --save-features not given — the extracted table was NOT "
+                  "persisted (this run is one-shot). Re-run with "
+                  "--save-features <path> to keep it.\n", file=sys.stderr)
     else:
         sys.exit("give --features <table.csv>, --hecbench-src <tree>, or --selftest")
 
@@ -502,6 +514,17 @@ def main() -> int:
     if missing_base:
         sys.exit(f"feature table missing base columns (first: {missing_base[:3]}) — "
                  f"extract with at least UU_FEATURE_BLOCKS=emb")
+
+    if args.exclude_benchmarks:
+        drop = {b.strip() for b in args.exclude_benchmarks.split(",") if b.strip()}
+        if "benchmark" not in df.columns:
+            sys.exit("--exclude-benchmarks needs a 'benchmark' column")
+        before = len(df)
+        df = df[~df["benchmark"].isin(drop)].reset_index(drop=True)
+        print(f"excluded {before - len(df)} loops from {sorted(drop)} "
+              f"-> {len(df)} loops remain\n")
+        if len(df) == 0:
+            sys.exit("all loops excluded — nothing to analyse")
 
     id_col = add_id(df)
     if df[id_col].duplicated().any():
