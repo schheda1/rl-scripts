@@ -51,10 +51,12 @@ def l2(a: list, b: list) -> float:
 def test_schema() -> None:
     print("\nT1: schema")
     import features
-    n_struct, n_blocks = 18, len(features.ENABLED_BLOCKS)
-    check(f"FEATURE_COLUMNS length == {n_struct}+{n_blocks}x{IR2VEC_DIM}",
-          len(FEATURE_COLUMNS) == n_struct + n_blocks * IR2VEC_DIM,
-          f"{len(FEATURE_COLUMNS)}")
+    n_struct = 18
+    # Blocks are variable-width now (emb/femb/kemb are 75, widths is 11), so sum the
+    # actual block lengths rather than assuming n_blocks * IR2VEC_DIM.
+    expected = n_struct + sum(len(features.BLOCKS[b][0]) for b in features.ENABLED_BLOCKS)
+    check(f"FEATURE_COLUMNS length == {expected}",
+          len(FEATURE_COLUMNS) == expected, f"{len(FEATURE_COLUMNS)}")
     check("agent.N_FEATURES == len(FEATURE_COLUMNS)",
           agent.N_FEATURES == len(FEATURE_COLUMNS),
           f"{agent.N_FEATURES} vs {len(FEATURE_COLUMNS)}")

@@ -38,6 +38,12 @@ IDX_TRIP_COUNT = STRUCTURAL_COLUMNS.index("tripCount")             # 11
 
 _FA_ITERS = os.environ.get("LOOPCOUNT_FA_ITERS", "8")
 
+# Type-width histogram bins — MUST match WidthBinNames (and order) in LoopCount.cpp.
+# The type de-aliaser: IR2Vec's 6-class type vocab erases byte width (float==half==
+# bfloat16, i32==i64); this histogram restores it. bf16 is separate from f16 (real
+# data instantiates kernels across __nv_bfloat16 / __half / float). See IR2VEC_LIMITS.md.
+_WIDTH_BINS = ["i1", "i8", "i16", "i32", "i64", "bf16", "f16", "f32", "f64", "ptr", "other"]
+
 # Registry of optional embedding/aux blocks:
 #   name -> (columns, extra -mllvm flags needed to EMIT it, available_in_toolchain?)
 # Each flag string is one "-mllvm <arg>" unit (mirrors how hecbench appends flags).
@@ -51,10 +57,13 @@ BLOCKS = {
     # shared by every loop of that kernel (LoopCount.cpp emits it AFTER emb/femb).
     "kemb": ([f"kemb{i}" for i in range(IR2VEC_DIM)],
              ["-mllvm -loopcount-emit-kernel-emb"], True),
-    # "widths": (...) add when the IR-level type-width histogram lands (size TBD).
+    # IR-level type-width histogram (the type de-aliaser). Variable-width block
+    # (len(_WIDTH_BINS)=11, NOT 75) — emitted AFTER emb/femb/kemb by LoopCount.cpp.
+    "widths": ([f"width_{b}" for b in _WIDTH_BINS],
+               ["-mllvm -loopcount-emit-widths"], True),
 }
 # Canonical concatenation order (structural is prepended separately, always first).
-BLOCK_ORDER = ["emb", "femb", "kemb"]
+BLOCK_ORDER = ["emb", "femb", "kemb", "widths"]
 
 
 def _parse_enabled() -> list:
