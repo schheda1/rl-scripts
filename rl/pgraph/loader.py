@@ -41,6 +41,12 @@ DATA = "DATA"
 CALL = "CALL"
 TYPE_FLOW = "TYPE"
 
+# The module root node: an INSTRUCTION with this sentinel text, created by the
+# ProGraML builder with call edges to every function entry (and default
+# function==0). It is a module-level connector, not part of any function, so
+# slicing/featurization must special-case it.
+EXTERNAL_NODE_TEXT = "[external]"
+
 
 @dataclass
 class Node:

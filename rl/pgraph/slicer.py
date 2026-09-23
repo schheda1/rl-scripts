@@ -24,8 +24,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
 
-from .loader import (Graph, Node, CONSTANT, DATA, INSTRUCTION, TYPE,
-                     TYPE_FLOW, VARIABLE)
+from .loader import (Graph, Node, CONSTANT, DATA, EXTERNAL_NODE_TEXT,
+                     INSTRUCTION, TYPE, TYPE_FLOW, VARIABLE)
 
 
 @dataclass
@@ -118,8 +118,11 @@ def kernel_graph(g: Graph, function_index: int) -> Subgraph:
     """The whole function's subgraph: its instruction+variable nodes (which carry
     the function index) plus the shared const/type nodes they touch (constants and
     types are module-shared and carry no function, so we pull them by adjacency)."""
+    # The root node ("[external]") is an INSTRUCTION with default function==0, so
+    # exclude it explicitly or it would leak into kernel_graph(0).
     included: Set[int] = {n.index for n in g.nodes if n.function == function_index
-                          and n.type in (INSTRUCTION, VARIABLE)}
+                          and n.type in (INSTRUCTION, VARIABLE)
+                          and n.text != EXTERNAL_NODE_TEXT}
     extra: Set[int] = set()
     for i in list(included):
         for nb in g.out_neighbors(i) + g.in_neighbors(i):
@@ -210,6 +213,20 @@ def _selftest() -> None:
     assert kernel_context_indices(g, 0, is_kernel=True, parent_names=[]) == [0]
     assert kernel_context_indices(g, 0, is_kernel=False,
                                   parent_names=["kern", "absent"]) == [0]
+
+    # Root-node handling: node 0 is the module root ("[external]", INSTRUCTION,
+    # default function==0) with a call edge to a real fn-0 instruction.
+    # kernel_graph(0) must EXCLUDE the root, keep the real instruction.
+    gr = load_graph({
+        "node": [
+            {"text": EXTERNAL_NODE_TEXT},                 # 0 root
+            {"text": "ret", "function": 0},               # 1 real fn-0 instr
+        ],
+        "edge": [{"flow": "CALL", "source": 0, "target": 1}],
+        "function": [{"name": "k0"}],
+    })
+    korig = set(kernel_graph(gr, 0).orig_index)
+    assert 0 not in korig and 1 in korig, "root must be excluded, real instr kept: %s" % korig
     print("pgraph.slicer self-test: PASS")
 
 
