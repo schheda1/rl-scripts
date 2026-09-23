@@ -78,6 +78,19 @@ def compute_tokens(g: Graph) -> Dict[int, str]:
     return {i: node_token(g, i) for i in range(len(g.nodes))}
 
 
+def scheme_c_wl_label(tokens: Dict[int, str]):
+    """Build a WL label_fn (for collide.wl_hash / collision_report) that uses the
+    scheme-C token instead of node.text, so the collision floor reflects the ACTUAL
+    scheme-C features (esp. callee-aware calls, which the default label collapses to
+    "call"). `tokens` = compute_tokens(full_graph); a Subgraph's nodes keep their
+    ORIGINAL index, which keys `tokens`. Same shape as collide.default_label
+    (kind|token|boundary) — only the token differs."""
+    def label(node, is_boundary: bool) -> str:
+        tok = tokens.get(node.index, node.text)
+        return "%s|%s|%d" % (node.type, tok, 1 if is_boundary else 0)
+    return label
+
+
 class Vocab:
     """Frozen token vocabulary. id 0 is reserved for <unk> (OOV)."""
     UNK = "<unk>"
@@ -223,6 +236,29 @@ def _selftest() -> None:
         "function": [{"name": "k"}],
     })
     assert node_token(gr, 0) == EXTERNAL_NODE_TEXT, node_token(gr, 0)
+
+    # collide bridge: two isomorphic single-call loops calling DIFFERENT functions.
+    # Default label collapses both to "call" (collision); the scheme-C label uses
+    # the callee token and separates them.
+    from .collide import wl_hash
+    gc = load_graph({
+        "node": [
+            {"text": "call", "function": 0, "features": {"feature": {
+                "loopcount_loops": {"int64_list": {"value": ["0"]}}}}},   # 0 call->A (loop 0)
+            {"text": "call", "function": 0, "features": {"feature": {
+                "loopcount_loops": {"int64_list": {"value": ["1"]}}}}},   # 1 call->B (loop 1)
+            {"text": "; undefined function", "function": 1},              # 2 A entry
+            {"text": "; undefined function", "function": 2},              # 3 B entry
+        ],
+        "edge": [{"flow": "CALL", "source": 0, "target": 2},
+                 {"flow": "CALL", "source": 1, "target": 3}],
+        "function": [{"name": "k"}, {"name": "A"}, {"name": "B"}],
+    })
+    s0, s1 = loop_slice(gc, 0), loop_slice(gc, 1)
+    assert wl_hash(s0) == wl_hash(s1), "default label should collide the two calls"
+    lab = scheme_c_wl_label(compute_tokens(gc))
+    assert wl_hash(s0, label_fn=lab) != wl_hash(s1, label_fn=lab), \
+        "scheme-C label must distinguish callees"
     print("pgraph.vectorize (scheme C) self-test: PASS")
 
 
