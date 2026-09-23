@@ -52,6 +52,11 @@ KIND2ID = {k: i for i, k in enumerate(KINDS)}
 FLOWS = ("CONTROL", "DATA", "CALL", "TYPE")
 FLOW2ID = {f: i for i, f in enumerate(FLOWS)}
 
+# node_features column names per scheme, so a record self-describes its columns
+# (kind_id/token_id are categorical → embedded; the rest are scalars).
+SCHEME_C_COLUMNS = ["kind_id", "token_id", "is_boundary", "in_target_loop", "loop_depth"]
+SCHEME_A_COLUMNS = ["inst2vec_index", "is_boundary", "in_target_loop", "loop_depth"]
+
 
 def node_token(g: Graph, i: int) -> str:
     """The scheme-C token for node i, computed on the FULL graph (so a call's
@@ -138,23 +143,8 @@ def build_vocab(graphs: Iterable[Graph]) -> Vocab:
     return v
 
 
-def vectorize_c(sg: Subgraph, vocab: Vocab, tokens: Dict[int, str]) -> dict:
-    """Scheme-C features for one subgraph. `tokens` is compute_tokens(full_graph);
-    we index it by the slice's original node ids so call tokens survive slicing.
-
-    Returns node_features (n x 5), edge_index (2 x E), edge_attr (E x 2)."""
-    tgt = sg.target_loop
-    node_features: List[List[int]] = []
-    for k in range(sg.num_nodes):
-        node = sg.nodes[k]
-        orig = sg.orig_index[k]
-        kind_id = KIND2ID.get(node.type, 0)
-        token_id = vocab.token_id(tokens[orig])
-        is_boundary = 1 if sg.boundary[k] else 0
-        in_target = 1 if (tgt is not None and tgt in node.loops) else 0
-        loop_depth = len(node.loops)
-        node_features.append([kind_id, token_id, is_boundary, in_target, loop_depth])
-
+def _edge_arrays(sg: Subgraph):
+    """(edge_index [2 x E], edge_attr [E x [flow_id, position]]) — scheme-agnostic."""
     src: List[int] = []
     dst: List[int] = []
     edge_attr: List[List[int]] = []
@@ -162,15 +152,58 @@ def vectorize_c(sg: Subgraph, vocab: Vocab, tokens: Dict[int, str]) -> dict:
         src.append(s)
         dst.append(t)
         edge_attr.append([FLOW2ID.get(flow, 0), pos])
+    return [src, dst], edge_attr
 
+
+def _wrap(sg: Subgraph, node_features: List[List[int]],
+          feature_columns: List[str]) -> dict:
+    edge_index, edge_attr = _edge_arrays(sg)
     return {
         "num_nodes": sg.num_nodes,
-        "node_features": node_features,   # [kind, token, boundary, in_target, depth]
-        "edge_index": [src, dst],          # 2 x E
+        "node_features": node_features,
+        "feature_columns": feature_columns,  # names the node_features columns
+        "edge_index": edge_index,          # 2 x E
         "edge_attr": edge_attr,            # E x [flow, position]
-        "target_loop": tgt,
+        "target_loop": sg.target_loop,
         "function": sg.function,
     }
+
+
+def vectorize_c(sg: Subgraph, vocab: Vocab, tokens: Dict[int, str]) -> dict:
+    """Scheme-C features for one subgraph. `tokens` is compute_tokens(full_graph);
+    indexed by original node ids so call tokens survive slicing.
+    node_features row = [kind_id, token_id, is_boundary, in_target_loop, loop_depth]."""
+    tgt = sg.target_loop
+    node_features: List[List[int]] = []
+    for k in range(sg.num_nodes):
+        node = sg.nodes[k]
+        node_features.append([
+            KIND2ID.get(node.type, 0),
+            vocab.token_id(tokens[sg.orig_index[k]]),
+            1 if sg.boundary[k] else 0,
+            1 if (tgt is not None and tgt in node.loops) else 0,
+            len(node.loops),
+        ])
+    return _wrap(sg, node_features, SCHEME_C_COLUMNS)
+
+
+def vectorize_a(sg: Subgraph, a_map: Dict[int, int]) -> dict:
+    """Scheme-A features for one subgraph. `a_map` is
+    scheme_a.encode_scheme_a(full_graph)["embedding_index"] (node index ->
+    inst2vec embedding index). node_features row =
+    [emb_index, is_boundary, in_target_loop, loop_depth] — same structural scalars
+    as scheme C, but the inst2vec index in place of kind/token."""
+    tgt = sg.target_loop
+    node_features: List[List[int]] = []
+    for k in range(sg.num_nodes):
+        node = sg.nodes[k]
+        node_features.append([
+            a_map.get(node.index, 0),
+            1 if sg.boundary[k] else 0,
+            1 if (tgt is not None and tgt in node.loops) else 0,
+            len(node.loops),
+        ])
+    return _wrap(sg, node_features, SCHEME_A_COLUMNS)
 
 
 # ---------------------------------------------------------------------------
