@@ -17,7 +17,9 @@ width de-aliasing lives, so only instructions are callee-aware):
   INSTRUCTION -> opcode; for a call, "call:<callee>" (callee from the CALL edge on
                  the FULL graph — slices cut it, so tokens are computed pre-slice)
   VARIABLE/CONSTANT -> its generic text ("var"/"val"); its type rides the TYPE node
-  TYPE -> the type token ("i32","float","double","*","struct","[]","vector","ptr")
+  TYPE -> the type token ("i32","float","double","struct","[]","vector"); a POINTER
+          is "*asN" where N is its address space (from full_text), so GPU global
+          (1) / shared (3) / const (4) / local (5) memory stay distinguishable
 
 Edges carry [flow_id, position]. The vocab is FROZEN once over all benchmarks/archs
 (build_vocab + save/load) so feature dims are stable; OOV tokens map to <unk>.
@@ -25,11 +27,24 @@ Edges carry [flow_id, position]. The vocab is FROZEN once over all benchmarks/ar
 from __future__ import annotations
 
 import json
-from typing import Dict, Iterable, List, Optional
+import re
+from typing import Dict, Iterable, List
 
 from .loader import (CALL, CONSTANT, EXTERNAL_NODE_TEXT, Graph, INSTRUCTION,
-                     TYPE, VARIABLE)
+                     TYPE, VARIABLE, node_full_text)
 from .slicer import Subgraph
+
+# Pointer type nodes carry the generic text "*"; the address space (GPU global=1,
+# shared=3, const=4, local=5, ...) lives only in the node's full_text
+# ("ptr addrspace(1)"). We fold it into the token so the model can distinguish
+# memory spaces — critical for UU. (Flags/predicates/vector-lane/array-length are
+# intentionally NOT folded in yet; revisit only if ProGraML underperforms.)
+_ADDRSPACE_RE = re.compile(r"addrspace\((\d+)\)")
+
+
+def _pointer_addrspace(full_text: str) -> int:
+    m = _ADDRSPACE_RE.search(full_text)
+    return int(m.group(1)) if m else 0
 
 # Fixed enumerations (never learned, never OOV).
 KINDS = (INSTRUCTION, VARIABLE, CONSTANT, TYPE)
@@ -44,7 +59,9 @@ def node_token(g: Graph, i: int) -> str:
     captured now)."""
     node = g.nodes[i]
     if node.type != INSTRUCTION:
-        return node.text                      # "var"/"val" or a type token
+        if node.text == "*":                  # pointer type: fold in address space
+            return "*as%d" % _pointer_addrspace(node_full_text(node))
+        return node.text                      # "var"/"val" or a scalar/composite type token
     # Callee-aware ONLY for real call/invoke opcodes. The module root
     # ("[external]") also has outgoing CALL edges (root -> every function entry),
     # so keying off the CALL edge alone would mislabel it as a call.
@@ -208,6 +225,19 @@ def _selftest() -> None:
         "function": [{"name": "k"}],
     })
     assert node_token(gr, 0) == EXTERNAL_NODE_TEXT, node_token(gr, 0)
+
+    # Pointer type nodes: address space folded into the token from full_text.
+    import base64
+
+    def ptype(printed: str) -> dict:  # a pointer TYPE node with a full_text feature
+        b64 = base64.b64encode(printed.encode("utf-8")).decode("ascii")
+        return {"type": "TYPE", "text": "*",
+                "features": {"feature": {"full_text": {"bytes_list": {"value": [b64]}}}}}
+    gp = load_graph({"node": [ptype("ptr"), ptype("ptr addrspace(1)"),
+                              ptype("ptr addrspace(3)")], "edge": [], "function": []})
+    assert node_token(gp, 0) == "*as0", node_token(gp, 0)
+    assert node_token(gp, 1) == "*as1", node_token(gp, 1)
+    assert node_token(gp, 2) == "*as3", node_token(gp, 2)
     print("pgraph.vectorize (scheme C) self-test: PASS")
 
 

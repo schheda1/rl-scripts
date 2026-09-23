@@ -25,6 +25,7 @@ for scheme A.
 """
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Union
@@ -72,6 +73,22 @@ def _int_list_feature(features: dict, key: str) -> List[int]:
     if not f:
         return []
     return [int(v) for v in f.get("int64_list", {}).get("value", [])]
+
+
+def node_full_text(node: "Node") -> str:
+    """Decode a node's full_text feature. It is a bytes feature (base64 in proto3
+    JSON); '' if absent. Instruction full text is the whole statement; a TYPE
+    node's is the printed type (e.g. 'ptr addrspace(1)')."""
+    f = node.features.get("full_text")
+    if not f:
+        return ""
+    vals = f.get("bytes_list", {}).get("value", [])
+    if not vals:
+        return ""
+    try:
+        return base64.b64decode(vals[0]).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
 
 
 class Graph:
