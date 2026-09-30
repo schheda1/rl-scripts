@@ -229,7 +229,7 @@ def exec_worker(rank, gpu_id, q12, q23, result_q, cfg):
             ok, _ = run_hard_timeout(
                 f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
                 f"--output={out} --force-overwrite=true {item['run_cmd']}",
-                cwd=bundle, timeout=cfg["nsys_timeout"], env=env)
+                cwd=bundle, timeout=cfg["nsys_timeout"], env=env, scope_dir=str(bundle))
             if not ok:
                 continue                               # timed out → killed → skip run
             rep = Path(f"{out}.nsys-rep")
@@ -406,6 +406,42 @@ def _selftest() -> int:
         chk("hard_timeout kills promptly", _time.time() - t0 < 5)
         _time.sleep(2.5)                    # past when a SURVIVING grandchild would touch it
         chk("hard_timeout killed the grandchild (whole process group)", not marker.exists())
+    # tree-kill: a child that escapes to its OWN process group (as nsys launches ./main)
+    # would survive killpg — the ppid tree-walk must still reap it.  Linux-only (/proc).
+    if sys.platform.startswith("linux"):
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d) / "regrouped_ran"
+            script = Path(d) / "mk.py"
+            script.write_text(
+                "import os,time\n"
+                "if os.fork()==0:\n"
+                "    os.setpgrp()                 # NEW process group → killpg(parent) misses it\n"
+                "    time.sleep(2)\n"
+                f"    open(r'{marker}','w').close()\n"
+                "    os._exit(0)\n"
+                "time.sleep(30)\n"                # parent lingers so the tree is alive at timeout
+            )
+            ok_tk, _ = run_hard_timeout(f"{sys.executable} {script}", cwd=d, timeout=1,
+                                        env=dict(os.environ))
+            chk("hard_timeout returns False (tree-kill case)", ok_tk is False)
+            _time.sleep(2.5)
+            chk("hard_timeout tree-kill reaps a child in its OWN process group",
+                not marker.exists())
+        # cwd sweep in ISOLATION: a target that escapes BOTH the group and the ppid tree
+        # (setsid → new session + reparented to init) but runs in scope_dir.  killpg and
+        # tree-kill both miss it; only _pids_with_cwd(scope_dir) reaps it.  The outer shell
+        # sleeps so the timeout still fires.
+        with tempfile.TemporaryDirectory() as d:
+            scope = Path(d) / "bundle"
+            scope.mkdir()
+            marker = scope / "escaped_ran"
+            cmd = (f"setsid sh -c 'cd {scope}; sleep 2; touch {marker}' ; sleep 30")
+            ok_cw, _ = run_hard_timeout(cmd, cwd=d, timeout=1, env=dict(os.environ),
+                                        scope_dir=str(scope))
+            chk("hard_timeout returns False (cwd-sweep case)", ok_cw is False)
+            _time.sleep(2.5)
+            chk("hard_timeout cwd-sweep reaps a process reparented out of the tree",
+                not marker.exists())
     # reward math matches collect_cells exactly
     chk("reward speedup", abs(compute_reward(100.0, 80.0, 0.0) - 0.2) < 1e-9)
     chk("reward clip -1", compute_reward(100.0, 500.0, 0.0) == -1.0)

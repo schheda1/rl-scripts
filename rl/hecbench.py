@@ -785,7 +785,7 @@ def measure_kernel_time(
         ok, _out = run_hard_timeout(
             f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
             f"--output={report_path} --force-overwrite=true {run_cmd}",
-            cwd=benchmark_dir, timeout=nsys_timeout, env=env)
+            cwd=benchmark_dir, timeout=nsys_timeout, env=env, scope_dir=str(benchmark_dir))
         if not ok:
             continue
         ok2, stats_out = run_hard_timeout(

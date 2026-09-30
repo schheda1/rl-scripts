@@ -622,7 +622,7 @@ def measure_baselines(
             ok, _out = run_hard_timeout(
                 f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
                 f"--output={report_path} --force-overwrite=true {run_cmd}",
-                cwd=b, timeout=nsys_timeout, env=env_base)
+                cwd=b, timeout=nsys_timeout, env=env_base, scope_dir=str(b))
             if not ok:
                 timed_out += 1
                 continue

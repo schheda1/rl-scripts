@@ -65,22 +65,96 @@ def structural_copy(src: Path, dst: Path, threshold: int) -> None:
             os.symlink(item.resolve(), d)
 
 
+def _proc_children_map() -> dict:
+    """ppid -> [pid] for every process, read from /proc (Linux).  Returns {} where /proc
+    is absent (e.g. macOS) — callers then fall back to killpg alone."""
+    kids: dict = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return kids
+    for e in entries:
+        if not e.isdigit():
+            continue
+        try:
+            with open(f"/proc/{e}/stat") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        # comm (in parens) may contain spaces/parens; per proc(5) the fields AFTER the
+        # last ')' are: state ppid ...  → ppid is the 2nd token there.
+        rp = data.rfind(")")
+        rest = data[rp + 1:].split() if rp >= 0 else []
+        if len(rest) < 2:
+            continue
+        try:
+            kids.setdefault(int(rest[1]), []).append(int(e))
+        except ValueError:
+            continue
+    return kids
+
+
+def _descendants(pid: int, kids: dict) -> list:
+    """All transitive descendants of pid, via the ppid map (BFS)."""
+    out, stack = [], [pid]
+    while stack:
+        p = stack.pop()
+        for c in kids.get(p, []):
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+def _pids_with_cwd(target) -> list:
+    """PIDs whose working directory is `target` (Linux /proc).  Last-resort reaper: kills a
+    run's benchmark by the UNIQUE dir it runs in, independent of process group or parent —
+    catches a target a profiler reparented to init.  target MUST be per-run unique (a cell
+    bundle), else it would match unrelated processes that share a cwd."""
+    try:
+        tgt = os.path.realpath(target)
+    except OSError:
+        return []
+    out = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return out
+    for e in entries:
+        if not e.isdigit():
+            continue
+        try:
+            if os.path.realpath(f"/proc/{e}/cwd") == tgt:
+                out.append(int(e))
+        except OSError:
+            continue
+    return out
+
+
 def run_hard_timeout(cmd: str, cwd, timeout: int, env: dict,
-                     capture: bool = False) -> "tuple[bool, str]":
-    """Run a shell command with a HARD timeout that kills the WHOLE process group.
+                     capture: bool = False, scope_dir=None) -> "tuple[bool, str]":
+    """Run a shell command with a HARD timeout that kills the WHOLE process tree.
 
     Why not subprocess.run(timeout=): with shell=True the direct child is /bin/sh, and
     `nsys profile ./main` runs nsys + the benchmark as its GRANDCHILDREN.  subprocess.run's
     timeout kills only the shell, so on timeout nsys and the benchmark are ORPHANED — they
     keep running on the GPU, pile up across the n_runs loop, and (fatally for the metric)
     execute CONCURRENTLY with the next profiled run on the same GPU, corrupting its kernel
-    timings.  start_new_session=True makes the shell its own process-group/session leader;
-    on timeout we SIGKILL the entire group, so nsys and the benchmark die with it.
+    timings.
 
-    Returns (ok, output): ok=True on a clean exit, False on timeout/kill.  output is the
-    merged stdout+stderr when capture=True, else "".  On timeout nsys is killed before it
-    finalizes the report, so the caller sees no .nsys-rep and skips that run (unchanged
-    semantics)."""
+    Why not killpg alone: nsys launches the benchmark in its OWN process group (observed:
+    with killpg deployed, ./main still orphaned on the GPU whose cell kept timing out).
+    killpg(shell_group) then reaps nsys but leaves ./main running.  So on timeout we kill,
+    in order, three overlapping supersets — all snapshotted BEFORE killing so a
+    reparented/regrouped child is still discoverable:
+      1. killpg(our group)                 — the shell + anything still in its group,
+      2. ppid descendants of our child     — ./main is nsys's child even in nsys's group,
+      3. procs whose cwd == scope_dir      — ./main runs in its bundle even if reparented.
+    scope_dir MUST be per-run unique (a cell bundle); omit it when cwd is shared (e.g. the
+    CPU-side `nsys stats`, whose cwd is the worker dir) or it would over-match.
+
+    Returns (ok, output): ok=True on clean exit, False on timeout/kill.  output is merged
+    stdout+stderr when capture=True, else "".  On timeout nsys is killed before it finalizes
+    the report, so the caller sees no .nsys-rep and skips that run (unchanged semantics)."""
     kw = dict(cwd=str(cwd), shell=True, env=env, start_new_session=True)
     if capture:
         kw.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -91,12 +165,21 @@ def run_hard_timeout(cmd: str, cwd, timeout: int, env: dict,
         out, _ = proc.communicate(timeout=timeout)
         return True, (out or "")
     except subprocess.TimeoutExpired:
+        victims = set(_descendants(proc.pid, _proc_children_map()))   # snapshot tree first
+        if scope_dir:
+            victims.update(_pids_with_cwd(scope_dir))
+        victims.discard(os.getpid())                          # never signal ourselves
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # reap nsys + benchmark too
-        except (ProcessLookupError, PermissionError):
-            pass                                              # already gone
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # group sweep
+        except OSError:
+            pass                                              # already gone / no perms
+        for v in victims:                                     # tree + cwd sweeps
+            try:
+                os.kill(v, signal.SIGKILL)
+            except OSError:
+                pass
         try:
-            proc.communicate(timeout=30)                      # collect the dead group
+            proc.communicate(timeout=30)                      # reap our direct child
         except Exception:
             pass
         return False, ""
