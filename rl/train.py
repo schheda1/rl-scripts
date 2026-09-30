@@ -538,6 +538,7 @@ def measure_baselines(
     exact baseline values.
     """
     from hecbench import compile_baseline, demangle, demangled_to_filter, measure_kernel_time, _parse_nsys_kernel_times, _sum_kernel_times, _get_run_command
+    from store_common import run_hard_timeout
     import tempfile as _tempfile
 
     cache: dict[str, dict] = {}
@@ -609,27 +610,29 @@ def measure_baselines(
         # would otherwise abort the entire baseline pass (and the job) —
         # skip the run, and skip the benchmark if no run succeeds.  Workers
         # already skip benchmarks that have no baseline cache entry.
-        _subprocess = __import__("subprocess")
         run_cmd = _get_run_command(b, arch)
         report_path = _tempfile.mktemp(prefix="nsys_bl_", dir=str(tmp_dir))
         run_times_raw: list[dict] = []
         timed_out = 0
         for _ in range(n_runs):
-            try:
-                _subprocess.run(
-                    f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
-                    f"--output={report_path} --force-overwrite=true {run_cmd}",
-                    cwd=b, shell=True, capture_output=True, text=True,
-                    timeout=nsys_timeout, env=env_base,
-                )
-                stats = _subprocess.run(
-                    f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
-                    shell=True, capture_output=True, text=True, timeout=30, env=env_base,
-                )
-            except _subprocess.TimeoutExpired:
+            # HARD timeout that kills the whole process group (nsys + benchmark). A plain
+            # subprocess.run(timeout=) kills only /bin/sh, orphaning the benchmark on the
+            # GPU where it would contend with the next run and corrupt the baseline — the
+            # denominator of every reward for this benchmark.
+            ok, _out = run_hard_timeout(
+                f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
+                f"--output={report_path} --force-overwrite=true {run_cmd}",
+                cwd=b, timeout=nsys_timeout, env=env_base)
+            if not ok:
                 timed_out += 1
                 continue
-            kt = _parse_nsys_kernel_times(stats.stdout + stats.stderr)
+            ok2, stats_out = run_hard_timeout(
+                f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
+                cwd=".", timeout=30, env=env_base, capture=True)
+            if not ok2:
+                timed_out += 1
+                continue
+            kt = _parse_nsys_kernel_times(stats_out)
             if kt:
                 run_times_raw.append(kt)
 

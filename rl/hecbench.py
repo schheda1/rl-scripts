@@ -17,6 +17,8 @@ from typing import Optional
 
 import torch
 
+from store_common import run_hard_timeout   # process-group-killing timeout (no nsys orphans)
+
 # Default per-user temp directory for all pipeline artifacts (nsys reports, etc.)
 DEFAULT_TMP_DIR: Path = Path(f"/tmp/rl_pipeline_{getpass.getuser()}")
 
@@ -27,7 +29,12 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 def detect_arch() -> str:
-    """Return sm_XX string for the first GPU found via nvidia-smi."""
+    """Return the GPU arch string for the first visible GPU.
+
+    NVIDIA -> 'sm_XX' (nvidia-smi compute_cap).
+    AMD    -> 'gfxXXXX' (rocminfo Name line), tried only if nvidia-smi is absent.
+    Override either by exporting TARGET_ARCH (e.g. TARGET_ARCH=gfx90a).
+    """
     try:
         cap = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
@@ -35,11 +42,31 @@ def detect_arch() -> str:
         ).strip().splitlines()[0]
         major, minor = cap.split(".")
         return f"sm_{major}{minor}"
-    except Exception as e:
-        raise RuntimeError(f"Could not detect GPU arch via nvidia-smi: {e}")
+    except Exception:
+        pass
+    try:
+        # rocminfo prints a 'Name: gfxXXXX' line per GPU agent; take the first.
+        out = subprocess.check_output(["rocminfo"], text=True)
+        for line in out.splitlines():
+            m = re.search(r"\bName:\s*(gfx[0-9a-fA-F]+)", line)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    raise RuntimeError(
+        "Could not detect GPU arch (no nvidia-smi sm_XX, no rocminfo gfxXXXX). "
+        "Set TARGET_ARCH explicitly, e.g. TARGET_ARCH=gfx90a."
+    )
 
 
 ARCH: str = os.environ.get("TARGET_ARCH") or detect_arch()
+
+# Target GPU family, derived once from ARCH so the compile driver (CUDA vs HIP),
+# the benchmark directory suffix, and the device-triple filter can never disagree.
+# AMD arches are 'gfxXXXX'; NVIDIA are 'sm_XX'.
+IS_HIP: bool = ARCH.startswith("gfx")
+GPU_SUFFIX: str = "-hip" if IS_HIP else "-cuda"
+ROCM_PATH: str = os.environ.get("ROCM_PATH", "/opt/rocm")
 
 # Path to the IR2Vec vocabulary JSON (seedEmbeddingVocab75D.json).  Required for
 # every --enable-loopcount compile — without it the LLVM pass cannot produce
@@ -110,11 +137,11 @@ def discover_benchmarks(hecbench_src: Path = HECBENCH_SRC) -> list[Path]:
         _log.error("discover_benchmarks: path does not exist: %s", hecbench_src.resolve())
         return []
 
-    candidates = sorted(hecbench_src.glob("*-cuda"))
+    candidates = sorted(hecbench_src.glob(f"*{GPU_SUFFIX}"))
     if not candidates:
         _log.error(
-            "discover_benchmarks: no *-cuda directories found under %s",
-            hecbench_src.resolve(),
+            "discover_benchmarks: no *%s directories found under %s",
+            GPU_SUFFIX, hecbench_src.resolve(),
         )
         return []
 
@@ -220,15 +247,28 @@ def make_clean(benchmark_dir: Path, arch: str = ARCH) -> None:
 
 def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300) -> subprocess.CompletedProcess:
     env = {**os.environ, "ARCH": arch}
-    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-    # Override compiler and flags to use clang++ instead of nvcc.
-    # New HecBench Makefiles default to nvcc with nvcc-specific flags;
-    # we replicate the og-HeCBench clang++ pattern here.
-    cflags = (
-        f"-I{cuda_home}/include {extra_cflags} "
-        f"-std=c++17 -Wall -O3 --cuda-gpu-arch={arch}"
-    )
-    ldflags = f"-L{cuda_home}/lib64 -lcudart -lcuda"
+    # Override the benchmark Makefile's compiler/flags to drive our custom clang++
+    # (the one built with the LoopCount pass), replicating the og-HeCBench pattern.
+    if IS_HIP:
+        # HIP/AMDGPU: force clang++ to treat the sources (HeCBench keeps them as
+        # .cu) as HIP and emit device code for the AMDGPU offload arch.  ROCM_PATH
+        # and arch are env-tunable so the exact flag set can be adjusted per ROCm
+        # version without a code change.
+        cflags = (
+            f"-x hip --offload-arch={arch} --rocm-path={ROCM_PATH} "
+            f"-D__HIP_PLATFORM_AMD__ -I{ROCM_PATH}/include {extra_cflags} "
+            f"-std=c++17 -Wall -O3"
+        )
+        ldflags = f"--rocm-path={ROCM_PATH} -L{ROCM_PATH}/lib -lamdhip64"
+    else:
+        # CUDA/NVPTX: New HecBench Makefiles default to nvcc with nvcc-specific
+        # flags; replicate the og-HeCBench clang++ pattern here.
+        cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+        cflags = (
+            f"-I{cuda_home}/include {extra_cflags} "
+            f"-std=c++17 -Wall -O3 --cuda-gpu-arch={arch}"
+        )
+        ldflags = f"-L{cuda_home}/lib64 -lcudart -lcuda"
     subprocess.run(["make", "clean"], cwd=benchmark_dir, capture_output=True, env=env)
     return subprocess.run(
         f'make CC=clang++ CFLAGS="{cflags}" LDFLAGS="{ldflags}"',
@@ -454,7 +494,8 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
     # NOTE: this triple may be the x86 host triple (see docstring).  The device
     # loop filter below is the authoritative guard, not the triple.
     triple = next(
-        (t for t in parsed if "nvptx" in t or "cuda" in t.lower()),
+        (t for t in parsed
+         if "nvptx" in t or "amdgcn" in t or "cuda" in t.lower()),
         next(iter(parsed)),
     )
     file_map = parsed[triple]
@@ -732,41 +773,27 @@ def measure_kernel_time(
 
     times: list[float] = []
     for _ in range(n_runs):
-        # A per-run TimeoutExpired is treated as a failed run rather than
-        # propagated: call sites guard this function with `except RuntimeError`
-        # (worker: modified_ms = baseline_ms fallback), so an uncaught
-        # TimeoutExpired here would kill the whole worker process and silently
-        # drop every remaining loop assigned to it.  If all runs time out,
-        # the empty `times` list raises RuntimeError below — the contract the
-        # callers already handle.
-        try:
-            # Step 1: profile.  Minimal tracing — we only ever read the
-            # cuda_gpu_kern_sum report, so CPU sampling / context-switch
-            # tracing is pure overhead.
-            subprocess.run(
-                f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
-                f"--output={report_path} --force-overwrite=true {run_cmd}",
-                cwd=benchmark_dir,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=nsys_timeout,
-                env=env,
-            )
-
-            # Step 2: extract kernel stats as CSV
-            stats_result = subprocess.run(
-                f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
+        # A per-run timeout is treated as a failed run rather than propagated: call
+        # sites guard this function with `except RuntimeError` (worker: modified_ms =
+        # baseline_ms fallback).  If all runs time out, the empty `times` list raises
+        # RuntimeError below — the contract the callers already handle.
+        #
+        # HARD timeout (process-group kill): a plain subprocess.run(timeout=) with
+        # shell=True kills only /bin/sh, orphaning nsys + the benchmark on the GPU where
+        # they contend with the next run and corrupt its kernel time.  run_hard_timeout
+        # SIGKILLs the whole group.  ok=False (profile or stats) → failed run → continue.
+        ok, _out = run_hard_timeout(
+            f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
+            f"--output={report_path} --force-overwrite=true {run_cmd}",
+            cwd=benchmark_dir, timeout=nsys_timeout, env=env)
+        if not ok:
             continue
-        combined = stats_result.stdout + stats_result.stderr
-        kernel_times = _parse_nsys_kernel_times(combined)
+        ok2, stats_out = run_hard_timeout(
+            f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
+            cwd=".", timeout=30, env=env, capture=True)
+        if not ok2:
+            continue
+        kernel_times = _parse_nsys_kernel_times(stats_out)
         t = _sum_kernel_times(kernel_times, kernel_filter)
         if t is not None:
             times.append(t)

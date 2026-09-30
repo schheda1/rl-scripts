@@ -72,7 +72,7 @@ log = logging.getLogger("pipeline")
 # shm/tmp accounting, and the pre-compiled-store fast path.
 from store_common import (cellkey, structural_copy, dir_bytes, stage_from_store,
                           is_cell_done, load_manifest, toolchain_stamp,
-                          benchmark_fingerprint)
+                          benchmark_fingerprint, run_hard_timeout)
 
 _STOP = None                       # queue sentinel (picklable, and no work item is None)
 
@@ -223,14 +223,15 @@ def exec_worker(rank, gpu_id, q12, q23, result_q, cfg):
         reports = []
         for k in range(cfg["n_runs"]):
             out = rep_dir / f"run{k}"
-            try:
-                subprocess.run(
-                    f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
-                    f"--output={out} --force-overwrite=true {item['run_cmd']}",
-                    cwd=bundle, shell=True, capture_output=True, text=True,
-                    timeout=cfg["nsys_timeout"], env=env)
-            except subprocess.TimeoutExpired:
-                continue                               # failed run → skipped (as today)
+            # HARD timeout that kills nsys + the benchmark (process group), so a slow
+            # run never orphans a ./main that would then contend with the next run on
+            # this GPU and corrupt its timing.  ok=False → no report → run skipped.
+            ok, _ = run_hard_timeout(
+                f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
+                f"--output={out} --force-overwrite=true {item['run_cmd']}",
+                cwd=bundle, timeout=cfg["nsys_timeout"], env=env)
+            if not ok:
+                continue                               # timed out → killed → skip run
             rep = Path(f"{out}.nsys-rep")
             if rep.exists():
                 reports.append(str(rep))
@@ -253,13 +254,13 @@ def parse_worker(rank, q23, result_q, cfg):
         key, kf = item["key"], item["kernel_filter"]
         times = []
         for rep in item["reports"]:
-            try:
-                r = subprocess.run(
-                    f"nsys stats --report=cuda_gpu_kern_sum --format=csv {rep}",
-                    shell=True, capture_output=True, text=True, timeout=30, env=env)
-            except subprocess.TimeoutExpired:
+            # same process-group-kill guard: a hung `nsys stats` would otherwise orphan.
+            ok, out = run_hard_timeout(
+                f"nsys stats --report=cuda_gpu_kern_sum --format=csv {rep}",
+                cwd=".", timeout=30, env=env, capture=True)
+            if not ok:
                 continue
-            t = _sum_kernel_times(_parse_nsys_kernel_times(r.stdout + r.stderr), kf)
+            t = _sum_kernel_times(_parse_nsys_kernel_times(out), kf)
             if t is not None:
                 times.append(t)
         shutil.rmtree(item["report_dir"], ignore_errors=True)   # free tmp (last reader)
@@ -390,6 +391,21 @@ def _selftest() -> int:
     chk("limit n>=len returns same list", _limit_by_benchmark(_items, 99) is _items)
     chk("limit 0 returns same list", _limit_by_benchmark(_items, 0) is _items)
     chk("limit never exceeds n", len(_limit_by_benchmark(_items, 5)) == 5)
+    # run_hard_timeout: clean exit is True; on timeout the GRANDCHILD is killed too (the
+    # orphaned-nsys bug).  A surviving grandchild would touch `marker` after 2s; timeout
+    # fires at 1s and killpg must reap the whole group so the marker never appears.
+    import time as _time
+    chk("hard_timeout clean exit", run_hard_timeout("exit 0", cwd=".", timeout=10,
+                                                    env=dict(os.environ))[0] is True)
+    with tempfile.TemporaryDirectory() as d:
+        marker = Path(d) / "grandchild_ran"
+        t0 = _time.time()
+        ok_to, _ = run_hard_timeout(f"sh -c 'sleep 2; touch {marker}'",
+                                    cwd=d, timeout=1, env=dict(os.environ))
+        chk("hard_timeout returns False on timeout", ok_to is False)
+        chk("hard_timeout kills promptly", _time.time() - t0 < 5)
+        _time.sleep(2.5)                    # past when a SURVIVING grandchild would touch it
+        chk("hard_timeout killed the grandchild (whole process group)", not marker.exists())
     # reward math matches collect_cells exactly
     chk("reward speedup", abs(compute_reward(100.0, 80.0, 0.0) - 0.2) < 1e-9)
     chk("reward clip -1", compute_reward(100.0, 500.0, 0.0) == -1.0)

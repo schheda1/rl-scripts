@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 
@@ -62,6 +63,43 @@ def structural_copy(src: Path, dst: Path, threshold: int) -> None:
             shutil.copy2(item, d)
         else:
             os.symlink(item.resolve(), d)
+
+
+def run_hard_timeout(cmd: str, cwd, timeout: int, env: dict,
+                     capture: bool = False) -> "tuple[bool, str]":
+    """Run a shell command with a HARD timeout that kills the WHOLE process group.
+
+    Why not subprocess.run(timeout=): with shell=True the direct child is /bin/sh, and
+    `nsys profile ./main` runs nsys + the benchmark as its GRANDCHILDREN.  subprocess.run's
+    timeout kills only the shell, so on timeout nsys and the benchmark are ORPHANED — they
+    keep running on the GPU, pile up across the n_runs loop, and (fatally for the metric)
+    execute CONCURRENTLY with the next profiled run on the same GPU, corrupting its kernel
+    timings.  start_new_session=True makes the shell its own process-group/session leader;
+    on timeout we SIGKILL the entire group, so nsys and the benchmark die with it.
+
+    Returns (ok, output): ok=True on a clean exit, False on timeout/kill.  output is the
+    merged stdout+stderr when capture=True, else "".  On timeout nsys is killed before it
+    finalizes the report, so the caller sees no .nsys-rep and skips that run (unchanged
+    semantics)."""
+    kw = dict(cwd=str(cwd), shell=True, env=env, start_new_session=True)
+    if capture:
+        kw.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    else:
+        kw.update(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, **kw)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        return True, (out or "")
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # reap nsys + benchmark too
+        except (ProcessLookupError, PermissionError):
+            pass                                              # already gone
+        try:
+            proc.communicate(timeout=30)                      # collect the dead group
+        except Exception:
+            pass
+        return False, ""
 
 
 def dir_bytes(root: Path) -> int:
