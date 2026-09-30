@@ -89,6 +89,36 @@ def compute_reward(baseline_ms: float, modified_ms: float, deadzone: float) -> f
     return reward
 
 
+def _limit_by_benchmark(items: list, n: int) -> list:
+    """Take at most n items, ROUND-ROBIN across benchmarks, so a small --limit
+    validation sample spreads over many benchmarks (exercises many distinct
+    compile/run paths) instead of draining one benchmark's cells.  Deterministic:
+    preserves first-seen benchmark order and each benchmark's internal order.
+    Returns the SAME list object (identity) when n<=0 or n>=len — callers rely on
+    this to mean 'no limit'."""
+    if n <= 0 or n >= len(items):
+        return items
+    from collections import OrderedDict
+    groups: "OrderedDict[str, list]" = OrderedDict()
+    for it in items:
+        groups.setdefault(it["benchmark_name"], []).append(it)
+    lists = list(groups.values())
+    out: list = []
+    idx = 0
+    while len(out) < n:
+        progressed = False
+        for lst in lists:
+            if idx < len(lst):
+                out.append(lst[idx])
+                progressed = True
+                if len(out) >= n:
+                    break
+        if not progressed:                 # every benchmark exhausted
+            break
+        idx += 1
+    return out
+
+
 def _sys_mem_gb() -> tuple:
     """(available_gb, total_gb) from /proc/meminfo; (0,0) if unavailable."""
     try:
@@ -351,6 +381,15 @@ def _selftest() -> int:
         print(f"  {'PASS' if cond else 'FAIL'}  {name}")
 
     chk("cellkey", cellkey("b", 3, 1, 4) == "b|3|1|4")
+    # --limit round-robins across benchmarks and is identity-safe at the no-cap edges
+    _items = [{"benchmark_name": b} for b in ["a", "a", "a", "b", "b", "c"]]
+    chk("limit spreads across benchmarks",
+        [x["benchmark_name"] for x in _limit_by_benchmark(_items, 3)] == ["a", "b", "c"])
+    chk("limit 4 round-robin wraps",
+        [x["benchmark_name"] for x in _limit_by_benchmark(_items, 4)] == ["a", "b", "c", "a"])
+    chk("limit n>=len returns same list", _limit_by_benchmark(_items, 99) is _items)
+    chk("limit 0 returns same list", _limit_by_benchmark(_items, 0) is _items)
+    chk("limit never exceeds n", len(_limit_by_benchmark(_items, 5)) == 5)
     # reward math matches collect_cells exactly
     chk("reward speedup", abs(compute_reward(100.0, 80.0, 0.0) - 0.2) < 1e-9)
     chk("reward clip -1", compute_reward(100.0, 500.0, 0.0) == -1.0)
@@ -453,6 +492,15 @@ def parse_args():
     p.add_argument("--save-every", type=int, default=100)
     p.add_argument("--no-post-features", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--read-only", action="store_true",
+                   help="VALIDATION: run the real compile->nsys->parse pipeline but NEVER "
+                        "write reward_cache.json or baseline_cache.json (baselines are not "
+                        "measured either — cells whose benchmark has no baseline are skipped). "
+                        "All scratch + the memlog go OUTSIDE the checkpoint dir. Pair with "
+                        "--limit for a quick end-to-end check.")
+    p.add_argument("--limit", type=int, default=0,
+                   help="cap the run to N cells (round-robin across benchmarks) — for a fast "
+                        "validation sample; 0 = no cap")
     p.add_argument("--selftest", action="store_true")
     # must match the training run / existing cache
     p.add_argument("--val-ratio", type=float, default=0.15)
@@ -487,13 +535,15 @@ def main() -> int:
         sys.exit(f"IR2VEC_VOCAB unset/missing ({IR2VEC_VOCAB!r}) but post-features on; "
                  f"set it or pass --no-post-features")
 
+    ro = args.read_only
     ckpt = args.checkpoint_dir
     elig = ckpt / "eligible_benchmarks.json"
     if not elig.exists():
         sys.exit(f"missing {elig}")
     # Per-checkpoint scratch so two jobs on one node (different run dirs) can't clobber
-    # each other's shm bundles when either does its startup wipe.
-    shm_root = Path(args.shm_root) / ckpt.name
+    # each other's shm bundles when either does its startup wipe.  Read-only validation
+    # gets its OWN "__val" namespace so it can never wipe a real run's live shm bundles.
+    shm_root = Path(args.shm_root) / (ckpt.name + ("__val" if ro else ""))
     src = Path(args.hecbench_src) if args.hecbench_src else HECBENCH_SRC
 
     all_b, _lc, loop_records_map, normalizer = precheck_benchmarks(
@@ -542,8 +592,26 @@ def main() -> int:
     todo_benches = {a["benchmark_name"] for a in assignments
                     if f"{a['benchmark_name']}|{a['loop_idx']}" in todo}
     need_bl = [b for b in benches if b.name in todo_benches and b.name not in baseline_cache]
+    # READ-ONLY: never measure baselines (that path WRITES baseline_cache.json). Cells whose
+    # benchmark has no baseline are dropped below (base_ms<=0) rather than measured.
+    if ro and need_bl:
+        log.warning("READ-ONLY: %d benchmark(s) have no baseline — their cells are SKIPPED "
+                    "(baselines are never measured or written in read-only mode)", len(need_bl))
+    if ro:
+        need_bl = []
 
-    tmp_root = Path(args.tmp_root) if args.tmp_root else ckpt / "pipe_tmp"
+    # In read-only mode keep ALL writes out of the checkpoint dir: scratch (reports/nsys temp)
+    # goes to a system-temp validation dir unless the user points --tmp-root at fast local disk.
+    if args.tmp_root:
+        tmp_root = Path(args.tmp_root)
+    elif ro:
+        import tempfile as _tf
+        tmp_root = Path(_tf.gettempdir()) / f"uu_pipe_val__{ckpt.name}"
+    else:
+        tmp_root = ckpt / "pipe_tmp"
+    if ro:
+        log.warning("=== READ-ONLY VALIDATION ===  reward_cache.json / baseline_cache.json "
+                    "will NOT be written.  scratch=%s  shm=%s", tmp_root, shm_root)
 
     # --- build the per-cell work list + per-loop postfeat list ---
     # Scope (kernel_filter, baseline_ms) is attached LATER, after baselines are measured.
@@ -606,6 +674,15 @@ def main() -> int:
     if dropped:
         log.warning("%d cells skipped — benchmark has no baseline (measure it, re-run)", dropped)
     n_missing = len(work_items)          # completion target: one terminal result per item
+
+    # --- optional --limit: validate a small, benchmark-spread sample (compile/run/parse) ---
+    if args.limit and args.limit > 0:
+        work_items = _limit_by_benchmark(work_items, args.limit)
+        post_items = _limit_by_benchmark(post_items, args.limit)
+        n_missing = len(work_items)
+        log.info("--limit %d → %d cells across %d benchmarks + %d postfeat loops",
+                 args.limit, len(work_items),
+                 len({w["benchmark_name"] for w in work_items}), len(post_items))
 
     # --- pre-compiled store (optional): verify fail-safe, then mark stage-able cells ---
     prebuilt, store = set(), None
@@ -684,7 +761,8 @@ def main() -> int:
 
     counters = {"cells_done": 0, "n_missing": n_missing}
     stop_mem = threading.Event()
-    memlog = ckpt / "pipeline_memlog.jsonl"
+    # read-only keeps the memlog out of the checkpoint dir too (scratch, not a result).
+    memlog = (tmp_root if ro else ckpt) / "pipeline_memlog.jsonl"
     mem_t = threading.Thread(target=mem_monitor,
                              args=(stop_mem, memlog,
                                    {"work": work_q, "q12": q12, "q23": q23,
@@ -700,6 +778,8 @@ def main() -> int:
     GET_TIMEOUT = 120          # periodic liveness check when idle; benign if a cell > this
 
     def _persist():
+        if ro:
+            return                         # read-only: NEVER write reward_cache.json
         save_cache(rc_file, rewards, postf, norm_sig, failure_keys,
                    args.compile_failure_penalty, args.reward_deadzone)
 
