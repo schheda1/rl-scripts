@@ -230,6 +230,20 @@ def main() -> int:
 
     explicit = ([s.strip() for s in args.benchmarks.split(",") if s.strip()]
                 if args.benchmarks else None)
+    # Explicit --benchmarks: fail LOUD on names that aren't in the missing set for THIS
+    # split, naming the valid ones.  Silently selecting 0 (→ empty store, exit 0) hides a
+    # typo or a wrong --split and lets a downstream job accept an empty store as valid.
+    avail = ", ".join(f"{b}({len(by_bench[b])})"
+                      for b in sorted(by_bench, key=lambda x: -len(by_bench[x]))) or "(none)"
+    if explicit is not None:
+        unknown = [b for b in explicit if b not in by_bench]
+        if unknown:
+            log.warning("--benchmarks: %d name(s) not in the missing set for split '%s' "
+                        "(ignored): %s", len(unknown), args.split, ", ".join(unknown))
+        if not any(b in by_bench for b in explicit):
+            log.error("--benchmarks matched NONE of the benchmarks with missing cells in "
+                      "split '%s'.  Pick from (name(missing_cells)): %s", args.split, avail)
+            return 2
     selected = _select_benchmarks(by_bench, args.frac, args.max_frac, explicit)
     total = sum(len(v) for v in by_bench.values())
     sel_cells = sum(len(by_bench[b]) for b in selected)
@@ -237,7 +251,10 @@ def main() -> int:
              total, len(by_bench), len(selected), sel_cells,
              100 * sel_cells / max(total, 1))
     if not selected:
-        log.info("nothing to pre-compile (frac too small or no missing cells).")
+        log.info("nothing to pre-compile: %s", "frac %g too small for %d missing cells "
+                 "(need frac*total >= 1)" % (args.frac, total) if total else "no missing cells")
+        if total:
+            log.info("missing-cell benchmarks for split '%s': %s", args.split, avail)
         # still write an (empty) stamped manifest so the consumer can verify stamps
         write_manifest(str(args.store), toolchain_stamp(args.arch), {}, [])
         return 0
