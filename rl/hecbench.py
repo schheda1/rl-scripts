@@ -66,7 +66,13 @@ ARCH: str = os.environ.get("TARGET_ARCH") or detect_arch()
 # AMD arches are 'gfxXXXX'; NVIDIA are 'sm_XX'.
 IS_HIP: bool = ARCH.startswith("gfx")
 GPU_SUFFIX: str = "-hip" if IS_HIP else "-cuda"
+# ROCm install root.  A custom-built clang has NO default ROCm location, so this
+# MUST point at a real install containing amdgcn/bitcode/*.bc.  On HPC nodes the
+# bitcode often is not under <root>/amdgcn/bitcode — set ROCM_DEVICE_LIB to the
+# directory that actually holds the .bc files and it is passed via
+# --rocm-device-lib-path (overrides the derived default).
 ROCM_PATH: str = os.environ.get("ROCM_PATH", "/opt/rocm")
+ROCM_DEVICE_LIB: str = os.environ.get("ROCM_DEVICE_LIB", "")
 
 # Path to the IR2Vec vocabulary JSON (seedEmbeddingVocab75D.json).  Required for
 # every --enable-loopcount compile — without it the LLVM pass cannot produce
@@ -254,12 +260,15 @@ def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300)
         # .cu) as HIP and emit device code for the AMDGPU offload arch.  ROCM_PATH
         # and arch are env-tunable so the exact flag set can be adjusted per ROCm
         # version without a code change.
+        # --rocm-device-lib-path is added when ROCM_DEVICE_LIB is set, for HPC
+        # layouts where the device bitcode is not under <ROCM_PATH>/amdgcn/bitcode.
+        dl = f" --rocm-device-lib-path={ROCM_DEVICE_LIB}" if ROCM_DEVICE_LIB else ""
         cflags = (
-            f"-x hip --offload-arch={arch} --rocm-path={ROCM_PATH} "
+            f"-x hip --offload-arch={arch} --rocm-path={ROCM_PATH}{dl} "
             f"-D__HIP_PLATFORM_AMD__ -I{ROCM_PATH}/include {extra_cflags} "
             f"-std=c++17 -Wall -O3"
         )
-        ldflags = f"--rocm-path={ROCM_PATH} -L{ROCM_PATH}/lib -lamdhip64"
+        ldflags = f"--rocm-path={ROCM_PATH}{dl} -L{ROCM_PATH}/lib -lamdhip64"
     else:
         # CUDA/NVPTX: New HecBench Makefiles default to nvcc with nvcc-specific
         # flags; replicate the og-HeCBench clang++ pattern here.

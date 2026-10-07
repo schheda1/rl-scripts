@@ -43,7 +43,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hecbench import (                                               # noqa: E402
-    ARCH, IS_HIP, HECBENCH_SRC, discover_benchmarks, get_loop_features,
+    ARCH, IS_HIP, HECBENCH_SRC, ROCM_PATH, ROCM_DEVICE_LIB,
+    discover_benchmarks, get_loop_features,
     compile_loopcount, parse_loopcount_output, _build_extra_cflags, _make,
 )
 
@@ -257,6 +258,8 @@ def main() -> None:
     args = p.parse_args()
 
     print(f"ARCH={ARCH}  IS_HIP={IS_HIP}  HECBENCH_SRC={HECBENCH_SRC}")
+    if IS_HIP:
+        print(f"ROCM_PATH={ROCM_PATH}  ROCM_DEVICE_LIB={ROCM_DEVICE_LIB or '(unset)'}")
     if not IS_HIP:
         print(f"{_WARN}  IS_HIP False — NVIDIA path. Set TARGET_ARCH=gfx90a for AMD (running as sanity check).")
 
