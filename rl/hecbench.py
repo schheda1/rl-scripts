@@ -577,6 +577,17 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
         # eligible — unmerge is a no-op on single-path loops, and very high path
         # counts explode under specialisation.  numPaths already parsed as float.
         _np = df["numPaths"].astype(float)
+        # AMD device-library / runtime internals (OCKL/OCML/OCLC + libc assert)
+        # get linked whole into the amdgcn module early, before DCE.  When a
+        # kernel calls one (device malloc -> __ockl_dm_alloc, printf ->
+        # __ockl_fprintf_*, assert -> __assert_fail, a soft-float math impl ->
+        # __ocml_*), the call-graph walk gives THEIR internal loops kernelParents,
+        # so they pass the (is_kernel | has_parents) guard and leak into the
+        # eligible set.  They are GPU-runtime code, not the benchmark's, and have
+        # no NVIDIA analog (nvptx libdevice is loopless math) — never optimize
+        # them.  No-op on NVIDIA: no such symbols exist there.
+        _not_devlib = ~df["function"].astype(str).str.match(
+            r"^(__ockl|__ocml|__oclc|__assert_fail)")
         mask = (
             (df["duplicatable"] == 1.0)
             & (df["containsBarrier"] == 0.0)
@@ -584,6 +595,7 @@ def get_loop_features(benchmark_dir: Path, arch: str = ARCH) -> tuple[dict, str,
             & df["function"].notna()
             & (df["function"] != "")
             & (is_kernel | has_parents)
+            & _not_devlib
             & (_np > STUDY_A_NUMPATHS_MIN)
             & (_np <= STUDY_A_NUMPATHS_MAX)
         )
