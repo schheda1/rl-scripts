@@ -65,6 +65,10 @@ from features import FEATURES_VERSION, assert_matches            # noqa: E402
 # actual bounds so a changed STUDY_A_NUMPATHS_MAX env var invalidates the cache.
 ELIGIBILITY_VERSION = (
     f"studyA:numPaths>{STUDY_A_NUMPATHS_MIN},<={STUDY_A_NUMPATHS_MAX}"
+    # +devlib-excl: drop AMD OCKL/OCML/OCLC/__assert_fail runtime loops that leak
+    # via kernelParents on amdgcn (no-op on NVIDIA).  Bumps the signature so any
+    # eligible_benchmarks.json built before the fix is treated as stale.
+    ";devlib-excl"
 )
 
 # Placeholder factor log-prob for no-op (unmerge==0) rollout entries — never
