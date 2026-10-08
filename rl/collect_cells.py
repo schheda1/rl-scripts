@@ -202,8 +202,11 @@ def _collect_worker(rank: int, gpu_id: int, assignments: list[dict],
                         datefmt="%H:%M:%S")
 
     try:
-        # MIRROR: train._worker_fn — CUDA_VISIBLE_DEVICES before any CUDA call.
+        # MIRROR: train._worker_fn — pin the GPU before any CUDA/HIP call.  A HIP
+        # binary ignores CUDA_VISIBLE_DEVICES, so HIP_VISIBLE_DEVICES must be set
+        # too or every AMD worker lands on GCD 0 and the two GCDs contend.
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_id)
 
         normalizer = FeatureNormalizer.from_state_dict(hp["normalizer_state"])
         baseline_cache: dict = hp["baseline_cache"]

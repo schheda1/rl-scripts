@@ -523,12 +523,12 @@ def measure_baselines(
         }
 
     per_kernel_ms is built by collecting all unique kernelParents values from
-    the benchmark's loop records, demangling each, and filtering the nsys output
-    to isolate that kernel's time.  Cases A and B1 (single kernel parent) use
-    per_kernel_ms; Case B2 (multiple parents) falls back to total_ms.
+    the benchmark's loop records, demangling each, and filtering the profiler
+    output to isolate that kernel's time.  Cases A and B1 (single kernel parent)
+    use per_kernel_ms; Case B2 (multiple parents) falls back to total_ms.
 
-    A benchmark is skipped if compilation or nsys measurement fails; workers
-    fall back to on-demand measurement via GpuLoopEnv.reset() on a cache miss.
+    A benchmark is skipped if compilation or measurement fails; workers fall
+    back to on-demand measurement via GpuLoopEnv.reset() on a cache miss.
 
     If *cache_file* is given, previously measured baselines are loaded from it
     (skipping re-measurement — ~3h for the full HeCBench set) and the merged
@@ -537,8 +537,9 @@ def measure_baselines(
     reward cache consistent: cached rewards were computed against these
     exact baseline values.
     """
-    from hecbench import compile_baseline, demangle, demangled_to_filter, measure_kernel_time, _parse_nsys_kernel_times, _sum_kernel_times, _get_run_command
-    from store_common import run_hard_timeout
+    from hecbench import (compile_baseline, demangle, demangled_to_filter,
+                          _profile_kernel_times_once, _sum_kernel_times,
+                          _get_run_command)
     import tempfile as _tempfile
 
     cache: dict[str, dict] = {}
@@ -591,7 +592,10 @@ def measure_baselines(
     log.info("Measuring baselines for %d benchmarks (once per run)...", len(benchmarks))
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    env_base = {**__import__("os").environ, "ARCH": arch, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
+    # Pin BOTH runtimes: a HIP binary ignores CUDA_VISIBLE_DEVICES, so the HIP
+    # var is required or every AMD worker lands on GCD 0 and the GCDs contend.
+    env_base = {**__import__("os").environ, "ARCH": arch,
+                "CUDA_VISIBLE_DEVICES": str(gpu_id), "HIP_VISIBLE_DEVICES": str(gpu_id)}
 
     for b in benchmarks:
         if not compile_baseline(b, arch=arch):
@@ -605,46 +609,34 @@ def measure_baselines(
                 if p:
                     unique_parents.add(p)
 
-        # Run nsys once, parse the full kernel-time dict.
-        # A per-run TimeoutExpired must not propagate: one slow benchmark
-        # would otherwise abort the entire baseline pass (and the job) —
-        # skip the run, and skip the benchmark if no run succeeds.  Workers
-        # already skip benchmarks that have no baseline cache entry.
+        # Profile once per run, parse the full kernel-time dict.  The hard
+        # (process-group) timeout and the target profiler (nsys / rocprof) live
+        # in the shared helper, so baselines are measured BIT-IDENTICALLY to the
+        # per-cell rewards they are the denominator of.  A per-run failure must
+        # not propagate: one slow benchmark would otherwise abort the whole
+        # baseline pass (and the job) — skip the run, and skip the benchmark if
+        # none succeed.  Workers already skip benchmarks with no baseline entry.
         run_cmd = _get_run_command(b, arch)
         report_path = _tempfile.mktemp(prefix="nsys_bl_", dir=str(tmp_dir))
         run_times_raw: list[dict] = []
-        timed_out = 0
+        failed_runs = 0
         for _ in range(n_runs):
-            # HARD timeout that kills the whole process group (nsys + benchmark). A plain
-            # subprocess.run(timeout=) kills only /bin/sh, orphaning the benchmark on the
-            # GPU where it would contend with the next run and corrupt the baseline — the
-            # denominator of every reward for this benchmark.
-            ok, _out = run_hard_timeout(
-                f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
-                f"--output={report_path} --force-overwrite=true {run_cmd}",
-                cwd=b, timeout=nsys_timeout, env=env_base, scope_dir=str(b))
-            if not ok:
-                timed_out += 1
-                continue
-            ok2, stats_out = run_hard_timeout(
-                f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
-                cwd=".", timeout=30, env=env_base, capture=True)
-            if not ok2:
-                timed_out += 1
-                continue
-            kt = _parse_nsys_kernel_times(stats_out)
+            kt = _profile_kernel_times_once(
+                run_cmd, b, env_base, tmp_dir, nsys_timeout, report_path)
             if kt:
                 run_times_raw.append(kt)
+            else:
+                failed_runs += 1
 
-        if timed_out:
+        if failed_runs:
             log.warning(
-                "  WARN  %-35s  %d/%d baseline nsys runs timed out (>%ds) — "
-                "raise --nsys-timeout to include this benchmark reliably",
-                b.name, timed_out, n_runs, nsys_timeout,
+                "  WARN  %-35s  %d/%d baseline profiler runs failed (timeout "
+                ">%ds or no output) — raise --nsys-timeout if timeouts dominate",
+                b.name, failed_runs, n_runs, nsys_timeout,
             )
 
         if not run_times_raw:
-            log.warning("  SKIP  %-35s  nsys produced no output", b.name)
+            log.warning("  SKIP  %-35s  profiler produced no output", b.name)
             continue
 
         # Median total time across runs — more robust than mean against
@@ -673,7 +665,7 @@ def measure_baselines(
                 )
             else:
                 log.warning(
-                    "  WARN  %-35s  kernel filter %r not found in nsys output "
+                    "  WARN  %-35s  kernel filter %r not found in profiler output "
                     "(mangled: %r) — B2 fallback will apply",
                     b.name, nsys_filter, mangled,
                 )

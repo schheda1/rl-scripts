@@ -6,8 +6,10 @@ extraction, and nsys kernel-time measurement.
 """
 
 import getpass
+import glob
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import tempfile
@@ -779,6 +781,46 @@ def _parse_nsys_kernel_times(csv_output: str) -> dict[str, float]:
         return {}
 
 
+# Runtime-internal helper kernels (hipMemset/hipMemcpy lowered by the HIP runtime)
+# — dropped from the total-time path so it counts compute kernels only, matching
+# the CUDA path where memset/memcpy lived in a separate nsys report and never
+# entered cuda_gpu_kern_sum.  The per-kernel filter path targets a named compute
+# kernel and is unaffected.
+_ROCPROF_RUNTIME_PREFIXES = ("__amd_rocclr_",)
+
+
+def _parse_rocprof_kernel_times(stats_csv_path) -> "dict[str, float]":
+    """
+    Parse legacy rocprof `--stats` output (`*.stats.csv`) into
+    {kernel_name: total_ms} — the SAME shape _parse_nsys_kernel_times returns, so
+    _sum_kernel_times consumes it unchanged.
+
+    Columns: "Name","Calls","TotalDurationNs","AverageNs","Percentage".
+    TotalDurationNs is the kernel's GPU time summed over all its launches in the
+    run — the direct analog of nsys cuda_gpu_kern_sum "Total Time".  ns -> ms.
+    Returns {} on any parse failure (the caller treats an empty run as skipped).
+    """
+    p = Path(stats_csv_path)
+    if not p.is_file():
+        return {}
+    try:
+        df = pd.read_csv(p)            # quoted fields: commas inside Name are safe
+    except Exception:
+        return {}
+    if df.empty or "Name" not in df.columns or "TotalDurationNs" not in df.columns:
+        return {}
+    out: dict[str, float] = {}
+    for _, row in df.iterrows():
+        name = str(row["Name"]).strip()
+        if not name or any(name.startswith(pre) for pre in _ROCPROF_RUNTIME_PREFIXES):
+            continue
+        try:
+            out[name] = float(row["TotalDurationNs"]) / 1_000_000.0
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 def _sum_kernel_times(
     kernel_times: dict[str, float],
     kernel_filter: Optional[str] = None,
@@ -802,6 +844,88 @@ def _sum_kernel_times(
     return matched if matched > 0 else None
 
 
+def _profile_once_nsys(
+    run_cmd: str, benchmark_dir, env: dict, timeout: int, report_path: str,
+) -> "dict[str, float] | None":
+    """One nsys profile+stats pass -> {kernel_name: ms}, or None on a failed run.
+
+    HARD (process-group) timeout: a plain subprocess.run(timeout=) with shell=True
+    kills only /bin/sh, orphaning nsys + the benchmark on the GPU where they
+    contend with the next run and corrupt its kernel time; run_hard_timeout
+    SIGKILLs the whole group.  *report_path* is reused across runs (one name,
+    --force-overwrite), exactly as the original code did."""
+    ok, _out = run_hard_timeout(
+        f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
+        f"--output={report_path} --force-overwrite=true {run_cmd}",
+        cwd=benchmark_dir, timeout=timeout, env=env, scope_dir=str(benchmark_dir))
+    if not ok:
+        return None
+    ok2, stats_out = run_hard_timeout(
+        f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
+        cwd=".", timeout=30, env=env, capture=True)
+    if not ok2:
+        return None
+    return _parse_nsys_kernel_times(stats_out)
+
+
+def _profile_once_rocprof(
+    run_cmd: str, benchmark_dir, env: dict, tmp_dir: Path, timeout: int,
+) -> "dict[str, float] | None":
+    """One legacy-rocprof `--stats` pass -> {kernel_name: total_ms}, or None.
+
+    `rocprof --stats` with NO counter file (-i) and NO --hip-trace/--hsa-trace is
+    the lightweight, GPU-kernel-only mode — the legacy analog of nsys
+    `--trace=cuda --sample=none`.  Counters are omitted on purpose: collecting
+    them serializes dispatches (one kernel in flight) and would distort timing.
+    --basenames is left off so names keep the '(' signature the per-kernel filter
+    relies on (see demangled_to_filter).
+
+    rocprof writes results.csv/.json/.db/rpl_data into its -d dir; only
+    <out>.stats.csv is read, and the whole dir is removed after the run so the
+    trace files cannot pile up across a long sweep.  Hard (process-group) timeout
+    via run_hard_timeout — same orphan-avoidance as the nsys path."""
+    # Absolute: rocprof's -d/-o resolve against cwd=benchmark_dir, but we read the
+    # stats file back here — an absolute run_dir keeps the two in agreement even
+    # if tmp_dir is relative.
+    run_dir = os.path.abspath(tempfile.mkdtemp(prefix="rocprof_rl_", dir=str(tmp_dir)))
+    try:
+        out_csv = os.path.join(run_dir, "r.csv")
+        ok, _out = run_hard_timeout(
+            f"rocprof --stats -d {run_dir} -o {out_csv} {run_cmd}",
+            cwd=benchmark_dir, timeout=timeout, env=env,
+            scope_dir=str(benchmark_dir))
+        if not ok:
+            return None
+        # rocprof derives the stats file as <-o without .csv>.stats.csv; glob as a
+        # fallback in case a version names it differently.
+        stats = os.path.join(run_dir, "r.stats.csv")
+        if not os.path.isfile(stats):
+            cands = glob.glob(os.path.join(run_dir, "**", "*.stats.csv"),
+                              recursive=True)
+            if not cands:
+                return None
+            stats = cands[0]
+        return _parse_rocprof_kernel_times(stats)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _profile_kernel_times_once(
+    run_cmd: str, benchmark_dir, env: dict, tmp_dir: Path, timeout: int,
+    nsys_report_path: str,
+) -> "dict[str, float] | None":
+    """One profiling pass -> {kernel_name: total_ms}, or None on a failed run.
+
+    Dispatches by target so train.measure_baselines and the collect/env workers
+    share ONE profiler: the measurement must be bit-identical between the run that
+    BUILDS the reward cache and the one that READS it.  AMD uses legacy
+    `rocprof --stats` (nsys_report_path ignored); NVIDIA uses the nsys two-step
+    into nsys_report_path (reused across runs with --force-overwrite)."""
+    if IS_HIP:
+        return _profile_once_rocprof(run_cmd, benchmark_dir, env, tmp_dir, timeout)
+    return _profile_once_nsys(run_cmd, benchmark_dir, env, timeout, nsys_report_path)
+
+
 def measure_kernel_time(
     benchmark_dir: Path,
     arch: str = ARCH,
@@ -820,49 +944,48 @@ def measure_kernel_time(
     containing the loop being optimised.  If None, all kernels are summed
     (original behaviour — used for total-benchmark baseline and B2 fallback).
 
-    Uses a two-step approach compatible with newer nsys versions:
-      1. nsys profile --output=<file> <binary> <args>
-      2. nsys stats --report=cuda_gpu_kern_sum --format=csv <file>.nsys-rep
+    Profiler by target (both reduce to a {kernel_name: ms} dict, so everything
+    below the profiler is target-neutral):
+      NVIDIA: nsys profile  +  nsys stats --report=cuda_gpu_kern_sum
+      AMD:    legacy rocprof --stats  ->  <out>.stats.csv
 
-    nsys report files are written under *tmp_dir*.
-    *gpu_id* controls which physical GPU is used via CUDA_VISIBLE_DEVICES.
+    Report/trace files are written under *tmp_dir*.  *gpu_id* pins the GPU via
+    CUDA_VISIBLE_DEVICES (NVIDIA) AND HIP_VISIBLE_DEVICES (AMD).
     """
     run_cmd = _get_run_command(benchmark_dir, arch)
-    env = {**os.environ, "ARCH": arch, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
+    # Pin the GPU for BOTH runtimes.  A HIP binary IGNORES CUDA_VISIBLE_DEVICES,
+    # so without the HIP var every AMD worker falls through to GCD 0 and the two
+    # GCDs contend — corrupting kernel timings exactly as orphaned processes
+    # would.  Setting both keeps one code path correct on either target.
+    env = {**os.environ, "ARCH": arch,
+           "CUDA_VISIBLE_DEVICES": str(gpu_id), "HIP_VISIBLE_DEVICES": str(gpu_id)}
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    # nsys reuses this one report file across runs (--force-overwrite); rocprof
+    # makes and cleans its own per-run dir, so this name is unused on AMD.
     report_path = tempfile.mktemp(prefix="nsys_rl_", dir=str(tmp_dir))
 
     times: list[float] = []
     for _ in range(n_runs):
-        # A per-run timeout is treated as a failed run rather than propagated: call
-        # sites guard this function with `except RuntimeError` (worker: modified_ms =
-        # baseline_ms fallback).  If all runs time out, the empty `times` list raises
-        # RuntimeError below — the contract the callers already handle.
-        #
-        # HARD timeout (process-group kill): a plain subprocess.run(timeout=) with
-        # shell=True kills only /bin/sh, orphaning nsys + the benchmark on the GPU where
-        # they contend with the next run and corrupt its kernel time.  run_hard_timeout
-        # SIGKILLs the whole group.  ok=False (profile or stats) → failed run → continue.
-        ok, _out = run_hard_timeout(
-            f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
-            f"--output={report_path} --force-overwrite=true {run_cmd}",
-            cwd=benchmark_dir, timeout=nsys_timeout, env=env, scope_dir=str(benchmark_dir))
-        if not ok:
+        # A per-run timeout/failure is treated as a skipped run, not propagated:
+        # call sites guard this with `except RuntimeError` (worker: modified_ms =
+        # baseline_ms fallback).  If every run fails, the empty `times` list
+        # raises RuntimeError below — the contract callers already handle.  The
+        # hard (process-group) timeout lives inside the profiler helper: a plain
+        # timeout would orphan the profiler + benchmark on the GPU, contending
+        # with the next run and corrupting its kernel time.
+        kernel_times = _profile_kernel_times_once(
+            run_cmd, benchmark_dir, env, tmp_dir, nsys_timeout, report_path)
+        if not kernel_times:
             continue
-        ok2, stats_out = run_hard_timeout(
-            f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
-            cwd=".", timeout=30, env=env, capture=True)
-        if not ok2:
-            continue
-        kernel_times = _parse_nsys_kernel_times(stats_out)
         t = _sum_kernel_times(kernel_times, kernel_filter)
         if t is not None:
             times.append(t)
 
     if not times:
+        tool = "rocprof" if IS_HIP else "nsys"
         filter_msg = f" (filter={kernel_filter!r})" if kernel_filter else ""
         raise RuntimeError(
-            f"nsys produced no parseable kernel times for "
+            f"{tool} produced no parseable kernel times for "
             f"{benchmark_dir.name}{filter_msg}"
         )
     return statistics.median(times)
