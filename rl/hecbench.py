@@ -313,25 +313,31 @@ def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300)
         # <ROCM_PATH>/amdgcn/bitcode).
         dl = f" --rocm-device-lib-path={ROCM_DEVICE_LIB}" if ROCM_DEVICE_LIB else ""
         cc = _hip_cc_wrapper()
-        # Anchor the benchmark's RELATIVE includes to the ORIGINAL source tree.
-        # -hip benchmarks pull shared headers from the sibling via the Makefile's
-        # `-I../<name>-cuda` (e.g. reference.h) and from the source with "../x.h",
-        # both RELATIVE to the benchmark dir — which breaks when collect_cells /
-        # train compile from an ISOLATED COPY (only the -hip tree is copied, so the
-        # sibling and ../shared.h are absent and every cell fails "No such file").
-        # 280/526 -hip benchmarks include a non-local header; ~206 live in the
-        # -cuda sibling.  Add absolute -I to the ORIGINAL -hip dir (for "./x" and
-        # "../shared.h") and its -cuda sibling (for the reference.h pattern), found
-        # under HECBENCH_SRC.  Redundant-but-harmless on original-tree compiles.
-        orig_incs = ""
+        # -hip Makefiles reference the sibling -cuda dir by a RELATIVE path, both as
+        # a make PREREQUISITE (`%.o: %.cu ../<name>-cuda/reference.h`) and via
+        # `-I../<name>-cuda`.  When collect_cells/train compile from an ISOLATED
+        # COPY (only the -hip tree is copied) `../<name>-cuda` does not exist, so
+        # MAKE fails during dependency resolution BEFORE compiling ("No rule to make
+        # target ../<name>-cuda/reference.h").  A compile-time -I cannot satisfy a
+        # make prerequisite — so make the path RESOLVE by symlinking the sibling
+        # next to the benchmark dir, pointing at the original under HECBENCH_SRC.
+        # Idempotent; a no-op in the original tree (the real sibling exists there,
+        # so .exists() is True and we skip — never clobbering it).  Recovers the
+        # ~206 of 280 non-self-contained -hip benchmarks whose header is in the
+        # sibling; the ~30 that need a `../shared.h` one level up still fail (benign
+        # per-benchmark — a fuller source-tree mirror would be needed for those).
         if benchmark_dir.name.endswith("-hip"):
-            _base = benchmark_dir.name[:-len("-hip")]
-            for _cand in (HECBENCH_SRC / f"{_base}-hip", HECBENCH_SRC / f"{_base}-cuda"):
-                if _cand.is_dir():
-                    orig_incs += f"-I{_cand} "
+            _sibname = benchmark_dir.name[:-len("-hip")] + "-cuda"
+            _siblink = benchmark_dir.parent / _sibname
+            _sibsrc = HECBENCH_SRC / _sibname
+            if not _siblink.exists() and _sibsrc.is_dir():
+                try:
+                    _siblink.symlink_to(_sibsrc)
+                except OSError:
+                    pass
         flags = (
             f"--offload-arch={arch} --rocm-path={ROCM_PATH}{dl} "
-            f"-D__HIP_PLATFORM_AMD__ -I{ROCM_PATH}/include {orig_incs}{extra_cflags} "
+            f"-D__HIP_PLATFORM_AMD__ -I{ROCM_PATH}/include {extra_cflags} "
             f"-std=c++17 -O3"
         )
         flag_var = "EXTRA_CFLAGS"
