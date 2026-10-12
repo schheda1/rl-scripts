@@ -505,6 +505,125 @@ def precheck_benchmarks(
 # One-shot baseline measurement
 # ---------------------------------------------------------------------------
 
+def _measure_one_baseline(b, loop_records_map, arch, n_runs, nsys_timeout,
+                          tmp_dir, env_base):
+    """Measure ONE benchmark's baseline -> {"total_ms", "per_kernel_ms"}, or None
+    to skip (compile failed / no profiler output).  Pure measurement + logging;
+    the caller owns the cache.  Factored out of the serial loop so the serial and
+    the parallel (per-GPU) paths measure BIT-IDENTICALLY.
+
+    *env_base* carries the GPU pin (CUDA_/HIP_VISIBLE_DEVICES) and is built by the
+    caller, so this function is GPU-agnostic.
+    """
+    from hecbench import (compile_baseline, demangle, demangled_to_filter,
+                          _profile_kernel_times_once, _sum_kernel_times,
+                          _get_run_command)
+    import tempfile as _tempfile
+
+    if not compile_baseline(b, arch=arch):
+        log.warning("  SKIP  %-35s  baseline compile failed", b.name)
+        return None
+
+    # Collect unique mangled kernel parent names for this benchmark's loops
+    unique_parents: set[str] = set()
+    for rec in loop_records_map.get(b.name, []):
+        for p in rec.get("kernel_parents", []):
+            if p:
+                unique_parents.add(p)
+
+    # Profile once per run, parse the full kernel-time dict.  The hard
+    # (process-group) timeout and the target profiler (nsys / rocprof) live in the
+    # shared helper, so baselines are measured BIT-IDENTICALLY to the per-cell
+    # rewards they are the denominator of.  A per-run failure must not propagate:
+    # skip the run, and skip the benchmark if none succeed.
+    run_cmd = _get_run_command(b, arch)
+    report_path = _tempfile.mktemp(prefix="nsys_bl_", dir=str(tmp_dir))
+    run_times_raw: list[dict] = []
+    failed_runs = 0
+    for _ in range(n_runs):
+        kt = _profile_kernel_times_once(
+            run_cmd, b, env_base, tmp_dir, nsys_timeout, report_path)
+        if kt:
+            run_times_raw.append(kt)
+        else:
+            failed_runs += 1
+
+    if failed_runs:
+        log.warning(
+            "  WARN  %-35s  %d/%d baseline profiler runs failed (timeout "
+            ">%ds or no output) — raise --nsys-timeout if timeouts dominate",
+            b.name, failed_runs, n_runs, nsys_timeout,
+        )
+    if not run_times_raw:
+        log.warning("  SKIP  %-35s  profiler produced no output", b.name)
+        return None
+
+    # Median total time across runs — more robust than mean against scheduling
+    # outliers and profiler warm-up effects.
+    total_ms = statistics.median(sum(kt.values()) for kt in run_times_raw)
+
+    # Per-kernel medians: for each unique parent, the median of the filtered time
+    # across runs.  Key is "funcname(" (via demangled_to_filter) so it matches
+    # regardless of how c++filt vs the profiler format pointer/const tokens.
+    per_kernel_ms: dict[str, float] = {}
+    for mangled in unique_parents:
+        nsys_filter = demangled_to_filter(demangle(mangled))
+        run_vals = [_sum_kernel_times(kt, nsys_filter) for kt in run_times_raw]
+        valid = [v for v in run_vals if v is not None]
+        if valid:
+            per_kernel_ms[nsys_filter] = statistics.median(valid)
+            log.info("  DONE  %-35s  kernel=%-50s  %.3f ms",
+                     b.name, nsys_filter, per_kernel_ms[nsys_filter])
+        else:
+            log.warning(
+                "  WARN  %-35s  kernel filter %r not found in profiler output "
+                "(mangled: %r) — B2 fallback will apply",
+                b.name, nsys_filter, mangled)
+
+    log.info("  DONE  %-35s  total=%.3f ms  kernels_cached=%d",
+             b.name, total_ms, len(per_kernel_ms))
+    return {"total_ms": total_ms, "per_kernel_ms": per_kernel_ms}
+
+
+def _baseline_worker(rank, gpu_id, shard, hp, result_q):
+    """Measure the baselines in *shard* on one GPU, streaming each result back.
+    Sends only plain Python over the queue (never torch tensors).  Spawned by
+    measure_baselines' parallel path; relies on the caller's 'spawn' start method.
+    """
+    import os as _os
+    import logging as _logging
+    import traceback as _tb
+    from pathlib import Path as _Path
+
+    # Pin the GPU before any HIP call (a HIP binary ignores CUDA_VISIBLE_DEVICES).
+    _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    _os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_id)
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format=f"%(asctime)s %(levelname)s [BL{rank}] %(message)s",
+        datefmt="%H:%M:%S")
+    env_base = {**_os.environ, "ARCH": hp["arch"],
+                "CUDA_VISIBLE_DEVICES": str(gpu_id),
+                "HIP_VISIBLE_DEVICES": str(gpu_id)}
+    tmp_dir = _Path(hp["tmp_dir"])
+    try:
+        for b in shard:
+            try:
+                res = _measure_one_baseline(
+                    b, hp["loop_records_map"], hp["arch"], hp["n_runs"],
+                    hp["nsys_timeout"], tmp_dir, env_base)
+            except Exception as e:
+                _logging.getLogger("train").warning(
+                    "  SKIP  %-35s  baseline measurement crashed: %s", b.name, e)
+                res = None
+            result_q.put({"type": "baseline", "name": b.name, "result": res})
+    except Exception:
+        result_q.put({"type": "worker_crashed", "rank": rank,
+                      "error": _tb.format_exc()})
+    finally:
+        result_q.put({"type": "worker_done", "rank": rank})
+
+
 def measure_baselines(
     benchmarks: list[Path],
     loop_records_map: dict[str, list[dict]],
@@ -514,6 +633,7 @@ def measure_baselines(
     tmp_dir: Path,
     gpu_id: int = 0,
     cache_file: "Path | None" = None,
+    num_workers: int = 1,
 ) -> dict[str, dict]:
     """
     Compile and measure baseline kernel times for each benchmark once.
@@ -540,12 +660,10 @@ def measure_baselines(
     the cache.  Baseline stability across restarts also keeps the cross-epoch
     reward cache consistent: cached rewards were computed against these
     exact baseline values.
-    """
-    from hecbench import (compile_baseline, demangle, demangled_to_filter,
-                          _profile_kernel_times_once, _sum_kernel_times,
-                          _get_run_command)
-    import tempfile as _tempfile
 
+    *num_workers* > 1 shards the uncached benchmarks across that many GPUs
+    (gpu_id = rank) and measures them in parallel; 1 (default) is the serial path.
+    """
     cache: dict[str, dict] = {}
     if cache_file is not None and Path(cache_file).exists():
         try:
@@ -596,91 +714,71 @@ def measure_baselines(
     log.info("Measuring baselines for %d benchmarks (once per run)...", len(benchmarks))
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    # Pin BOTH runtimes: a HIP binary ignores CUDA_VISIBLE_DEVICES, so the HIP
-    # var is required or every AMD worker lands on GCD 0 and the GCDs contend.
-    env_base = {**__import__("os").environ, "ARCH": arch,
-                "CUDA_VISIBLE_DEVICES": str(gpu_id), "HIP_VISIBLE_DEVICES": str(gpu_id)}
 
-    for b in benchmarks:
-        if not compile_baseline(b, arch=arch):
-            log.warning("  SKIP  %-35s  baseline compile failed", b.name)
-            continue
-
-        # Collect unique mangled kernel parent names for this benchmark's loops
-        unique_parents: set[str] = set()
-        for rec in loop_records_map.get(b.name, []):
-            for p in rec.get("kernel_parents", []):
-                if p:
-                    unique_parents.add(p)
-
-        # Profile once per run, parse the full kernel-time dict.  The hard
-        # (process-group) timeout and the target profiler (nsys / rocprof) live
-        # in the shared helper, so baselines are measured BIT-IDENTICALLY to the
-        # per-cell rewards they are the denominator of.  A per-run failure must
-        # not propagate: one slow benchmark would otherwise abort the whole
-        # baseline pass (and the job) — skip the run, and skip the benchmark if
-        # none succeed.  Workers already skip benchmarks with no baseline entry.
-        run_cmd = _get_run_command(b, arch)
-        report_path = _tempfile.mktemp(prefix="nsys_bl_", dir=str(tmp_dir))
-        run_times_raw: list[dict] = []
-        failed_runs = 0
-        for _ in range(n_runs):
-            kt = _profile_kernel_times_once(
-                run_cmd, b, env_base, tmp_dir, nsys_timeout, report_path)
-            if kt:
-                run_times_raw.append(kt)
-            else:
-                failed_runs += 1
-
-        if failed_runs:
-            log.warning(
-                "  WARN  %-35s  %d/%d baseline profiler runs failed (timeout "
-                ">%ds or no output) — raise --nsys-timeout if timeouts dominate",
-                b.name, failed_runs, n_runs, nsys_timeout,
-            )
-
-        if not run_times_raw:
-            log.warning("  SKIP  %-35s  profiler produced no output", b.name)
-            continue
-
-        # Median total time across runs — more robust than mean against
-        # scheduling outliers and nsys warm-up effects.
-        total_ms = statistics.median(
-            sum(kt.values()) for kt in run_times_raw
-        )
-
-        # Per-kernel medians: for each unique parent, take the median of the
-        # filtered time across runs.  Median is more robust than mean here.
-        # Key in per_kernel_ms is "funcname(" (via demangled_to_filter) so it
-        # matches regardless of how c++filt vs nsys format pointer/const tokens.
-        per_kernel_ms: dict[str, float] = {}
-        for mangled in unique_parents:
-            nsys_filter = demangled_to_filter(demangle(mangled))
-            run_vals = [
-                _sum_kernel_times(kt, nsys_filter)
-                for kt in run_times_raw
-            ]
-            valid = [v for v in run_vals if v is not None]
-            if valid:
-                per_kernel_ms[nsys_filter] = statistics.median(valid)
-                log.info(
-                    "  DONE  %-35s  kernel=%-50s  %.3f ms",
-                    b.name, nsys_filter, per_kernel_ms[nsys_filter],
-                )
-            else:
-                log.warning(
-                    "  WARN  %-35s  kernel filter %r not found in profiler output "
-                    "(mangled: %r) — B2 fallback will apply",
-                    b.name, nsys_filter, mangled,
-                )
-
-        cache[b.name] = {"total_ms": total_ms, "per_kernel_ms": per_kernel_ms}
-        log.info(
-            "  DONE  %-35s  total=%.3f ms  kernels_cached=%d",
-            b.name, total_ms, len(per_kernel_ms),
-        )
-        # Persist after EVERY benchmark so a kill resumes here, not from zero.
-        _flush_cache()
+    # Serial (num_workers<=1; the train.main path) or parallel across GPUs
+    # (collect_cells, one worker per GCD).  Both call _measure_one_baseline, so
+    # the measurement is bit-identical; only the scheduling differs.  In both the
+    # MAIN process is the single cache writer and flushes after each benchmark,
+    # so a kill resumes where it stopped.
+    if num_workers > 1 and len(benchmarks) > 1:
+        # Shard the UNCACHED benchmarks round-robin across GPUs (gpu_id = rank;
+        # rough balance without a per-benchmark cost estimate).  Each worker
+        # STREAMS per-benchmark results so the main stays the single writer.
+        # Relies on the caller having set the mp start method to 'spawn'
+        # (collect_cells.__main__ / train.__main__ both do).
+        import queue as _queue
+        result_q: "mp.Queue" = mp.Queue()
+        shards = [benchmarks[i::num_workers] for i in range(num_workers)]
+        procs = []
+        for rank in range(num_workers):
+            if not shards[rank]:
+                continue
+            hp = {
+                "arch": arch, "n_runs": n_runs, "nsys_timeout": nsys_timeout,
+                "tmp_dir": str(tmp_dir),
+                # only this shard's records (keeps the pickled payload small)
+                "loop_records_map": {b.name: loop_records_map.get(b.name, [])
+                                     for b in shards[rank]},
+            }
+            pr = mp.Process(target=_baseline_worker,
+                            args=(rank, rank, shards[rank], hp, result_q),
+                            daemon=True)
+            pr.start()
+            procs.append(pr)
+        log.info("Measuring baselines in parallel across %d GPUs", len(procs))
+        done = 0
+        msg_timeout = n_runs * nsys_timeout + 600
+        while done < len(procs):
+            try:
+                msg = result_q.get(timeout=msg_timeout)
+            except _queue.Empty:
+                if not any(pr.is_alive() for pr in procs):
+                    log.error("All baseline workers died — ending baseline pass")
+                    break
+                continue
+            t = msg["type"]
+            if t == "baseline":
+                if msg["result"] is not None:
+                    cache[msg["name"]] = msg["result"]
+                    _flush_cache()
+            elif t == "worker_crashed":
+                log.error("Baseline worker %d crashed:\n%s",
+                          msg["rank"], msg.get("error"))
+            elif t == "worker_done":
+                done += 1
+        for pr in procs:
+            pr.join(timeout=30)
+    else:
+        # Serial — pin BOTH runtimes (a HIP binary ignores CUDA_VISIBLE_DEVICES).
+        env_base = {**__import__("os").environ, "ARCH": arch,
+                    "CUDA_VISIBLE_DEVICES": str(gpu_id),
+                    "HIP_VISIBLE_DEVICES": str(gpu_id)}
+        for b in benchmarks:
+            res = _measure_one_baseline(
+                b, loop_records_map, arch, n_runs, nsys_timeout, tmp_dir, env_base)
+            if res is not None:
+                cache[b.name] = res
+                _flush_cache()
 
     # Accounting: len(benchmarks) is what was ATTEMPTED this call (the ones not
     # already cached), not what succeeded.  Report both — a benchmark without a

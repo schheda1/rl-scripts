@@ -574,6 +574,7 @@ def main() -> None:
             need_bl, loop_records_map=loop_records_map, arch=args.arch,
             n_runs=args.n_runs, nsys_timeout=args.nsys_timeout,
             tmp_dir=tmp_dir, gpu_id=0, cache_file=bl_file,
+            num_workers=args.num_workers,
         )
         still = [b.name for b in need_bl if b.name not in baseline_cache]
         if still:
