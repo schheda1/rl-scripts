@@ -313,9 +313,25 @@ def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300)
         # <ROCM_PATH>/amdgcn/bitcode).
         dl = f" --rocm-device-lib-path={ROCM_DEVICE_LIB}" if ROCM_DEVICE_LIB else ""
         cc = _hip_cc_wrapper()
+        # Anchor the benchmark's RELATIVE includes to the ORIGINAL source tree.
+        # -hip benchmarks pull shared headers from the sibling via the Makefile's
+        # `-I../<name>-cuda` (e.g. reference.h) and from the source with "../x.h",
+        # both RELATIVE to the benchmark dir — which breaks when collect_cells /
+        # train compile from an ISOLATED COPY (only the -hip tree is copied, so the
+        # sibling and ../shared.h are absent and every cell fails "No such file").
+        # 280/526 -hip benchmarks include a non-local header; ~206 live in the
+        # -cuda sibling.  Add absolute -I to the ORIGINAL -hip dir (for "./x" and
+        # "../shared.h") and its -cuda sibling (for the reference.h pattern), found
+        # under HECBENCH_SRC.  Redundant-but-harmless on original-tree compiles.
+        orig_incs = ""
+        if benchmark_dir.name.endswith("-hip"):
+            _base = benchmark_dir.name[:-len("-hip")]
+            for _cand in (HECBENCH_SRC / f"{_base}-hip", HECBENCH_SRC / f"{_base}-cuda"):
+                if _cand.is_dir():
+                    orig_incs += f"-I{_cand} "
         flags = (
             f"--offload-arch={arch} --rocm-path={ROCM_PATH}{dl} "
-            f"-D__HIP_PLATFORM_AMD__ -I{ROCM_PATH}/include {extra_cflags} "
+            f"-D__HIP_PLATFORM_AMD__ -I{ROCM_PATH}/include {orig_incs}{extra_cflags} "
             f"-std=c++17 -O3"
         )
         flag_var = "EXTRA_CFLAGS"
