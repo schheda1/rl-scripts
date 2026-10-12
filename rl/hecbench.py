@@ -386,6 +386,7 @@ def compile_single_loop_ex(
     filename: str,
     triple: str,
     arch: str = ARCH,
+    timeout: int = 300,
 ) -> tuple[bool, str]:
     """
     Like compile_single_loop, but also returns an error signature on failure.
@@ -393,6 +394,12 @@ def compile_single_loop_ex(
     The signature is the first line matching a compiler-error pattern, which is
     what makes thousands of failures group into a handful of root causes.
     Returns an empty signature when the compile succeeds.
+
+    *timeout* caps the compile (passed to _make).  UU unrolling makes compile time
+    grow with factor, so a doomed high-factor compile can otherwise sit at the
+    full budget; the caller lowers it (e.g. collect_cells --compile-timeout) to
+    bound wasted time.  A hit raises subprocess.TimeoutExpired, which callers
+    translate to a compile_timeout penalty.
     """
     cflags = _build_extra_cflags(
         enable_uu=True,
@@ -402,7 +409,7 @@ def compile_single_loop_ex(
         unmerge_flags=[unmerge],
         unroll_factors=[factor],
     )
-    result = _make(benchmark_dir, extra_cflags=cflags, arch=arch)
+    result = _make(benchmark_dir, extra_cflags=cflags, arch=arch, timeout=timeout)
     if result.returncode == 0:
         return True, ""
     return False, extract_error_signature(result.stderr)

@@ -55,7 +55,6 @@ import queue
 import shutil
 import sys
 import time
-from itertools import groupby
 from pathlib import Path
 
 import torch.multiprocessing as mp
@@ -133,49 +132,14 @@ def missing_cells(assignments: list[dict], rewards: dict,
     return out
 
 
-def pack_by_cells(assignments: list[dict], todo: dict,
-                  n_workers: int) -> list[list[dict]]:
-    """
-    Bin-pack whole BENCHMARKS across workers, weighted by cell count.
-
-    Benchmark granularity (not loop, as training uses) because each worker
-    copies a benchmark tree once and reuses it for every loop and cell inside
-    it; splitting one benchmark across workers would duplicate that copy.
-    Weighted by cells rather than loops because a 19-cell loop is 19x the work
-    of a 1-cell loop, and loop counts per benchmark are heavily skewed.
-    """
-    by_bench: dict = {}
-    for a in assignments:
-        key = f"{a['benchmark_name']}|{a['loop_idx']}"
-        if key in todo:
-            by_bench.setdefault(a["benchmark_name"], []).append(a)
-
-    weights = [
-        (sum(len(todo[f"{a['benchmark_name']}|{a['loop_idx']}"]) for a in loops),
-         name, loops)
-        for name, loops in by_bench.items()
-    ]
-    weights.sort(key=lambda t: -t[0])          # heaviest first
-
-    buckets: list[list[dict]] = [[] for _ in range(n_workers)]
-    loads = [0] * n_workers
-    for w, _name, loops in weights:
-        i = loads.index(min(loads))
-        buckets[i].extend(loops)
-        loads[i] += w
-    for b in buckets:
-        b.sort(key=lambda a: (a["benchmark_name"], a["loop_idx"]))
-    return buckets
-
-
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
-def _collect_worker(rank: int, gpu_id: int, assignments: list[dict],
-                    todo: dict, hp: dict, result_q) -> None:
+def _collect_worker(rank: int, gpu_id: int, work_q, hp: dict, result_q) -> None:
     """
-    Measure every assigned cell.  Sends only plain Python over the queue.
+    Pull benchmarks from *work_q* and measure every cell of each.  Sends only
+    plain Python over the queue.
 
     NEVER put torch tensors on this queue: torch.multiprocessing passes them by
     shared memory and frees the backing store when the producer exits, so a
@@ -210,6 +174,8 @@ def _collect_worker(rank: int, gpu_id: int, assignments: list[dict],
 
         normalizer = FeatureNormalizer.from_state_dict(hp["normalizer_state"])
         baseline_cache: dict = hp["baseline_cache"]
+        by_bench: dict = hp["by_bench"]
+        todo: dict = hp["todo"]
         tmp_dir = _Path(hp["tmp_dir"]) / f"collect_{rank}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         working_set_dir = tmp_dir / "working_set"
@@ -224,9 +190,13 @@ def _collect_worker(rank: int, gpu_id: int, assignments: list[dict],
             gpu_id=gpu_id, normalizer=normalizer, baseline_cache=baseline_cache,
         )
 
-        for bench_name, bench_iter in groupby(
-                assignments, key=lambda x: x["benchmark_name"]):
-            bench_loops = list(bench_iter)
+        while True:
+            bench_name = work_q.get()
+            if bench_name is None:            # sentinel — no more benchmarks
+                break
+            bench_loops = by_bench.get(bench_name, [])
+            if not bench_loops:
+                continue
 
             # MIRROR: train._worker_fn — benchmark must have a baseline entry.
             if baseline_cache.get(bench_name) is None:
@@ -285,7 +255,7 @@ def _collect_worker(rank: int, gpu_id: int, assignments: list[dict],
                         ok, err_sig = compile_single_loop_ex(
                             copy_dir, loop_idx=loop_idx, unmerge=unmerge,
                             factor=factor, filename=filename, triple=triple,
-                            arch=hp["arch"],
+                            arch=hp["arch"], timeout=hp["compile_timeout"],
                         )
                     except subprocess.TimeoutExpired:
                         # MIRROR: compile timeout → fixed penalty, cached.
@@ -440,6 +410,13 @@ def main() -> None:
     p.add_argument("--reward-deadzone", type=float, required=True,
                    help="REQUIRED: must match the training run (see above).")
     p.add_argument("--compile-timeout-penalty", type=float, default=-1.0)
+    p.add_argument("--compile-timeout", type=int, default=300,
+                   help="Per-cell compile budget in seconds (default 300). UU "
+                        "unrolling makes compile time grow with factor; a doomed "
+                        "high-factor compile otherwise sits at the full budget. "
+                        "Applies only to the cell compiles, not the plain "
+                        "baseline/precheck ones. Lower it (e.g. 150) to cut time "
+                        "spent on loops the transform can't compile in budget.")
     # --- Measurement ---
     p.add_argument("--arch", default=ARCH)
     p.add_argument("--n-runs", type=int, required=True,
@@ -585,6 +562,7 @@ def main() -> None:
         "arch": args.arch, "n_runs": args.n_runs,
         "nsys_timeout": args.nsys_timeout, "tmp_dir": str(tmp_dir),
         "compile_timeout_penalty": args.compile_timeout_penalty,
+        "compile_timeout": args.compile_timeout,
         "compile_failure_penalty": args.compile_failure_penalty,
         "reward_deadzone": args.reward_deadzone,
         "normalizer_state": normalizer.state_dict(),
@@ -593,18 +571,47 @@ def main() -> None:
         "have_postf": set(postf.keys()),
     }
 
-    buckets = pack_by_cells(assignments, todo, args.num_workers)
+    # Group this run's assignments by benchmark — the worker copies a benchmark
+    # tree once and reuses it for all its loops/cells — and order benchmarks
+    # FASTEST-FIRST by measured baseline kernel time, so more of the dataset is
+    # covered if the window runs out before the slow-kernel tail.  Benchmarks
+    # with no baseline can't be scored, so they are excluded (the worker would
+    # skip them anyway) rather than queued.
+    by_bench: dict = {}
+    for a in assignments:
+        if f"{a['benchmark_name']}|{a['loop_idx']}" in todo:
+            by_bench.setdefault(a["benchmark_name"], []).append(a)
+    ordered = sorted(
+        (name for name in by_bench if baseline_cache.get(name)),
+        key=lambda name: baseline_cache[name].get("total_ms", float("inf")),
+    )
+    no_bl = [name for name in by_bench if not baseline_cache.get(name)]
+    if no_bl:
+        log.warning("%d benchmark(s) have cells to collect but no baseline — "
+                    "skipped: %s", len(no_bl), sorted(no_bl))
+    hp["by_bench"] = by_bench
+    hp["todo"] = todo
+
+    # Dynamic work queue: each worker PULLS the next benchmark when it goes idle,
+    # so a fast worker never waits behind a slow one (benchmark kernels span
+    # ms..tens of seconds, and process+launch under profiling is slow).  One
+    # sentinel (None) per worker ends it; main stays the single cache writer.
+    work_q: "mp.Queue" = mp.Queue()
+    for name in ordered:
+        work_q.put(name)
+    for _ in range(args.num_workers):
+        work_q.put(None)
+
     result_q: mp.Queue = mp.Queue()
     procs = []
     for rank in range(args.num_workers):
-        if not buckets[rank]:
-            continue
         pr = mp.Process(target=_collect_worker,
-                        args=(rank, rank, buckets[rank], todo, hp, result_q),
+                        args=(rank, rank, work_q, hp, result_q),
                         daemon=True)
         pr.start()
         procs.append(pr)
-    log.info("Launched %d workers", len(procs))
+    log.info("Launched %d workers over %d benchmarks (fastest-first)",
+             len(procs), len(ordered))
 
     n_alive = len(procs)
     done = measured = failed = crashed = 0

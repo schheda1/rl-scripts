@@ -585,10 +585,11 @@ def _measure_one_baseline(b, loop_records_map, arch, n_runs, nsys_timeout,
     return {"total_ms": total_ms, "per_kernel_ms": per_kernel_ms}
 
 
-def _baseline_worker(rank, gpu_id, shard, hp, result_q):
-    """Measure the baselines in *shard* on one GPU, streaming each result back.
-    Sends only plain Python over the queue (never torch tensors).  Spawned by
-    measure_baselines' parallel path; relies on the caller's 'spawn' start method.
+def _baseline_worker(rank, gpu_id, work_q, hp, result_q):
+    """Pull benchmarks from *work_q* and measure each baseline on one GPU,
+    streaming each result back.  Sends only plain Python over the queue (never
+    torch tensors).  Spawned by measure_baselines' parallel path; relies on the
+    caller's 'spawn' start method.  Breaks on a None sentinel.
     """
     import os as _os
     import logging as _logging
@@ -607,7 +608,10 @@ def _baseline_worker(rank, gpu_id, shard, hp, result_q):
                 "HIP_VISIBLE_DEVICES": str(gpu_id)}
     tmp_dir = _Path(hp["tmp_dir"])
     try:
-        for b in shard:
+        while True:
+            b = work_q.get()
+            if b is None:                     # sentinel — no more benchmarks
+                break
             try:
                 res = _measure_one_baseline(
                     b, hp["loop_records_map"], hp["arch"], hp["n_runs"],
@@ -661,8 +665,11 @@ def measure_baselines(
     reward cache consistent: cached rewards were computed against these
     exact baseline values.
 
-    *num_workers* > 1 shards the uncached benchmarks across that many GPUs
-    (gpu_id = rank) and measures them in parallel; 1 (default) is the serial path.
+    *num_workers* > 1 measures the uncached benchmarks in parallel across that
+    many GPUs via a shared dynamic work queue — each worker (gpu_id = rank) pulls
+    the next benchmark when idle, so a fast GPU never waits behind a slow one.
+    1 (default) is the serial path.  The main process is always the single cache
+    writer and flushes after each benchmark.
     """
     cache: dict[str, dict] = {}
     if cache_file is not None and Path(cache_file).exists():
@@ -721,31 +728,33 @@ def measure_baselines(
     # MAIN process is the single cache writer and flushes after each benchmark,
     # so a kill resumes where it stopped.
     if num_workers > 1 and len(benchmarks) > 1:
-        # Shard the UNCACHED benchmarks round-robin across GPUs (gpu_id = rank;
-        # rough balance without a per-benchmark cost estimate).  Each worker
-        # STREAMS per-benchmark results so the main stays the single writer.
-        # Relies on the caller having set the mp start method to 'spawn'
-        # (collect_cells.__main__ / train.__main__ both do).
+        # Dynamic work queue (not a static shard): each worker PULLS the next
+        # benchmark when idle, so a fast GPU never waits behind a slow one —
+        # baseline cost spans ms..tens of seconds × n_runs.  One sentinel (None)
+        # per worker ends it; workers STREAM per-benchmark results so the main
+        # stays the single cache writer.  Relies on the caller having set the mp
+        # start method to 'spawn' (collect_cells.__main__ / train.__main__ do).
         import queue as _queue
         result_q: "mp.Queue" = mp.Queue()
-        shards = [benchmarks[i::num_workers] for i in range(num_workers)]
+        work_q: "mp.Queue" = mp.Queue()
+        for b in benchmarks:
+            work_q.put(b)
+        for _ in range(num_workers):
+            work_q.put(None)
+        hp = {
+            "arch": arch, "n_runs": n_runs, "nsys_timeout": nsys_timeout,
+            "tmp_dir": str(tmp_dir),
+            # full map: a worker can pull ANY benchmark off the queue
+            "loop_records_map": loop_records_map,
+        }
         procs = []
         for rank in range(num_workers):
-            if not shards[rank]:
-                continue
-            hp = {
-                "arch": arch, "n_runs": n_runs, "nsys_timeout": nsys_timeout,
-                "tmp_dir": str(tmp_dir),
-                # only this shard's records (keeps the pickled payload small)
-                "loop_records_map": {b.name: loop_records_map.get(b.name, [])
-                                     for b in shards[rank]},
-            }
             pr = mp.Process(target=_baseline_worker,
-                            args=(rank, rank, shards[rank], hp, result_q),
+                            args=(rank, rank, work_q, hp, result_q),
                             daemon=True)
             pr.start()
             procs.append(pr)
-        log.info("Measuring baselines in parallel across %d GPUs", len(procs))
+        log.info("Measuring baselines dynamically across %d GPUs", len(procs))
         done = 0
         msg_timeout = n_runs * nsys_timeout + 600
         while done < len(procs):
