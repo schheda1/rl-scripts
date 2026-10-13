@@ -298,6 +298,49 @@ def _hip_cc_wrapper() -> str:
     return str(path)
 
 
+def _cuda_makefile_incdefs(benchmark_dir: Path, arch: str) -> str:
+    """Return the benchmark Makefile's own `-I` / `-D` flags, via a `make -n` dry run.
+
+    The CUDA branch of _make OVERRIDES CFLAGS (to drop nvcc-only flags like
+    `-Xcompiler` / `-arch=` that clang++ can't parse), which also discards the
+    benchmark's shared includes (e.g. `-I../include` -> SDKBitMap.h/shrUtils.h) and
+    type/macro defines (e.g. `-Ddfloat=double`, `-DPRECISION=double`).  That
+    silently excluded ~16/29 -cuda benchmarks that build fine.  Re-add JUST the
+    -I/-D (never the nvcc flags) so they survive.
+
+    `make -n` only PRINTS the recipe (no compile, no nvcc needed); it runs with the
+    Makefile's own CFLAGS (no pipeline override), so the -I/-D are the benchmark's.
+    Over-capturing is harmless — extra includes/defines don't break a compile — and
+    an empty result (parse error / missing prereq) just reproduces the pre-fix
+    behavior for that benchmark.  Handles both joined (`-I../include`) and split
+    (`-I ../include`) forms.
+    """
+    try:
+        r = subprocess.run(
+            ["make", "-n"], cwd=benchmark_dir, capture_output=True, text=True,
+            env={**os.environ, "ARCH": arch}, timeout=30)
+    except Exception:
+        return ""
+    seen: list[str] = []
+    for line in (r.stdout + "\n" + r.stderr).splitlines():
+        toks = line.split()
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if t in ("-I", "-D") and i + 1 < len(toks):
+                flag = t + toks[i + 1]
+                i += 2
+            elif (t.startswith("-I") or t.startswith("-D")) and len(t) > 2:
+                flag = t
+                i += 1
+            else:
+                i += 1
+                continue
+            if flag not in seen:
+                seen.append(flag)
+    return " ".join(seen)
+
+
 def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300) -> subprocess.CompletedProcess:
     env = {**os.environ, "ARCH": arch}
     # Override the benchmark Makefile's compiler/flags to drive our custom clang++
@@ -346,10 +389,16 @@ def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300)
         # CUDA/NVPTX: New HecBench Makefiles default to nvcc with nvcc-specific
         # flags; replicate the og-HeCBench clang++ pattern here.  (.cu auto-detects
         # as CUDA, so no -x flag and no wrapper needed — link stays clean.)
+        # Override CFLAGS (drops nvcc-only flags clang++ can't parse: -Xcompiler,
+        # -arch=, ...), but RE-ADD the benchmark Makefile's own -I/-D — otherwise
+        # shared headers (SDKBitMap.h, ...) and type/macro defines (-Ddfloat=double,
+        # -DPRECISION=double, ...) are dropped and the benchmark fails to compile
+        # (this excluded ~16/29 -cuda benchmarks that build fine).
         cc = "clang++"
         cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+        mk_incdefs = _cuda_makefile_incdefs(benchmark_dir, arch)
         flags = (
-            f"-I{cuda_home}/include {extra_cflags} "
+            f"-I{cuda_home}/include {mk_incdefs} {extra_cflags} "
             f"-std=c++17 -Wall -O3 --cuda-gpu-arch={arch}"
         )
         flag_var = "CFLAGS"
