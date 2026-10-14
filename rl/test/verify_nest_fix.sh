@@ -3,8 +3,8 @@
 #   (1) the dominator-tree cycle cut in unmerge's DFS (UnrollAndUnmerge.cpp,
 #       dfsAndDuplicate / unmerge), which fixes the non-terminating compile when
 #       unmerging above an unmerged loop that had children;
-#   (2) the pre-transform identity stamp (-uu-stamp-loops, default on) read back
-#       by LoopCount as the uuIdx / uuIdxMixed columns.
+#   (2) the pre-transform identity stamp (-uu-stamp-loops, OPT-IN, default off)
+#       read back by LoopCount as the uuIdx / uuIdxMixed columns.
 #
 # Runs on the CUDA dev box against multimaterial-cuda/compact.cu (-DFUSED), the
 # nest idx 7 > 6 > 5 used for the original experiments.  Compile-only except the
@@ -37,6 +37,7 @@ LC="-mllvm --enable-loopcount -mllvm --ir2vec-vocab-path=$IR2VEC_VOCAB"
 T=nvptx64-nvidia-cuda
 UU="-mllvm --enable-uu -mllvm -uu-match-targettriple=$T -mllvm -uu-match-filename=$FILE"
 IN=6; OUT_IDX=7
+STAMP="-mllvm -uu-stamp-loops=1"     # opt-in; never used in the oracle build or the regression compiles
 
 fails=0
 pass() { echo "PASS  $*"; }
@@ -66,8 +67,14 @@ emit_ptx() {
   timeout 300 "$cc" $BASE $LC $extra -S -o "$OUT/$name.ptx" $FILE 2>/dev/null
   rc=$?
 }
+# final device IR (end of the whole -O3 pipeline), for the inertness diagnostic
+emit_ll() {
+  local name=$1 cc=$2 extra=$3
+  timeout 300 "$cc" $BASE $LC $extra -S -emit-llvm -o "$OUT/$name.final.ll" $FILE 2>/dev/null
+  rc=$?
+}
 # strip metadata lines/attachments so two .ll files can be compared structurally
-strip_md() { sed -E 's/, ![a-zA-Z.]+ ![0-9]+//g; /^![0-9]+ = /d; /^!llvm\./d' "$1"; }
+strip_md() { sed -E 's/, ![a-zA-Z.]+ ![0-9]+//g; /^![^ ]+ = /d' "$1"; }
 
 echo "== clang: $NEW"
 echo "== assertion mode: $("$(dirname "$NEW")/llvm-config" --assertion-mode 2>/dev/null || echo unknown)"
@@ -88,7 +95,7 @@ fi
 
 # ---------------------------------------------------------------------------
 echo; echo "### 1. base rows carry their own stamp (idx == uuIdx, mixed == 0)"
-compile base_stamped "$NEW" "$UU -mllvm -uu-opt-loop-idx=9999"      # all loops skipped, stamp only
+compile base_stamped "$NEW" "$UU -mllvm -uu-opt-loop-idx=9999 $STAMP"      # all loops skipped, stamp only
 if [ $rc -ne 0 ]; then fail "stamp-only compile rc=$rc"; else
   bad=$(rows "$OUT/base_stamped.csv" | awk -F';' '$1 != $30 || $31 != 0 {print $1":"$30":"$31}')
   [ -z "$bad" ] && pass "every base row: uuIdx == loopIdx, mixed == 0" || fail "rows with uuIdx != loopIdx or mixed: $bad"
@@ -101,23 +108,44 @@ fi
 
 # ---------------------------------------------------------------------------
 echo; echo "### 2. inertness: the stamp changes no code (structural rows and PTX identical with stamps on/off)"
-compile base_nostamp "$NEW" "$UU -mllvm -uu-opt-loop-idx=9999 -mllvm -uu-stamp-loops=0"
-if cmp -s <(rows "$OUT/base_stamped.csv" | cut -d';' -f1-29) <(rows "$OUT/base_nostamp.csv" | cut -d';' -f1-29); then
-  pass "structural columns identical with stamps on vs off"; else fail "structural columns differ with stamps on vs off"; fi
-emit_ptx ptx_on  "$NEW" "$UU -mllvm -uu-opt-loop-idx=9999"
-emit_ptx ptx_off "$NEW" "$UU -mllvm -uu-opt-loop-idx=9999 -mllvm -uu-stamp-loops=0"
-if cmp -s "$OUT/ptx_on.ptx" "$OUT/ptx_off.ptx"; then pass "PTX byte-identical with stamps on vs off (no transform)"; else fail "PTX differs with stamps on vs off"; fi
-emit_ptx ptx_on_B  "$NEW" "$UU -mllvm -uu-opt-loop-idx=$IN,$OUT_IDX -mllvm -uu-opt-loop-unmerge=1,0 -mllvm -uu-opt-loop-unrollfactors=2,3"
-emit_ptx ptx_off_B "$NEW" "$UU -mllvm -uu-opt-loop-idx=$IN,$OUT_IDX -mllvm -uu-opt-loop-unmerge=1,0 -mllvm -uu-opt-loop-unrollfactors=2,3 -mllvm -uu-stamp-loops=0"
-if cmp -s "$OUT/ptx_on_B.ptx" "$OUT/ptx_off_B.ptx"; then pass "PTX byte-identical with stamps on vs off (B: inner unmerge x2, outer unroll x3)"; else fail "PTX differs with stamps on vs off under transform B"; fi
+compile base_nostamp "$NEW" "$UU -mllvm -uu-opt-loop-idx=9999"
+# every column except uuIdx/uuIdxMixed: structural features AND the embedding
+# blocks must be identical, i.e. a stamped re-extraction compile yields the same
+# feature vectors as an unstamped one (LoopCount runs right after the stamp,
+# before any other pass can react to it).
+if cmp -s <(rows "$OUT/base_stamped.csv" | cut -d';' -f1-29,32-) <(rows "$OUT/base_nostamp.csv" | cut -d';' -f1-29,32-); then
+  pass "all feature columns (structural + embeddings) identical with stamps on vs off"; else fail "feature columns differ with stamps on vs off"; fi
+# Diagnostic for a PTX difference: is it already in the final IR (a middle-end
+# decision reacting to the metadata) or only in the backend output?  Writes the
+# diffs next to the PTX and prints their sizes and first lines.
+diag_ptx() {   # label  flags
+  local label=$1 flags=$2
+  diff "$OUT/ptx_on$label.ptx" "$OUT/ptx_off$label.ptx" >"$OUT/ptx$label.diff"
+  emit_ll "ll_on$label"  "$NEW" "$flags $STAMP"
+  emit_ll "ll_off$label" "$NEW" "$flags"
+  diff <(strip_md "$OUT/ll_on$label.final.ll") <(strip_md "$OUT/ll_off$label.final.ll") >"$OUT/ll$label.diff"
+  echo "      PTX diff: $(wc -l <"$OUT/ptx$label.diff") lines; final IR (metadata stripped) diff: $(wc -l <"$OUT/ll$label.diff") lines"
+  echo "      --- first PTX diff lines ($OUT/ptx$label.diff):"; head -24 "$OUT/ptx$label.diff" | sed 's/^/      /'
+  echo "      --- first IR diff lines ($OUT/ll$label.diff):";  head -24 "$OUT/ll$label.diff"  | sed 's/^/      /'
+}
+F0="$UU -mllvm -uu-opt-loop-idx=9999"
+FB="$UU -mllvm -uu-opt-loop-idx=$IN,$OUT_IDX -mllvm -uu-opt-loop-unmerge=1,0 -mllvm -uu-opt-loop-unrollfactors=2,3"
+emit_ptx ptx_on  "$NEW" "$F0 $STAMP"
+emit_ptx ptx_off "$NEW" "$F0"
+if cmp -s "$OUT/ptx_on.ptx" "$OUT/ptx_off.ptx"; then pass "PTX byte-identical with stamps on vs off (no transform)"
+else fail "PTX differs with stamps on vs off (no transform) — stamps stay opt-in; diagnostic:"; diag_ptx "" "$F0"; fi
+emit_ptx ptx_on_B  "$NEW" "$FB $STAMP"
+emit_ptx ptx_off_B "$NEW" "$FB"
+if cmp -s "$OUT/ptx_on_B.ptx" "$OUT/ptx_off_B.ptx"; then pass "PTX byte-identical with stamps on vs off (B: inner unmerge x2, outer unroll x3)"
+else fail "PTX differs with stamps on vs off under transform B — diagnostic:"; diag_ptx "_B" "$FB"; fi
 
 # ---------------------------------------------------------------------------
-echo; echo "### 3. regression: single-action compiles unchanged by the cycle-cut change (stamps off vs pre-change reference IR)"
+echo; echo "### 3. regression: single-action compiles unchanged by the cycle-cut change (production config vs pre-change reference IR)"
 if [ -s "$OUT/old_P1.ll" ]; then
   for spec in $REG_SPECS; do
     IFS=: read -r name idx u f <<<"$spec"
     if [ ! -s "$OUT/old_$name.ll" ]; then fail "$name: reference $OUT/old_$name.ll missing (pre mode did not produce it)"; continue; fi
-    emit_ir "new_$name" "$NEW" "$UU -mllvm -uu-opt-loop-idx=$idx -mllvm -uu-opt-loop-unmerge=$u -mllvm -uu-opt-loop-unrollfactors=$f -mllvm -uu-stamp-loops=0"
+    emit_ir "new_$name" "$NEW" "$UU -mllvm -uu-opt-loop-idx=$idx -mllvm -uu-opt-loop-unmerge=$u -mllvm -uu-opt-loop-unrollfactors=$f"
     if [ $rc -ne 0 ]; then fail "$name: new compile rc=$rc"; continue; fi
     if cmp -s "$OUT/old_$name.ll" "$OUT/new_$name.ll"; then pass "$name: IR byte-identical to the pre-change reference"
     elif cmp -s <(strip_md "$OUT/old_$name.ll") <(strip_md "$OUT/new_$name.ll"); then pass "$name: IR identical modulo metadata numbering"
@@ -156,7 +184,7 @@ if [ ! -x "$OPT" ]; then
 else
   for spec in "C1:1,1:1,1" "C2:1,1:2,1" "B:1,0:2,3" "D1:0,1:2,1"; do
     IFS=: read -r name um fa <<<"$spec"
-    emit_ir "v_$name" "$NEW" "$UU -mllvm -uu-opt-loop-idx=$IN,$OUT_IDX -mllvm -uu-opt-loop-unmerge=$um -mllvm -uu-opt-loop-unrollfactors=$fa"
+    emit_ir "v_$name" "$NEW" "$UU -mllvm -uu-opt-loop-idx=$IN,$OUT_IDX -mllvm -uu-opt-loop-unmerge=$um -mllvm -uu-opt-loop-unrollfactors=$fa $STAMP"
     if [ $rc -ne 0 ]; then fail "$name: emit-ir compile rc=$rc"; continue; fi
     if "$OPT" -passes=verify -disable-output "$OUT/v_$name.ll" 2>"$OUT/v_$name.verify"; then pass "$name: opt -passes=verify clean"
     else fail "$name: verifier errors — see $OUT/v_$name.verify"; fi
@@ -173,7 +201,7 @@ echo; echo "### 6. persistence: every clone reports its pre-transform index, no 
 OTHERS_EXPECTED="0 1 2 3 4 8 9 10 11 "
 check_persist() {   # name  flags  expect_count_of_5  expect_count_of_6  expect_count_of_7
   local name=$1 flags=$2 e5=$3 e6=$4 e7=$5
-  compile "$name" "$NEW" "$flags"
+  compile "$name" "$NEW" "$flags $STAMP"
   if [ $rc -ne 0 ]; then fail "$name: rc=$rc"; return; fi
   local neg mixed c5 c6 c7 others
   neg=$(rows "$OUT/$name.csv"   | awk -F';' '$30 == -1' | wc -l)
@@ -201,9 +229,11 @@ rm -f multimat_F
 make multimat_F CC="clang++" CFLAGS="-I$CUDA_HOME/include $UU -mllvm -uu-opt-loop-idx=$IN,$OUT_IDX -mllvm -uu-opt-loop-unmerge=1,1 -mllvm -uu-opt-loop-unrollfactors=2,1 -std=c++17 -Wall -O3 --cuda-gpu-arch=$ARCH" LDFLAGS="-L$CUDA_HOME/lib64 -lcudart -lcuda" >"$OUT/C2.build" 2>&1
 if [ $? -ne 0 ]; then fail "C2 full build failed — see $OUT/C2.build"; else
   ./multimat_F 2000 2000 0.3 0.05 0.05 >"$OUT/C2.run" 2>&1
+  # multimat_F runs exactly one result check (compact representation; the full-matrix
+  # check lives in full_matrix_material_centric, which multimat.cu does not call).
   npass=$(grep -c 'All tests passed' "$OUT/C2.run"); nbad=$(grep -c 'not equal' "$OUT/C2.run")
-  if [ "$npass" -eq 2 ] && [ "$nbad" -eq 0 ]; then pass "C2 binary: 'All tests passed!' x2, no mismatches"
-  else fail "C2 binary: passed=$npass mismatches=$nbad — see $OUT/C2.run"; fi
+  if [ "$npass" -eq 1 ] && [ "$nbad" -eq 0 ]; then pass "C2 binary: 'All tests passed!', no mismatches"
+  else fail "C2 binary: passed=$npass (expected 1) mismatches=$nbad — see $OUT/C2.run"; fi
 fi
 rm -f multimat_F
 

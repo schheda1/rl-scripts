@@ -546,9 +546,12 @@ LOOPCOUNT_COLUMNS = [
     "containsCall", "numExits",
     # metadata columns — not ML features, used for per-kernel measurement
     "isKernelFunction", "kernelParents",
-    # Pre-transform loop identity stamped by the UU pass (uu-stamp-loops) and
-    # read back by LoopCount: -1 in plain --enable-loopcount compiles (nothing
-    # stamped); after a transform every clone of loop k reports uuIdx == k, so
+    # Pre-transform loop identity stamped by the UU pass and read back by
+    # LoopCount.  Stamping is OPT-IN (-mllvm -uu-stamp-loops=1): it is metadata
+    # only, but it was observed to perturb the final PTX, so it must never be on
+    # in a compile whose binary is measured — only in post-transform feature
+    # re-extraction compiles, which are never executed.  -1 when unstamped.
+    # After a transform every clone of loop k reports uuIdx == k, so
     # post-transform rows are matched by this, never by row position (which
     # shifts whenever a factor >= 2 clones a subtree).  uuIdxMixed == 1 flags a
     # loop whose own blocks carry different stamps — treat as unknown identity.
