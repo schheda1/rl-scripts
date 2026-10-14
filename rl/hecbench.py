@@ -546,6 +546,13 @@ LOOPCOUNT_COLUMNS = [
     "containsCall", "numExits",
     # metadata columns — not ML features, used for per-kernel measurement
     "isKernelFunction", "kernelParents",
+    # Pre-transform loop identity stamped by the UU pass (uu-stamp-loops) and
+    # read back by LoopCount: -1 in plain --enable-loopcount compiles (nothing
+    # stamped); after a transform every clone of loop k reports uuIdx == k, so
+    # post-transform rows are matched by this, never by row position (which
+    # shifts whenever a factor >= 2 clones a subtree).  uuIdxMixed == 1 flags a
+    # loop whose own blocks carry different stamps — treat as unknown identity.
+    "uuIdx", "uuIdxMixed",
     # IR2Vec embedding columns — appended at the END (LLVM emits them last).
     *_EMB_COLUMNS,
 ]
