@@ -546,16 +546,20 @@ LOOPCOUNT_COLUMNS = [
     "containsCall", "numExits",
     # metadata columns — not ML features, used for per-kernel measurement
     "isKernelFunction", "kernelParents",
-    # Pre-transform loop identity stamped by the UU pass and read back by
-    # LoopCount.  Stamping is OPT-IN (-mllvm -uu-stamp-loops=1): it is metadata
-    # only, but it was observed to perturb the final PTX, so it must never be on
-    # in a compile whose binary is measured — only in post-transform feature
-    # re-extraction compiles, which are never executed.  -1 when unstamped.
-    # After a transform every clone of loop k reports uuIdx == k, so
-    # post-transform rows are matched by this, never by row position (which
-    # shifts whenever a factor >= 2 clones a subtree).  uuIdxMixed == 1 flags a
-    # loop whose own blocks carry different stamps — treat as unknown identity.
-    "uuIdx", "uuIdxMixed",
+    # Pre-transform loop identity stamped by the UU pass as a "uu.loop.idx"
+    # option in the loop ID (!llvm.loop on the latch, LangRef placement) and
+    # read back by LoopCount.  Stamping is OPT-IN (-mllvm -uu-stamp-loops=1):
+    # loop metadata changes codegen (SimplifyCFG will not fold an empty block
+    # whose branch and a predecessor's terminator both carry !llvm.loop), so it
+    # must never be on in a compile whose binary is measured — only in
+    # post-transform feature re-extraction compiles, which are never executed.
+    # LoopCount runs right after the UU pass, so the features it reads are
+    # identical either way (verified: all feature columns byte-identical with
+    # and without the stamp).  -1 when unstamped.  After a transform every
+    # clone of loop k reports uuIdx == k, so post-transform rows are matched by
+    # this, never by row position (which shifts whenever a factor >= 2 clones
+    # a subtree).
+    "uuIdx",
     # IR2Vec embedding columns — appended at the END (LLVM emits them last).
     *_EMB_COLUMNS,
 ]

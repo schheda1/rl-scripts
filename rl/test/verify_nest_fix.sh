@@ -3,8 +3,9 @@
 #   (1) the dominator-tree cycle cut in unmerge's DFS (UnrollAndUnmerge.cpp,
 #       dfsAndDuplicate / unmerge), which fixes the non-terminating compile when
 #       unmerging above an unmerged loop that had children;
-#   (2) the pre-transform identity stamp (-uu-stamp-loops, OPT-IN, default off)
-#       read back by LoopCount as the uuIdx / uuIdxMixed columns.
+#   (2) the pre-transform identity stamp (-uu-stamp-loops, OPT-IN, default off:
+#       it changes codegen through SimplifyCFG's empty-block rule, see section 2)
+#       read back by LoopCount as the uuIdx column.
 #
 # Runs on the CUDA dev box against multimaterial-cuda/compact.cu (-DFUSED), the
 # nest idx 7 > 6 > 5 used for the original experiments.  Compile-only except the
@@ -45,9 +46,9 @@ fail() { echo "FAIL  $*"; fails=$((fails + 1)); }
 
 # Columns after stripping "LOOPCOUNT::" (1-based): 1 loopIdx, 2 depth, 9 function,
 # 10 numPaths, 12 loopSize, 18 containsChildLoops, 22 nBB, 28 isKernelFunction,
-# 29 kernelParents, 30 uuIdx, 31 uuIdxMixed.
+# 29 kernelParents, 30 uuIdx; embedding blocks follow from 31.
 rows() { grep '^LOOPCOUNT::[0-9]' "$1" | sed 's/^LOOPCOUNT:://'; }
-show() { rows "$1" | awk -F';' '{printf "  idx=%-2s depth=%s child=%s numPaths=%-3s loopSize=%-5s nBB=%-3s uu=%s/%s\n",$1,$2,$18,$10,$12,$22,$30,$31}'; }
+show() { rows "$1" | awk -F';' '{printf "  idx=%-2s depth=%s child=%s numPaths=%-3s loopSize=%-5s nBB=%-3s uu=%s\n",$1,$2,$18,$10,$12,$22,$30}'; }
 
 # compile NAME  CLANG  "<extra flags>"   -> $OUT/NAME.csv (stderr), rc in $rc
 compile() {
@@ -94,11 +95,11 @@ if [ "${1:-}" = pre ]; then
 fi
 
 # ---------------------------------------------------------------------------
-echo; echo "### 1. base rows carry their own stamp (idx == uuIdx, mixed == 0)"
+echo; echo "### 1. base rows carry their own stamp (idx == uuIdx)"
 compile base_stamped "$NEW" "$UU -mllvm -uu-opt-loop-idx=9999 $STAMP"      # all loops skipped, stamp only
 if [ $rc -ne 0 ]; then fail "stamp-only compile rc=$rc"; else
-  bad=$(rows "$OUT/base_stamped.csv" | awk -F';' '$1 != $30 || $31 != 0 {print $1":"$30":"$31}')
-  [ -z "$bad" ] && pass "every base row: uuIdx == loopIdx, mixed == 0" || fail "rows with uuIdx != loopIdx or mixed: $bad"
+  bad=$(rows "$OUT/base_stamped.csv" | awk -F';' '$1 != $30 {print $1":"$30}')
+  [ -z "$bad" ] && pass "every base row: uuIdx == loopIdx" || fail "rows with uuIdx != loopIdx: $bad"
 fi
 compile base_plain "$NEW" ""                                          # no --enable-uu: nothing stamped
 if [ $rc -ne 0 ]; then fail "plain loopcount compile rc=$rc"; else
@@ -107,37 +108,38 @@ if [ $rc -ne 0 ]; then fail "plain loopcount compile rc=$rc"; else
 fi
 
 # ---------------------------------------------------------------------------
-echo; echo "### 2. inertness: the stamp changes no code (structural rows and PTX identical with stamps on/off)"
+echo; echo "### 2. inertness: the stamp leaves every feature column unchanged (the check that matters); PTX is reported, not judged"
 compile base_nostamp "$NEW" "$UU -mllvm -uu-opt-loop-idx=9999"
-# every column except uuIdx/uuIdxMixed: structural features AND the embedding
-# blocks must be identical, i.e. a stamped re-extraction compile yields the same
-# feature vectors as an unstamped one (LoopCount runs right after the stamp,
-# before any other pass can react to it).
-if cmp -s <(rows "$OUT/base_stamped.csv" | cut -d';' -f1-29,32-) <(rows "$OUT/base_nostamp.csv" | cut -d';' -f1-29,32-); then
+# every column except uuIdx: structural features AND the embedding blocks must
+# be identical, i.e. a stamped re-extraction compile yields the same feature
+# vectors as an unstamped one (LoopCount runs right after the stamp, before any
+# other pass can react to it).
+if cmp -s <(rows "$OUT/base_stamped.csv" | cut -d';' -f1-29,31-) <(rows "$OUT/base_nostamp.csv" | cut -d';' -f1-29,31-); then
   pass "all feature columns (structural + embeddings) identical with stamps on vs off"; else fail "feature columns differ with stamps on vs off"; fi
-# Diagnostic for a PTX difference: is it already in the final IR (a middle-end
-# decision reacting to the metadata) or only in the backend output?  Writes the
-# diffs next to the PTX and prints their sizes and first lines.
-diag_ptx() {   # label  flags
+# The stamp is KNOWN not to be inert for codegen: SimplifyCFG refuses to fold an
+# empty block whose branch and a predecessor's terminator both carry !llvm.loop
+# (Local.cpp, TryToSimplifyUncondBranchFromEmptyBlock), which stamping every
+# terminator triggers throughout a loop body; LoopRotate then sees a different
+# CFG (visible as for.body.lr.ph vs for.body.preheader block names).  That is
+# why -uu-stamp-loops is opt-in and never used in a measured compile.  The PTX
+# comparison below is therefore informational: it reports the diff sizes and
+# whether the final IR already differs, but does not fail the run.
+report_ptx() {   # label  flags
   local label=$1 flags=$2
   diff "$OUT/ptx_on$label.ptx" "$OUT/ptx_off$label.ptx" >"$OUT/ptx$label.diff"
   emit_ll "ll_on$label"  "$NEW" "$flags $STAMP"
   emit_ll "ll_off$label" "$NEW" "$flags"
   diff <(strip_md "$OUT/ll_on$label.final.ll") <(strip_md "$OUT/ll_off$label.final.ll") >"$OUT/ll$label.diff"
-  echo "      PTX diff: $(wc -l <"$OUT/ptx$label.diff") lines; final IR (metadata stripped) diff: $(wc -l <"$OUT/ll$label.diff") lines"
-  echo "      --- first PTX diff lines ($OUT/ptx$label.diff):"; head -24 "$OUT/ptx$label.diff" | sed 's/^/      /'
-  echo "      --- first IR diff lines ($OUT/ll$label.diff):";  head -24 "$OUT/ll$label.diff"  | sed 's/^/      /'
+  echo "INFO  stamped vs unstamped${label:+ (B)}: PTX diff $(wc -l <"$OUT/ptx$label.diff") lines, final IR (metadata stripped) diff $(wc -l <"$OUT/ll$label.diff") lines — expected (SimplifyCFG empty-block rule); files in $OUT"
 }
 F0="$UU -mllvm -uu-opt-loop-idx=9999"
 FB="$UU -mllvm -uu-opt-loop-idx=$IN,$OUT_IDX -mllvm -uu-opt-loop-unmerge=1,0 -mllvm -uu-opt-loop-unrollfactors=2,3"
 emit_ptx ptx_on  "$NEW" "$F0 $STAMP"
 emit_ptx ptx_off "$NEW" "$F0"
-if cmp -s "$OUT/ptx_on.ptx" "$OUT/ptx_off.ptx"; then pass "PTX byte-identical with stamps on vs off (no transform)"
-else fail "PTX differs with stamps on vs off (no transform) — stamps stay opt-in; diagnostic:"; diag_ptx "" "$F0"; fi
+if cmp -s "$OUT/ptx_on.ptx" "$OUT/ptx_off.ptx"; then echo "INFO  PTX byte-identical with stamps on vs off (no transform)"; else report_ptx "" "$F0"; fi
 emit_ptx ptx_on_B  "$NEW" "$FB $STAMP"
 emit_ptx ptx_off_B "$NEW" "$FB"
-if cmp -s "$OUT/ptx_on_B.ptx" "$OUT/ptx_off_B.ptx"; then pass "PTX byte-identical with stamps on vs off (B: inner unmerge x2, outer unroll x3)"
-else fail "PTX differs with stamps on vs off under transform B — diagnostic:"; diag_ptx "_B" "$FB"; fi
+if cmp -s "$OUT/ptx_on_B.ptx" "$OUT/ptx_off_B.ptx"; then echo "INFO  PTX byte-identical with stamps on vs off (B)"; else report_ptx "_B" "$FB"; fi
 
 # ---------------------------------------------------------------------------
 echo; echo "### 3. regression: single-action compiles unchanged by the cycle-cut change (production config vs pre-change reference IR)"
@@ -192,7 +194,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo; echo "### 6. persistence: every clone reports its pre-transform index, no -1, no mixed"
+echo; echo "### 6. persistence: every clone reports its pre-transform index, no -1"
 # Inside the nest every row must carry 5, 6 or 7 with the clone counts observed
 # before the change.  Every other loop of the file must appear exactly once with
 # its PRE-transform index as its stamp — their loopIdx shifts when the nest grows
@@ -203,17 +205,16 @@ check_persist() {   # name  flags  expect_count_of_5  expect_count_of_6  expect_
   local name=$1 flags=$2 e5=$3 e6=$4 e7=$5
   compile "$name" "$NEW" "$flags $STAMP"
   if [ $rc -ne 0 ]; then fail "$name: rc=$rc"; return; fi
-  local neg mixed c5 c6 c7 others
+  local neg c5 c6 c7 others
   neg=$(rows "$OUT/$name.csv"   | awk -F';' '$30 == -1' | wc -l)
-  mixed=$(rows "$OUT/$name.csv" | awk -F';' '$31 != 0'  | wc -l)
   c5=$(rows "$OUT/$name.csv"    | awk -F';' '$30 == 5'  | wc -l)
   c6=$(rows "$OUT/$name.csv"    | awk -F';' '$30 == 6'  | wc -l)
   c7=$(rows "$OUT/$name.csv"    | awk -F';' '$30 == 7'  | wc -l)
   others=$(rows "$OUT/$name.csv" | awk -F';' '$30 != 5 && $30 != 6 && $30 != 7 {print $30}' | sort -n | tr '\n' ' ')
-  if [ "$neg" -eq 0 ] && [ "$mixed" -eq 0 ] && [ "$c5" -eq "$e5" ] && [ "$c6" -eq "$e6" ] && [ "$c7" -eq "$e7" ] && [ "$others" = "$OTHERS_EXPECTED" ]; then
-    pass "$name: uuIdx counts 5x$c5 6x$c6 7x$c7, no -1, no mixed, other loops' stamps = {$OTHERS_EXPECTED}"
+  if [ "$neg" -eq 0 ] && [ "$c5" -eq "$e5" ] && [ "$c6" -eq "$e6" ] && [ "$c7" -eq "$e7" ] && [ "$others" = "$OTHERS_EXPECTED" ]; then
+    pass "$name: uuIdx counts 5x$c5 6x$c6 7x$c7, no -1, other loops' stamps = {$OTHERS_EXPECTED}"
   else
-    fail "$name: uuIdx counts 5x$c5 6x$c6 7x$c7 (expected $e5/$e6/$e7), -1 rows=$neg, mixed rows=$mixed, other stamps='$others' (expected '$OTHERS_EXPECTED')"
+    fail "$name: uuIdx counts 5x$c5 6x$c6 7x$c7 (expected $e5/$e6/$e7), -1 rows=$neg, other stamps='$others' (expected '$OTHERS_EXPECTED')"
     show "$OUT/$name.csv"
   fi
 }
