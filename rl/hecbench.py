@@ -218,6 +218,7 @@ def _build_extra_cflags(
     unmerge_flags: Optional[list[int]] = None,
     unroll_factors: Optional[list[int]] = None,
     global_unroll_factor: Optional[int] = None,
+    stamp_loops: bool = False,
 ) -> str:
     parts: list[str] = []
 
@@ -241,6 +242,15 @@ def _build_extra_cflags(
         parts.extend(EXTRA_LOOPCOUNT_FLAGS)
     if enable_uu:
         parts.append("-mllvm --enable-uu")
+        if stamp_loops:
+            # Pre-transform identity stamp, read back by LoopCount as the uuIdx
+            # column.  OPT-IN and ONLY for feature re-extraction compiles: loop
+            # metadata changes codegen (SimplifyCFG keeps an empty block whose
+            # branch and predecessor both carry !llvm.loop), so a binary that
+            # gets measured must never carry it.  The features are unaffected —
+            # LoopCount runs right after the UU pass — verified byte-identical
+            # with and without the stamp (test/verify_nest_fix.sh, section 2).
+            parts.append("-mllvm -uu-stamp-loops=1")
     if filename:
         parts.append(f"-mllvm -uu-match-filename={filename}")
     if triple:
@@ -496,18 +506,70 @@ def compile_multi_loop(
     triple: str,
     arch: str = ARCH,
 ) -> bool:
-    """Simultaneous mode: apply all loop decisions at once. Used for deployment."""
-    indices = sorted(loop_actions)
-    cflags = _build_extra_cflags(
-        enable_uu=True,
-        filename=filename,
-        triple=triple,
-        loop_indices=indices,
-        unmerge_flags=[loop_actions[i][0] for i in indices],
-        unroll_factors=[loop_actions[i][1] for i in indices],
-    )
-    result = _make(benchmark_dir, extra_cflags=cflags, arch=arch)
-    return result.returncode == 0
+    """Simultaneous mode: apply all loop decisions at once. Used for deployment.
+
+    Thin wrapper over compile_trajectory_ex (the shared primitive); kept for
+    its existing bool contract.
+    """
+    ok, _ = compile_trajectory_ex(benchmark_dir, loop_actions, filename, triple,
+                                  arch=arch)
+    return ok
+
+
+def compile_trajectory_ex(
+    benchmark_dir: Path,
+    loop_actions: dict[int, tuple[int, int]],
+    filename: str,
+    triple: str,
+    arch: str = ARCH,
+    timeout: int = 300,
+) -> tuple[bool, str]:
+    """
+    Compile with every (loop_idx -> (unmerge, factor)) decision applied in ONE
+    pass invocation and return (ok, error_signature), like compile_single_loop_ex.
+
+    This is the trajectory primitive shared by the collectors, the training
+    environment, the deployment evaluator and the offline analysis: one compile
+    path for all of them, so their numbers are comparable (MIRROR discipline).
+
+    The pass applies the actions innermost-first on a pre-transform snapshot of
+    the loops, so an outer loop's action operates on the already-transformed
+    inner loop.  The positional option lists are built in ascending loop_idx
+    order, which is that order.
+
+    No-op entries ((unmerge, factor) == (0, 1)) are dropped — the pass would do
+    nothing for them — and a trajectory with nothing left is compiled as the
+    BASELINE (no UU flags at all).  That matters: `--enable-uu` with an EMPTY
+    -uu-opt-loop-idx list makes the pass unmerge EVERY loop (getLoopDispatch's
+    last branch), so an empty index list must never reach the compiler with UU
+    enabled.  Callers normally short-circuit an all-no-op trajectory before
+    getting here (reward exactly 0.0, never compiled, never stored — the
+    single-loop cache's NOOP convention); this fallback exists for the
+    deployment evaluator, which needs the baseline binary when the policy
+    chose no-op everywhere.
+
+    *timeout* caps the compile.  A hit raises subprocess.TimeoutExpired for the
+    caller to translate into the compile_timeout penalty, exactly as
+    compile_single_loop_ex does.
+    """
+    actions = {int(i): (int(u), int(f)) for i, (u, f) in loop_actions.items()
+               if (int(u), int(f)) != (0, 1)}
+    indices = sorted(actions)
+    if indices:
+        cflags = _build_extra_cflags(
+            enable_uu=True,
+            filename=filename,
+            triple=triple,
+            loop_indices=indices,
+            unmerge_flags=[actions[i][0] for i in indices],
+            unroll_factors=[actions[i][1] for i in indices],
+        )
+    else:
+        cflags = ""   # baseline: see the docstring
+    result = _make(benchmark_dir, extra_cflags=cflags, arch=arch, timeout=timeout)
+    if result.returncode == 0:
+        return True, ""
+    return False, extract_error_signature(result.stderr)
 
 
 # ---------------------------------------------------------------------------
