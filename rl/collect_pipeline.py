@@ -957,6 +957,12 @@ def main() -> int:
             continue
         t = msg.get("type")
         if t in ("cell", "compile_failed", "compile_timeout", "measure_failed"):
+            if ro:
+                # Validation has no cache write, so the per-cell value is only
+                # visible here; print it so it can be compared against the
+                # real run's reward_cache.json by key.
+                log.info("READ-ONLY %-16s %-40s reward=%s", t, msg.get("key"),
+                         "n/a" if t == "measure_failed" else f"{msg['reward']:+.4f}")
             if t != "measure_failed":                 # measure_failed is NOT cached
                 rewards[msg["key"]] = msg["reward"]
                 if t in ("compile_failed", "compile_timeout"):
