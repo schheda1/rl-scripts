@@ -1005,7 +1005,10 @@ def main() -> int:
     left = missing_cells(assignments, rewards,
                          None if args.no_post_features else postf)
     n_left = sum(len(v) for v in left.values())
-    if n_left:
+    if n_left and args.limit and args.limit > 0:
+        log.info("%d cells not attempted (--limit %d) — expected for a validation sample",
+                 n_left, args.limit)
+    elif n_left:
         log.warning("%d cells still missing (measure_failed / crashed) — re-run to retry",
                     n_left)
     return 0
