@@ -28,11 +28,21 @@ location).  exec deletes the bundle right after its 20 runs; parse deletes the r
 Bounded queues (Q12, Q23) bound shm/tmp and provide backpressure.  Memory monitor logs
 per-queue depth + shm/tmp footprint + system RAM at --mem-log-interval to a JSONL file.
 
-INVARIANTS (must match collect_cells / the existing cache): 20 cold `nsys profile` runs;
-`nsys profile --trace=cuda --sample=none --cpuctxsw=none`; reward =
-clip_-1((baseline_ms - median(sum_kernel_times))/max(baseline_ms,1e-9)) then deadzone;
-compile_failed/timeout → cached penalty; measure_failed → NOT cached (retried).  --n-runs
-REQUIRED and must match the run.  Pin the nsys version across the whole collection.
+INVARIANTS (must match collect_cells / the existing cache): n_runs cold profiled runs per
+cell with the SAME profiler command the single-cell measurement uses (hecbench's
+_profile_once_nsys / _profile_once_rocprof — see exec_command):
+  NVIDIA  `nsys profile --trace=cuda --sample=none --cpuctxsw=none` per run (exec, GPU),
+          then `nsys stats --report=cuda_gpu_kern_sum` per report (parse, CPU);
+  AMD     legacy `rocprof --stats -d <dir> -o <dir>/r.csv` per run (exec, GPU) — rocprof
+          writes the pre-aggregated <dir>/r.stats.csv itself, so parse is a file read.
+reward = clip_-1((baseline_ms - median(sum_kernel_times))/max(baseline_ms,1e-9)) then
+deadzone; compile_failed/timeout → cached penalty; measure_failed → NOT cached (retried).
+--n-runs REQUIRED and must match the run.  Pin the profiler version across a collection.
+
+AMD specifics: the GPU stage pins BOTH CUDA_VISIBLE_DEVICES and HIP_VISIBLE_DEVICES (a HIP
+binary ignores the CUDA variable); bundles are laid out <key>/<bench> so hecbench._make's
+sibling-header symlink for -hip benchmarks fires (store_common.bundle_paths); the target
+is taken from hecbench.IS_HIP, i.e. TARGET_ARCH — --arch must agree with it.
 
 Usage:
   python3 collect_pipeline.py CKPT_DIR --split test --n-runs 20 \\
@@ -70,8 +80,8 @@ log = logging.getLogger("pipeline")
 
 # Shared, stdlib-only leaf (safe for --selftest; no torch): cell key, bundle copy,
 # shm/tmp accounting, and the pre-compiled-store fast path.
-from store_common import (cellkey, structural_copy, dir_bytes, stage_from_store,
-                          is_cell_done, load_manifest, toolchain_stamp,
+from store_common import (cellkey, sanitize, bundle_paths, structural_copy, dir_bytes,
+                          stage_from_store, is_cell_done, load_manifest, toolchain_stamp,
                           benchmark_fingerprint, run_hard_timeout)
 
 _STOP = None                       # queue sentinel (picklable, and no work item is None)
@@ -148,8 +158,26 @@ def resolve_kernel_scope(kernel_parents: list, baseline_cache: dict, bench: str)
     return kernel_filter, baseline_ms
 
 
+def exec_command(is_hip: bool, run_cmd: str, out: str) -> str:
+    """ONE profiled run of a cell — the same command hecbench uses for a single
+    measurement (_profile_once_rocprof / _profile_once_nsys), so the pipeline changes
+    the scheduling, never the measurement.  *out* is an ABSOLUTE per-run path (the
+    profiler resolves it against cwd=bundle): on AMD the directory rocprof writes into
+    (-d) with the csv stem inside it (-o); on NVIDIA the nsys report stem."""
+    if is_hip:
+        return f"rocprof --stats -d {out} -o {out}/r.csv {run_cmd}"
+    return (f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
+            f"--output={out} --force-overwrite=true {run_cmd}")
+
+
+def artifact_for(is_hip: bool, out: str) -> str:
+    """The file parse reads for that run: rocprof's pre-aggregated stats csv (rocprof
+    derives it from -o as <stem>.stats.csv) or the nsys report."""
+    return f"{out}/r.stats.csv" if is_hip else f"{out}.nsys-rep"
+
+
 # ---------------------------------------------------------------------------
-# Stage workers  (each: plain-data queues only; CUDA_VISIBLE_DEVICES set first)
+# Stage workers  (each: plain-data queues only; GPU visibility set first)
 # ---------------------------------------------------------------------------
 
 def compile_worker(rank, work_q, q12, result_q, cfg):
@@ -166,9 +194,11 @@ def compile_worker(rank, work_q, q12, result_q, cfg):
         bench, li = item["benchmark_name"], item["loop_idx"]
         u, f = item["unmerge"], item["factor"]
         key = cellkey(bench, li, u, f)
-        bundle = shm / "bundles" / key.replace("|", "__")
+        # <shm>/bundles/<key>/<bench>: the benchmark's own name innermost, so _make's
+        # -hip sibling-header symlink fires (see store_common.bundle_paths).
+        bundle_root, bundle = bundle_paths(shm / "bundles", sanitize(key), bench)
         try:
-            shutil.rmtree(bundle, ignore_errors=True)
+            shutil.rmtree(bundle_root, ignore_errors=True)
             structural_copy(Path(item["benchmark_path"]), bundle, cfg["copy_threshold"])
             # FAST PATH: drop the pre-built binary (no make) if this cell is in the store;
             # stage_from_store unlinks any existing target first (never writes through a
@@ -178,14 +208,15 @@ def compile_worker(rank, work_q, q12, result_q, cfg):
                 try:
                     ok, err = compile_single_loop_ex(
                         bundle, loop_idx=li, unmerge=u, factor=f,
-                        filename=item["filename"], triple=item["triple"], arch=cfg["arch"])
+                        filename=item["filename"], triple=item["triple"], arch=cfg["arch"],
+                        timeout=cfg["compile_timeout"])
                 except subprocess.TimeoutExpired:
-                    shutil.rmtree(bundle, ignore_errors=True)
+                    shutil.rmtree(bundle_root, ignore_errors=True)
                     result_q.put({"type": "compile_timeout", "key": key, "benchmark": bench,
                                   "reward": cfg["compile_timeout_penalty"]})
                     continue
                 if not ok:
-                    shutil.rmtree(bundle, ignore_errors=True)
+                    shutil.rmtree(bundle_root, ignore_errors=True)
                     result_q.put({"type": "compile_failed", "key": key, "benchmark": bench,
                                   "reward": cfg["compile_failure_penalty"], "error": err})
                     continue
@@ -193,49 +224,65 @@ def compile_worker(rank, work_q, q12, result_q, cfg):
             # bundle now lives in shm until exec deletes it (immutable in between).
             q12.put({"key": key, "benchmark": bench, "loop_idx": li,
                      "unmerge": u, "factor": f, "bundle": str(bundle),
+                     "bundle_root": str(bundle_root),
                      "run_cmd": run_cmd, "kernel_filter": item["kernel_filter"],
                      "baseline_ms": item["baseline_ms"]})
         except Exception as e:
-            shutil.rmtree(bundle, ignore_errors=True)
+            shutil.rmtree(bundle_root, ignore_errors=True)
             lg.warning("compile crashed for %s: %s — treated as measure_failed", key, e)
             result_q.put({"type": "measure_failed", "key": key, "benchmark": bench})
     result_q.put({"type": "compile_done", "rank": rank})
 
 
 def exec_worker(rank, gpu_id, q12, q23, result_q, cfg):
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)   # one nsys profile at a time / GPU
-    tmp = Path(cfg["tmp_root"])
-    my_tmpdir = tmp / f"nsys_tmp_r{rank}"             # per-WORKER TMPDIR (nsys isolation;
-    #                                                  per-rank, not per-gpu, so >1 exec
-    #                                                  per GPU still get separate temp)
+    # One profiled run at a time per GPU.  Pin BOTH runtimes before anything else: a HIP
+    # binary ignores CUDA_VISIBLE_DEVICES, so without the HIP variable every AMD exec
+    # worker lands on GCD 0 and the GCDs contend (MIRROR: hecbench.measure_kernel_time,
+    # collect_cells._collect_worker, train._baseline_worker).
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_id)
+    is_hip = cfg["is_hip"]
+    # Absolute: the profiler's output path (-d/-o or --output) is resolved against
+    # cwd=bundle, while parse reads the artifact from here.
+    tmp = Path(cfg["tmp_root"]).resolve()
+    my_tmpdir = tmp / f"nsys_tmp_r{rank}"             # per-WORKER TMPDIR (profiler scratch
+    #                                                  isolation; per-rank, not per-gpu, so
+    #                                                  >1 exec per GPU still get separate temp)
     my_tmpdir.mkdir(parents=True, exist_ok=True)
     os.environ["TMPDIR"] = str(my_tmpdir)
     env = {**os.environ, "ARCH": cfg["arch"], "CUDA_VISIBLE_DEVICES": str(gpu_id),
-           "TMPDIR": str(my_tmpdir)}
+           "HIP_VISIBLE_DEVICES": str(gpu_id), "TMPDIR": str(my_tmpdir)}
     lg = logging.getLogger(f"exec.g{gpu_id}")
     while True:
         item = q12.get()
         if item is _STOP:
             break
         key, bundle = item["key"], Path(item["bundle"])
-        rep_dir = tmp / "reports" / key.replace("|", "__")
+        rep_dir = tmp / "reports" / sanitize(key)
         rep_dir.mkdir(parents=True, exist_ok=True)
         reports = []
         for k in range(cfg["n_runs"]):
             out = rep_dir / f"run{k}"
-            # HARD timeout that kills nsys + the benchmark (process group), so a slow
-            # run never orphans a ./main that would then contend with the next run on
-            # this GPU and corrupt its timing.  ok=False → no report → run skipped.
+            if is_hip:
+                out.mkdir(parents=True, exist_ok=True)  # rocprof -d dir: results/json/db + stats
+            # HARD timeout that kills the profiler + the benchmark (process group), so a
+            # slow run never orphans a ./main that would then contend with the next run
+            # on this GPU and corrupt its timing.  ok=False → no artifact → run skipped.
             ok, _ = run_hard_timeout(
-                f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
-                f"--output={out} --force-overwrite=true {item['run_cmd']}",
+                exec_command(is_hip, item["run_cmd"], str(out)),
                 cwd=bundle, timeout=cfg["nsys_timeout"], env=env, scope_dir=str(bundle))
             if not ok:
                 continue                               # timed out → killed → skip run
-            rep = Path(f"{out}.nsys-rep")
+            rep = Path(artifact_for(is_hip, str(out)))
+            if not rep.exists() and is_hip:
+                # MIRROR: _profile_once_rocprof's fallback for a version that names the
+                # stats file differently.
+                cands = sorted(out.rglob("*.stats.csv"))
+                if cands:
+                    rep = cands[0]
             if rep.exists():
                 reports.append(str(rep))
-        shutil.rmtree(bundle, ignore_errors=True)      # free shm immediately (last reader)
+        shutil.rmtree(item["bundle_root"], ignore_errors=True)   # free shm (last reader)
         q23.put({"key": key, "benchmark": item["benchmark"], "reports": reports,
                  "report_dir": str(rep_dir), "kernel_filter": item["kernel_filter"],
                  "baseline_ms": item["baseline_ms"]})
@@ -244,7 +291,9 @@ def exec_worker(rank, gpu_id, q12, q23, result_q, cfg):
 
 def parse_worker(rank, q23, result_q, cfg):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""            # CPU-only
-    from hecbench import _parse_nsys_kernel_times, _sum_kernel_times
+    from hecbench import (_parse_nsys_kernel_times, _parse_rocprof_kernel_times,
+                          _sum_kernel_times)
+    is_hip = cfg["is_hip"]
     env = {**os.environ, "ARCH": cfg["arch"]}
     lg = logging.getLogger(f"parse.{rank}")
     while True:
@@ -254,13 +303,19 @@ def parse_worker(rank, q23, result_q, cfg):
         key, kf = item["key"], item["kernel_filter"]
         times = []
         for rep in item["reports"]:
-            # same process-group-kill guard: a hung `nsys stats` would otherwise orphan.
-            ok, out = run_hard_timeout(
-                f"nsys stats --report=cuda_gpu_kern_sum --format=csv {rep}",
-                cwd=".", timeout=30, env=env, capture=True)
-            if not ok:
-                continue
-            t = _sum_kernel_times(_parse_nsys_kernel_times(out), kf)
+            if is_hip:
+                # rocprof already aggregated per kernel at exec time: a file read.
+                # MIRROR: hecbench._profile_once_rocprof → _parse_rocprof_kernel_times.
+                kt = _parse_rocprof_kernel_times(rep)
+            else:
+                # same process-group-kill guard: a hung `nsys stats` would otherwise orphan.
+                ok, out = run_hard_timeout(
+                    f"nsys stats --report=cuda_gpu_kern_sum --format=csv {rep}",
+                    cwd=".", timeout=30, env=env, capture=True)
+                if not ok:
+                    continue
+                kt = _parse_nsys_kernel_times(out)
+            t = _sum_kernel_times(kt, kf)
             if t is not None:
                 times.append(t)
         shutil.rmtree(item["report_dir"], ignore_errors=True)   # free tmp (last reader)
@@ -294,9 +349,9 @@ def postfeat_worker(rank, post_q, result_q, cfg):
         if item is _STOP:
             break
         bench, li = item["benchmark_name"], item["loop_idx"]
-        bundle = shm / "postfeat" / f"{bench}__{li}"
+        bundle_root, bundle = bundle_paths(shm / "postfeat", f"{bench}__{li}", bench)
         try:
-            shutil.rmtree(bundle, ignore_errors=True)
+            shutil.rmtree(bundle_root, ignore_errors=True)
             structural_copy(Path(item["benchmark_path"]), bundle, cfg["copy_threshold"])
             env._benchmark_dir = bundle
             raw = item["pre_features_raw"]
@@ -313,7 +368,7 @@ def postfeat_worker(rank, post_q, result_q, cfg):
         except Exception as e:
             lg.warning("postfeat failed for %s|%d: %s", bench, li, e)
         finally:
-            shutil.rmtree(bundle, ignore_errors=True)
+            shutil.rmtree(bundle_root, ignore_errors=True)
     result_q.put({"type": "postfeat_done", "rank": rank})
 
 
@@ -442,6 +497,28 @@ def _selftest() -> int:
             _time.sleep(2.5)
             chk("hard_timeout cwd-sweep reaps a process reparented out of the tree",
                 not marker.exists())
+    # per-run profiler command/artifact: byte-for-byte what hecbench's single-cell
+    # measurement runs (_profile_once_nsys / _profile_once_rocprof)
+    chk("exec cmd nvidia", exec_command(False, "./main 1", "/t/run0") ==
+        "nsys profile --trace=cuda --sample=none --cpuctxsw=none --output=/t/run0 "
+        "--force-overwrite=true ./main 1")
+    chk("exec cmd amd", exec_command(True, "./main 1", "/t/run0") ==
+        "rocprof --stats -d /t/run0 -o /t/run0/r.csv ./main 1")
+    chk("artifact nvidia", artifact_for(False, "/t/run0") == "/t/run0.nsys-rep")
+    chk("artifact amd", artifact_for(True, "/t/run0") == "/t/run0/r.stats.csv")
+    # bundle layout: benchmark name innermost (the -hip sibling-symlink guard in _make
+    # keys on it), private root per cell, structural_copy lands inside it
+    with tempfile.TemporaryDirectory() as d:
+        root, b = bundle_paths(Path(d) / "bundles", "x-hip__3__1__4", "x-hip")
+        chk("bundle: benchmark name innermost", b.name == "x-hip" and b.parent == root)
+        chk("bundle: root is per-cell", root.name == "x-hip__3__1__4")
+        src = Path(d) / "src"
+        src.mkdir()
+        (src / "Makefile").write_text("all:")
+        structural_copy(src, b, threshold=1024)
+        chk("bundle: structural_copy creates the nested dir", (b / "Makefile").is_file())
+        chk("bundle: sibling symlink slot is inside the root",
+            (root / "x-cuda").parent == root and not (root / "x-cuda").exists())
     # reward math matches collect_cells exactly
     chk("reward speedup", abs(compute_reward(100.0, 80.0, 0.0) - 0.2) < 1e-9)
     chk("reward clip -1", compute_reward(100.0, 500.0, 0.0) == -1.0)
@@ -561,8 +638,14 @@ def parse_args():
     p.add_argument("--compile-failure-penalty", type=float)
     p.add_argument("--reward-deadzone", type=float)
     p.add_argument("--compile-timeout-penalty", type=float, default=-1.0)
-    p.add_argument("--arch", default=None, help="default: auto-detected TARGET_ARCH")
-    p.add_argument("--nsys-timeout", type=int, default=300)
+    p.add_argument("--compile-timeout", type=int, default=300,
+                   help="per-cell compile budget in seconds (default 300); a hit is the "
+                        "compile_timeout penalty.  MIRROR: collect_cells --compile-timeout")
+    p.add_argument("--arch", default=None, help="default: TARGET_ARCH (must agree with it: "
+                                                "hecbench picks the compile driver and the "
+                                                "profiler from TARGET_ARCH at import)")
+    p.add_argument("--nsys-timeout", type=int, default=300,
+                   help="per profiled run (nsys or rocprof) hard timeout, seconds")
     p.add_argument("--hecbench-src", default=None)
     return p.parse_args()
 
@@ -578,10 +661,16 @@ def main() -> int:
     import hashlib
     import torch.multiprocessing as mp
     from collect_cells import valid_cells, missing_cells, save_cache
-    from hecbench import ARCH, HECBENCH_SRC, discover_benchmarks, IR2VEC_VOCAB
+    from hecbench import ARCH, HECBENCH_SRC, IS_HIP, discover_benchmarks, IR2VEC_VOCAB
     from train import precheck_benchmarks, split_benchmarks, build_loop_assignments, measure_baselines
     if args.arch is None:
         args.arch = ARCH
+    # hecbench derives IS_HIP (compile driver, profiler, -hip/-cuda suffix) from
+    # TARGET_ARCH at import; an --arch of the other family would compile one way and
+    # profile the other.  Refuse rather than mix.
+    if str(args.arch).startswith("gfx") != IS_HIP:
+        sys.exit(f"--arch {args.arch} disagrees with TARGET_ARCH={ARCH!r} "
+                 f"(IS_HIP={IS_HIP}); export TARGET_ARCH for the intended target instead")
 
     if not args.no_post_features and (not IR2VEC_VOCAB or not Path(IR2VEC_VOCAB).exists()):
         sys.exit(f"IR2VEC_VOCAB unset/missing ({IR2VEC_VOCAB!r}) but post-features on; "
@@ -618,7 +707,7 @@ def main() -> int:
     if (not args.no_post_features) and n_postfeat == 0:
         log.warning("--postfeat 0 with post-features enabled → post-features NOT extracted")
     if args.n_exec_per_gpu > 1:
-        log.warning("--exec %d (>1 per GPU): multiple concurrent `nsys profile` on ONE GPU "
+        log.warning("--exec %d (>1 per GPU): multiple concurrent profiled runs on ONE GPU "
                     "CORRUPT the timing measurements (GPU contention). Use --exec 1 unless "
                     "the GPUs are genuinely distinct/partitioned.", args.n_exec_per_gpu)
 
@@ -687,9 +776,11 @@ def main() -> int:
     log.info("cells: %d missing of %d valid | postfeat loops: %d | baselines to measure: %d",
              n_missing, sum(len(valid_cells(a["pre_features_raw"])) for a in assignments),
              len(post_items), len(need_bl))
-    log.info("workers: exec=%d compile=%d parse=%d postfeat=%d  (per-GPU %d/%d/%d × %d GPUs)",
+    log.info("workers: exec=%d compile=%d parse=%d postfeat=%d  (per-GPU %d/%d/%d × %d GPUs)"
+             "  target=%s profiler=%s",
              n_exec, n_compile, n_parse, n_postfeat,
-             args.n_exec_per_gpu, args.n_compile_per_gpu, args.n_parse_per_gpu, G)
+             args.n_exec_per_gpu, args.n_compile_per_gpu, args.n_parse_per_gpu, G,
+             args.arch, "rocprof" if IS_HIP else "nsys")
 
     if args.dry_run:
         log.info("dry run — nothing measured.")
@@ -700,10 +791,12 @@ def main() -> int:
 
     if need_bl:
         log.info("measuring %d missing baselines first...", len(need_bl))
+        # MIRROR: collect_cells — the shared baseline path is itself a dynamic queue
+        # over the node's GPUs (one worker per GPU, rank == gpu_id).
         baseline_cache = measure_baselines(
             need_bl, loop_records_map=loop_records_map, arch=args.arch,
             n_runs=args.n_runs, nsys_timeout=args.nsys_timeout,
-            tmp_dir=tmp_root, gpu_id=0, cache_file=bl_file)
+            tmp_dir=tmp_root, gpu_id=0, cache_file=bl_file, num_workers=G)
 
     # Attach scope per LOOP (resolved once, now that baselines exist) and DROP cells
     # whose benchmark still has no baseline — they cannot be scored, so leave them
@@ -725,6 +818,13 @@ def main() -> int:
     work_items = kept
     if dropped:
         log.warning("%d cells skipped — benchmark has no baseline (measure it, re-run)", dropped)
+    # FASTEST-FIRST (MIRROR: collect_cells' queue order): cells of the quickest-running
+    # benchmarks go through the pipeline first, so if the window runs out the slow-kernel
+    # tail is what is left unmeasured.  Stable sort: loop/cell order within a benchmark
+    # is unchanged.  The store-hits-first sort below is also stable, so hits keep this
+    # order among themselves.
+    work_items.sort(key=lambda w: (baseline_cache.get(w["benchmark_name"]) or {})
+                    .get("total_ms", float("inf")))
     n_missing = len(work_items)          # completion target: one terminal result per item
 
     # --- optional --limit: validate a small, benchmark-spread sample (compile/run/parse) ---
@@ -775,6 +875,7 @@ def main() -> int:
         "reward_deadzone": args.reward_deadzone,
         "compile_failure_penalty": args.compile_failure_penalty,
         "compile_timeout_penalty": args.compile_timeout_penalty,
+        "compile_timeout": args.compile_timeout, "is_hip": IS_HIP,
         "shm_root": str(shm_root), "tmp_root": str(tmp_root),
         "copy_threshold": args.copy_threshold,
         "normalizer_state": normalizer.state_dict(),

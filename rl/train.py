@@ -1253,9 +1253,17 @@ def _worker_fn(
     try:
         # ------------------------------------------------------------------
         # GPU assignment: set CUDA_VISIBLE_DEVICES BEFORE any CUDA call so
-        # PyTorch maps device 0 → physical GPU gpu_id in this process.
+        # PyTorch maps device 0 → physical GPU gpu_id in this process.  Pin the
+        # HIP runtime too, so every subprocess this worker spawns inherits the
+        # same device on either target (a HIP binary ignores the CUDA
+        # variable).  The profiled runs themselves are ALSO pinned explicitly:
+        # measure_kernel_time builds its env with both variables from the
+        # gpu_id the environment passes it — this process-level pin is the
+        # belt-and-braces for anything else (MIRROR: _baseline_worker,
+        # collect_cells).
         # ------------------------------------------------------------------
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_id)
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         # Agent type mirrors main's --agent flag; both classes expose the same

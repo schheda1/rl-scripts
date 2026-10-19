@@ -36,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from store_common import (cellkey, sanitize, structural_copy, is_cell_done, write_cell,
+from store_common import (cellkey, sanitize, bundle_paths, structural_copy, is_cell_done, write_cell,
                           run_target_rel, benchmark_fingerprint, toolchain_stamp,
                           write_manifest, cell_dir)
 
@@ -51,9 +51,11 @@ def build_one(cell: dict, store: str, arch: str, threshold: int, scratch: str) -
     key = cellkey(cell["bench"], cell["li"], cell["u"], cell["f"])
     if is_cell_done(store, key):
         return ("skip", key)
-    bdir = Path(scratch) / sanitize(key)
+    # <scratch>/<key>/<bench>: benchmark name innermost so _make's -hip sibling-header
+    # symlink fires (store_common.bundle_paths); the root is removed with the bundle.
+    broot, bdir = bundle_paths(scratch, sanitize(key), Path(cell["path"]).name)
     try:
-        shutil.rmtree(bdir, ignore_errors=True)
+        shutil.rmtree(broot, ignore_errors=True)
         structural_copy(Path(cell["path"]), bdir, threshold)
         try:
             ok, _err = compile_single_loop_ex(
@@ -76,7 +78,7 @@ def build_one(cell: dict, store: str, arch: str, threshold: int, scratch: str) -
         log.warning("build error %s: %s", key, e)
         return ("error", key)
     finally:
-        shutil.rmtree(bdir, ignore_errors=True)
+        shutil.rmtree(broot, ignore_errors=True)
 
 
 def _select_benchmarks(by_bench: dict, frac: float, max_frac: float,
@@ -138,9 +140,9 @@ def verify_store(store: str, arch: str, threshold: int, scratch: str, n: int, sr
         bpath = next((b for b in benches if b.name == bench), None)
         if bpath is None:
             log.warning("verify %s: benchmark %s not found", key, bench); bad += 1; continue
-        bdir = Path(scratch) / ("verify_" + sanitize(key))
+        broot, bdir = bundle_paths(scratch, "verify_" + sanitize(key), bpath.name)
         try:
-            shutil.rmtree(bdir, ignore_errors=True)
+            shutil.rmtree(broot, ignore_errors=True)
             structural_copy(bpath, bdir, threshold)
             built, _ = compile_single_loop_ex(
                 bdir, loop_idx=int(li), unmerge=int(u), factor=int(f),
@@ -155,7 +157,7 @@ def verify_store(store: str, arch: str, threshold: int, scratch: str, n: int, sr
             else:
                 log.error("verify %s: codegen MISMATCH (stored vs fresh)", key); bad += 1
         finally:
-            shutil.rmtree(bdir, ignore_errors=True)
+            shutil.rmtree(broot, ignore_errors=True)
     log.info("verify: %d match / %d mismatch of %d sampled", ok, bad, len(keys))
     return 0 if bad == 0 else 1
 
@@ -181,11 +183,16 @@ def main() -> int:
     p.add_argument("--verify-n", type=int, default=5)
     args = p.parse_args()
 
-    from hecbench import ARCH, HECBENCH_SRC, discover_benchmarks, IR2VEC_VOCAB
+    from hecbench import ARCH, HECBENCH_SRC, IS_HIP, discover_benchmarks, IR2VEC_VOCAB
     from train import precheck_benchmarks, split_benchmarks, build_loop_assignments
     from collect_cells import missing_cells
     if args.arch is None:
         args.arch = ARCH
+    # hecbench picks the compile driver (CUDA vs HIP) from TARGET_ARCH at import;
+    # --arch only sets the GPU arch flag.  Refuse a mismatch (MIRROR: collect_pipeline).
+    if str(args.arch).startswith("gfx") != IS_HIP:
+        sys.exit(f"--arch {args.arch} disagrees with TARGET_ARCH={ARCH!r} (IS_HIP={IS_HIP}); "
+                 f"export TARGET_ARCH for the intended target")
     scratch = args.scratch or str(args.store / "_build")
     Path(scratch).mkdir(parents=True, exist_ok=True)
     src = Path(args.hecbench_src) if args.hecbench_src else HECBENCH_SRC

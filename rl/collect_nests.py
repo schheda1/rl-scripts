@@ -547,7 +547,10 @@ def main() -> None:
         chain = s["chain"]
         h = heur.get(s["benchmark"], {})
         h_cells = [h[k] for k in chain if k in h and h[k] is not None]
-        h_val = h_cells[0] if h_cells else 0.0        # heuristic fired on <=1 loop per chain
+        # The heuristic fires on at most one loop per chain (it skips every
+        # ancestor of a loop it transforms).  Not firing = no-op = 0.0; no CSV
+        # given = unknown = null, never 0.0.
+        h_val = h_cells[0] if h_cells else (0.0 if heur else None)
         inner_best = s["single_best_per_loop"][str(chain[0])]
         outer_best = max(s["single_best_per_loop"][str(k)] for k in chain[1:])
         rows.append({

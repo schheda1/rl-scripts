@@ -31,6 +31,23 @@ def sanitize(key: str) -> str:
     return key.replace("|", "__")
 
 
+def bundle_paths(root, name: str, bench: str) -> "tuple[Path, Path]":
+    """(bundle_root, bundle) for a per-cell build dir: <root>/<name>/<bench>.
+
+    The extra level is what makes AMD builds work in a bundle: `-hip` Makefiles name
+    the sibling `../<bench>-cuda` directory as a make PREREQUISITE, and hecbench._make
+    creates that sibling as a symlink NEXT TO the directory it builds — guarded on the
+    directory name ending in '-hip'.  A bundle named by cell key never matched, so every
+    non-self-contained -hip benchmark failed to build in the pipeline and the store.
+    With the benchmark's own name as the innermost directory the guard fires, the
+    symlink lands in <bundle_root> (private to this cell: bundles can never collide on
+    it), and removing <bundle_root> removes the symlink with the bundle.  On CUDA the
+    extra level is just a directory.  Callers build/stage/run in `bundle` and always
+    rmtree `bundle_root`."""
+    bundle_root = Path(root) / name
+    return bundle_root, bundle_root / bench
+
+
 def _is_source(path: Path) -> bool:
     """A compilable build input, by extension only (threshold-independent)."""
     return path.suffix.lower() in BUILD_EXTS or path.name == "Makefile"
