@@ -7,7 +7,20 @@ Usage:
                   [--checkpoint-every N]
                   [--resume checkpoints/latest.pt]
                   [--val-ratio 0.15] [--test-ratio 0.15] [--split-seed 42]
-                  [--skip-precheck]
+                  [--skip-precheck] [--num-workers N] [--offline]
+
+Offline replay (--offline):
+  No compile, no profiler, no GPU.  Train / val / test all replay from the
+  pre-collected caches in {checkpoint_dir}: reward_cache.json (required),
+  eligible_benchmarks.json (required: the pre-flight check compiles) and
+  baseline_cache.json (read if present, never measured).  A (loop, action)
+  cell the reward cache does not hold is DROPPED and counted as missed —
+  never built — so every non-no-op sample is a cache hit, and train_missed /
+  val_missed / test missed report the cache's coverage of the policy's
+  choices.  Cached compile-failure cells (the file's migration.failure_keys)
+  replay with the status a live run gave them, so the test report excludes
+  them exactly as a live run does.  Always the worker path (one CPU worker
+  at --num-workers 1).  The caches are never written back.
 
 Startup pre-flight check:
   Before splitting, every discovered benchmark is compiled with LoopCount to
@@ -274,6 +287,24 @@ def parse_args() -> argparse.Namespace:
                    help="Number of parallel GPU workers. Worker k uses GPU k. "
                         "Default 1 = sequential path (unchanged behaviour). "
                         "Requires at least --num-workers GPUs to be visible.")
+    p.add_argument("--offline", action="store_true",
+                   help="Replay ENTIRELY from the pre-collected caches in "
+                        "--checkpoint-dir: no compile, no profiler, no GPU. "
+                        "Requires reward_cache.json and eligible_benchmarks.json "
+                        "there; baseline_cache.json is read if present, never "
+                        "measured. A (loop, action) the reward cache does not "
+                        "hold is DROPPED and counted as missed, never built; a "
+                        "missing post-unmerge vector falls back to the "
+                        "pre-unmerge features (the same fallback the live path "
+                        "takes when extraction fails). Val and test replay from "
+                        "the same cache; --live-val is ignored. Cached "
+                        "compile-failure cells (migration.failure_keys) replay "
+                        "with their live status, so the test report excludes "
+                        "them as a live run would and the failure-rate metrics "
+                        "count them (a live run with a warm cache undercounts). "
+                        "Always runs the worker path, so --num-workers 1 is one "
+                        "CPU worker. Nothing is written back to the caches. "
+                        "(default: off)")
     return p.parse_args()
 
 
@@ -626,6 +657,38 @@ def _baseline_worker(rank, gpu_id, work_q, hp, result_q):
                       "error": _tb.format_exc()})
     finally:
         result_q.put({"type": "worker_done", "rank": rank})
+
+
+def load_baseline_cache(cache_file: Path, arch: str, n_runs: int) -> dict[str, dict]:
+    """
+    READ-ONLY counterpart of measure_baselines's loader for --offline: the same
+    arch + n_runs gate (MIRROR: measure_baselines), but a mismatch or a missing
+    file yields an EMPTY dict instead of a measurement.  Offline rewards come
+    from the reward cache, not from baselines, so an empty result is a
+    warning, not an error: the worker only consults baselines on the
+    compile+measure path, which --offline never takes.
+    """
+    cache_file = Path(cache_file)
+    if not cache_file.exists():
+        log.warning("--offline: no baseline cache at %s (not needed for replay)",
+                    cache_file)
+        return {}
+    try:
+        saved = json.loads(cache_file.read_text())
+    except Exception as e:
+        log.warning("--offline: could not read baseline cache (%s): %s",
+                    cache_file, e)
+        return {}
+    if saved.get("arch") != arch or saved.get("n_runs") != n_runs:
+        log.warning(
+            "--offline: baseline cache mismatch (arch %s vs %s, n_runs %s vs %s) "
+            "— ignored (not needed for replay)",
+            saved.get("arch"), arch, saved.get("n_runs"), n_runs)
+        return {}
+    cache = dict(saved.get("baselines", {}))
+    log.info("--offline: loaded %d baselines from %s (read-only)",
+             len(cache), cache_file)
+    return cache
 
 
 def measure_baselines(
@@ -1210,10 +1273,16 @@ def _worker_fn(
       {"type": "eval_result", "benchmark": str, "loop_idx": int,
        "reward": float, "value": float, "timeout": bool}  — eval sample
       {"type": "step_failed", "loop_idx": int, "rank": int}
-      {"type": "worker_done", "rank": int}
+      {"type": "worker_done", "rank": int, "postf_misses": int}
 
     Weight updates (train mode only): main puts a weight dict into *weight_q*
     after each PPO update; the worker drains it between benchmark groups.
+
+    hparams["offline"] (train.py --offline): read-only replay.  No benchmark
+    copy, no compile, no profiler.  A reward-cache miss is reported as
+    step_failed (reason "cache_miss") and the loop is skipped; a post-unmerge
+    feature miss falls back to the pre-unmerge features and is counted on the
+    worker_done message ("postf_misses").
     """
     import logging
     import os
@@ -1245,6 +1314,8 @@ def _worker_fn(
         format=f"%(asctime)s %(levelname)s {_epoch_tag}[W{rank}] %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Bound BEFORE the try so the `finally` below can always report it.
+    _postf_misses = 0
 
     # Everything below runs inside the try: a setup failure (CUDA init,
     # bad normalizer state, unwritable tmp dir) would otherwise kill this
@@ -1303,6 +1374,12 @@ def _worker_fn(
         # → same binary → same reward — so a hit replaces compile + measure.
         reward_cache: dict = hparams.get("reward_cache", {})
         postf_cache: dict = hparams.get("postf_cache", {})
+        # Read-only replay (train.py --offline): the caches are the ONLY
+        # source — a miss is dropped, never built.
+        offline: bool = bool(hparams.get("offline", False))
+        # Cells whose cached value is a compile penalty, not a measurement
+        # (reward_cache.json "migration.failure_keys"); offline only.
+        failure_keys: set = set(hparams.get("failure_keys", ()))
 
         # Per-worker directories
         tmp_dir = _Path(hparams["tmp_dir"]) / f"worker_{rank}"
@@ -1353,7 +1430,10 @@ def _worker_fn(
             # Validate baseline and copy benchmark to isolated working dir
             # ----------------------------------------------------------
             baseline_ms = baseline_cache.get(bench_name)
-            if baseline_ms is None:
+            # Offline, a baseline is only ever read on the compile+measure
+            # path, which is never taken — so its absence must not drop the
+            # benchmark's cached cells.
+            if baseline_ms is None and not offline:
                 _log.warning(
                     "No baseline cached for %s — skipping %d loops",
                     bench_name, len(bench_loops),
@@ -1362,16 +1442,21 @@ def _worker_fn(
 
             original_path = _Path(bench_loops[0]["benchmark_path"])
             copy_dir = working_set_dir / bench_name
-            try:
-                if copy_dir.exists():
-                    shutil.rmtree(copy_dir)
-                shutil.copytree(original_path, copy_dir)
-            except Exception as e:
-                _log.warning(
-                    "Failed to copy %s to working set: %s — skipping",
-                    bench_name, e,
-                )
-                continue
+            if offline:
+                # Nothing is compiled, so no working copy is made; env below
+                # is pointed at the source tree but never invoked.
+                copy_dir = original_path
+            else:
+                try:
+                    if copy_dir.exists():
+                        shutil.rmtree(copy_dir)
+                    shutil.copytree(original_path, copy_dir)
+                except Exception as e:
+                    _log.warning(
+                        "Failed to copy %s to working set: %s — skipping",
+                        bench_name, e,
+                    )
+                    continue
 
             # Point env at the worker's copy so get_post_unmerge_features
             # compiles inside the isolated directory.
@@ -1463,6 +1548,12 @@ def _worker_fn(
                         step2_features = torch.tensor(
                             _pf, dtype=torch.float32
                         ).to(device)
+                    elif offline:
+                        # Read-only replay: no compile to extract them.  Same
+                        # fallback as the extraction-failure branch below;
+                        # counted so main can report the cache's coverage.
+                        _postf_misses += 1
+                        step2_features = pre_features
                     else:
                         try:
                             step2_features = env.get_post_unmerge_features(
@@ -1519,6 +1610,34 @@ def _worker_fn(
                     # also hits — known-bad compiles are never re-paid.
                     reward = float(_rc_hit)
                     from_cache = True
+                    if offline and _rc_key in failure_keys:
+                        # A cached PENALTY: carry the status the live path
+                        # gave it, so the test drain excludes compile failures
+                        # (MIRROR: run_parallel_eval) and the failure-rate
+                        # metrics count them.  collect_pipeline records
+                        # timeouts in the same key list; the value tells them
+                        # apart — only a timeout cell holds the timeout penalty.
+                        status = ("compile_timeout"
+                                  if reward == hparams["compile_timeout_penalty"]
+                                  else "compile_failed")
+                        is_timeout = (status == "compile_timeout")
+                elif offline:
+                    # Read-only replay: a cell the collection never measured is
+                    # dropped and counted as missed (MIRROR: the measurement-
+                    # failure branch below) — never penalised, never built.
+                    _log.debug(
+                        "%s loop_idx=%d unmerge=%d factor=%d — not in reward "
+                        "cache, dropped (--offline)",
+                        bench_name, loop_idx, unmerge, factor,
+                    )
+                    # unmerge/factor name the missing cell, so a replay log
+                    # doubles as the list of what a collection still lacks.
+                    result_q.put({"type": "step_failed",
+                                  "benchmark": bench_name,
+                                  "loop_idx": loop_idx, "rank": rank,
+                                  "unmerge": unmerge, "factor": factor,
+                                  "reason": "cache_miss"})
+                    continue
                 else:
                     try:
                         ok, err_sig = compile_single_loop_ex(
@@ -1630,7 +1749,8 @@ def _worker_fn(
         result_q.put({"type": "worker_crashed", "rank": rank,
                       "error": f"{type(e).__name__}: {e}"})
     finally:
-        result_q.put({"type": "worker_done", "rank": rank})
+        result_q.put({"type": "worker_done", "rank": rank,
+                      "postf_misses": _postf_misses})
 
 
 def _send_loop_result(
@@ -1823,6 +1943,7 @@ def run_parallel_eval(
     reward_cache: "dict | None" = None,
     postf_cache: "dict | None" = None,
     use_reward_cache: bool = False,
+    failure_keys: "set | None" = None,
 ) -> dict:
     """
     Multi-GPU evaluation of the current policy (greedy), mirroring the training
@@ -1836,8 +1957,20 @@ def run_parallel_eval(
 
     Returns a metrics dict shaped like evaluate()'s, including per-benchmark
     stats with failure/no-signal counts.
+
+    args.offline forces the cached path: nothing can be measured fresh, so a
+    use_reward_cache=False request is overridden (with a warning) and a cell
+    the cache lacks is counted under missed / measure_failed / no_signal.
     """
+    offline = bool(getattr(args, "offline", False))
+    if offline and not use_reward_cache:
+        log.warning("[%s] --offline: fresh measurement is impossible — "
+                    "replaying from the reward cache", label)
+        use_reward_cache = True
     hparams = {
+        "offline":                 offline,
+        # Offline only: lets a cached penalty replay with its live status.
+        "failure_keys":            sorted(failure_keys) if (offline and failure_keys) else [],
         "arch":                    args.arch,
         "n_runs":                  args.n_runs,
         "nsys_timeout":            args.nsys_timeout,
@@ -1883,6 +2016,7 @@ def run_parallel_eval(
     rewards: list[float] = []
     failures: list[dict] = []
     samples = missed = done = 0
+    postf_misses = 0
 
     while done < n_workers:
         try:
@@ -1938,9 +2072,16 @@ def run_parallel_eval(
                       msg.get("error"))
         elif t == "worker_done":
             done += 1
+            postf_misses += msg.get("postf_misses", 0)
 
     for p in procs:
         p.join(timeout=30)
+
+    if offline:
+        log.info("[%s] --offline replay: %d samples from cache, %d cells not "
+                 "in cache (dropped), %d unmerge samples without a cached "
+                 "post-unmerge vector (pre-unmerge features used)",
+                 label, samples, missed, postf_misses)
 
     per_benchmark = []
     for b in sorted(set(by_bench) | set(status_by_bench)):
@@ -2040,6 +2181,7 @@ def run_parallel_epoch(
     total_epochs: int = 0,
     reward_cache: "dict | None" = None,
     postf_cache: "dict | None" = None,
+    failure_keys: "set | None" = None,
 ) -> tuple[dict, list[Path], list[Path]]:
     """
     Run one complete training + validation epoch across *n_workers* GPU workers.
@@ -2060,8 +2202,12 @@ def run_parallel_epoch(
     """
     reward_cache = reward_cache if reward_cache is not None else {}
     postf_cache  = postf_cache  if postf_cache  is not None else {}
+    offline = bool(getattr(args, "offline", False))
 
     hparams = {
+        "offline":                 offline,
+        # Offline only: lets a cached penalty replay with its live status.
+        "failure_keys":            sorted(failure_keys) if (offline and failure_keys) else [],
         "arch":                    args.arch,
         "n_runs":                  args.n_runs,
         "nsys_timeout":            args.nsys_timeout,
@@ -2146,6 +2292,7 @@ def run_parallel_epoch(
     train_unmerges    = 0
     train_unrolls     = 0
     done_count = 0
+    postf_misses = 0   # --offline only: unmerge samples replayed without a cached s2
 
     dropped_msgs = 0
     crashed_workers = 0
@@ -2270,6 +2417,7 @@ def run_parallel_epoch(
 
         elif mtype == "worker_done":
             done_count += 1
+            postf_misses += msg.get("postf_misses", 0)
             log.info("Worker %d finished training pass", msg["rank"])
 
     for p in workers:
@@ -2282,6 +2430,12 @@ def run_parallel_epoch(
         log.error("%d/%d workers crashed this epoch — the gradient step is "
                   "computed on a PARTIAL shard; treat this epoch as suspect",
                   crashed_workers, n_workers)
+
+    if offline:
+        log.info("--offline replay (train): %d samples from cache, %d cells "
+                 "not in cache (dropped), %d unmerge samples without a cached "
+                 "post-unmerge vector (pre-unmerge features used)",
+                 train_samples, train_missed, postf_misses)
 
     # Sample accounting: every assigned loop should produce exactly one entry.
     # A shortfall means loops were skipped (no baseline / copy failure) or
@@ -2324,6 +2478,7 @@ def run_parallel_epoch(
     val_noops      = 0
     val_unmerges   = 0
     val_unrolls    = 0
+    val_postf_misses = 0
     if val_loop_assignments:
         val_per_worker = assign_loops_to_workers(val_loop_assignments, n_workers)
         val_weights = _get_weights(agent)
@@ -2421,10 +2576,17 @@ def run_parallel_epoch(
 
             elif mtype == "worker_done":
                 val_done_count += 1
+                val_postf_misses += msg.get("postf_misses", 0)
                 log.info("Worker %d finished val pass", msg["rank"])
 
         for p in val_workers:
             p.join(timeout=30)
+
+        if offline:
+            log.info("--offline replay (val): %d samples from cache, %d cells "
+                     "not in cache (dropped), %d unmerge samples without a "
+                     "cached post-unmerge vector (pre-unmerge features used)",
+                     val_samples, val_missed, val_postf_misses)
 
         if all_val_rewards:
             val_avg_reward    = sum(all_val_rewards) / len(all_val_rewards)
@@ -2474,13 +2636,19 @@ def run_parallel_epoch(
         }
         if _mig:
             _payload["migration"] = _mig
-        cache_path.write_text(json.dumps(_payload))
-        log.info(
-            "Caches saved: %d rewards, %d post-unmerge feature vectors, "
-            "%d known failure cells (%s)",
-            len(reward_cache), len(postf_cache),
-            len(_mig.get("failure_keys", [])), cache_path,
-        )
+        if offline:
+            # Read-only replay: nothing new was measured, and the collected
+            # cache must stay byte-identical to what the collection wrote.
+            log.info("--offline: caches are read-only — %s not rewritten",
+                     cache_path)
+        else:
+            cache_path.write_text(json.dumps(_payload))
+            log.info(
+                "Caches saved: %d rewards, %d post-unmerge feature vectors, "
+                "%d known failure cells (%s)",
+                len(reward_cache), len(postf_cache),
+                len(_mig.get("failure_keys", [])), cache_path,
+            )
     except Exception as e:
         log.warning("Could not save reward cache: %s", e)
 
@@ -2524,6 +2692,16 @@ def run_parallel_epoch(
 def main() -> None:
     args = parse_args()
 
+    # --offline has no sequential path: only the worker path consults the
+    # caches BEFORE touching the compiler, so it is used even at
+    # --num-workers 1 (one CPU worker).  `parallel` replaces every
+    # `args.num_workers > 1` dispatch below.
+    parallel = args.num_workers > 1 or args.offline
+    if args.offline and args.live_val:
+        log.warning("--live-val ignored under --offline: nothing can be "
+                    "measured fresh")
+        args.live_val = False
+
     # Fail fast if the feature schema and the network input dim disagree — a
     # mismatch here would otherwise surface as an opaque shape error deep in
     # the first forward pass, hours into a run.
@@ -2534,12 +2712,15 @@ def main() -> None:
 
     # spawn is required for CUDA safety: forking after CUDA init is unsupported.
     # Set it early, before any torch.cuda usage.
-    if args.num_workers > 1:
+    if parallel:
         mp.set_start_method("spawn", force=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Using device: %s, GPU arch: %s", device, args.arch)
-    if args.num_workers > 1:
+    if args.offline:
+        log.info("OFFLINE replay: %d worker(s), no compile / profiler / GPU — "
+                 "every reward is a cache lookup", args.num_workers)
+    elif args.num_workers > 1:
         log.info("Parallel mode: %d workers, one GPU each", args.num_workers)
 
     _agent_common = dict(
@@ -2600,8 +2781,35 @@ def main() -> None:
 
     # --- Pre-flight eligibility check ---
     cache_file = ckpt_dir / "eligible_benchmarks.json"
+    if args.offline:
+        # The pre-flight check COMPILES, and precheck_benchmarks silently
+        # re-runs it on a missing or stale cache — so refuse up front on
+        # exactly the conditions that would make it fall through.
+        _why = None
+        if not cache_file.exists():
+            _why = "missing"
+        else:
+            try:
+                _pc = json.loads(cache_file.read_text())
+            except Exception as e:
+                _pc, _why = {}, f"unreadable ({e})"
+            if _why is None:
+                if _pc.get("features_version") != FEATURES_VERSION:
+                    _why = (f"features_version {_pc.get('features_version')} "
+                            f"!= {FEATURES_VERSION}")
+                elif _pc.get("eligibility_version") != ELIGIBILITY_VERSION:
+                    _why = (f"eligibility_version {_pc.get('eligibility_version')} "
+                            f"!= {ELIGIBILITY_VERSION}")
+                elif "eligible" not in _pc or "loop_records" not in _pc:
+                    _why = "no eligible/loop_records block"
+        if _why is not None:
+            log.error("--offline: %s is %s — the pre-flight check would have to "
+                      "compile. Run the collection (or train.py without "
+                      "--offline) in this checkpoint dir first.",
+                      cache_file, _why)
+            return
     all_benchmarks, loop_counts, loop_records_map, normalizer = precheck_benchmarks(
-        all_benchmarks, cache_file, skip=args.skip_precheck
+        all_benchmarks, cache_file, skip=args.skip_precheck or args.offline
     )
 
     if not all_benchmarks:
@@ -2622,18 +2830,28 @@ def main() -> None:
 
     # --- Baseline measurement (once per run, after split) ---
     # Train and val baselines are pre-measured so every epoch's reward uses
-    # the same reference value.  Test baselines are measured lazily on first
-    # access in GpuLoopEnv.reset() (test is only evaluated once at the end).
-    baseline_cache = measure_baselines(
-        train_bmarks + val_bmarks,
-        loop_records_map=loop_records_map,
-        arch=args.arch,
-        n_runs=args.n_runs,
-        nsys_timeout=args.nsys_timeout,
-        tmp_dir=tmp_dir,
-        gpu_id=0,
-        cache_file=ckpt_dir / "baseline_cache.json",
-    )
+    # the same reference value.  On the SEQUENTIAL path test baselines are
+    # measured lazily on first access in GpuLoopEnv.reset() (test is only
+    # evaluated once at the end); the worker path has no lazy fallback — a
+    # benchmark without a cached baseline is skipped outright — so there the
+    # test split is pre-measured too (previously it was not: a parallel run
+    # whose baseline_cache.json had not been pre-populated by a collection
+    # evaluated zero test loops).  --offline reads the file and never measures.
+    if args.offline:
+        baseline_cache = load_baseline_cache(
+            ckpt_dir / "baseline_cache.json", arch=args.arch, n_runs=args.n_runs
+        )
+    else:
+        baseline_cache = measure_baselines(
+            train_bmarks + val_bmarks + (test_bmarks if parallel else []),
+            loop_records_map=loop_records_map,
+            arch=args.arch,
+            n_runs=args.n_runs,
+            nsys_timeout=args.nsys_timeout,
+            tmp_dir=tmp_dir,
+            gpu_id=0,
+            cache_file=ckpt_dir / "baseline_cache.json",
+        )
 
     # --- Cross-epoch reward / post-unmerge-feature caches ---
     # Deterministic environment: same (loop, action) → same reward.  Persisted
@@ -2643,6 +2861,7 @@ def main() -> None:
     # via fingerprint.
     reward_cache: dict[str, float] = {}
     postf_cache: dict[str, list] = {}
+    rc_failure_keys: set[str] = set()   # --offline: cells holding a compile penalty
     _rc_file = ckpt_dir / "reward_cache.json"
     if _rc_file.exists():
         try:
@@ -2651,6 +2870,8 @@ def main() -> None:
                 json.dumps(normalizer.state_dict(), sort_keys=True).encode()
             ).hexdigest()[:12]
             reward_cache = _rc_data.get("rewards", {})
+            rc_failure_keys = set(
+                (_rc_data.get("migration") or {}).get("failure_keys", []))
             if _rc_data.get("normalizer_sig") == _sig:
                 postf_cache = _rc_data.get("post_features", {})
                 log.info(
@@ -2665,6 +2886,15 @@ def main() -> None:
                 )
         except Exception as e:
             log.warning("Could not read reward cache (%s): %s", _rc_file, e)
+    if args.offline:
+        if not reward_cache:
+            log.error("--offline: no rewards loaded from %s — nothing to replay. "
+                      "Point --checkpoint-dir at a collection run dir.", _rc_file)
+            return
+        if not postf_cache:
+            log.warning("--offline: no post-unmerge feature vectors loaded — "
+                        "every unmerge sample's factor state falls back to the "
+                        "pre-unmerge features (counted per pass)")
 
     # Build sequential-path env (also used for test eval at the end)
     env = GpuLoopEnv(
@@ -2754,7 +2984,7 @@ def main() -> None:
         # ==============================================================
         # PARALLEL PATH  (--num-workers > 1)
         # ==============================================================
-        if args.num_workers > 1:
+        if parallel:
             # Shuffle the flat train assignment list each epoch so workers
             # receive a different loop distribution — equivalent to shuffling
             # benchmark order but at loop granularity.
@@ -2774,6 +3004,7 @@ def main() -> None:
                 total_epochs=args.epochs,
                 reward_cache=reward_cache,
                 postf_cache=postf_cache,
+                failure_keys=rc_failure_keys,
             )
 
             total_updates += epoch_stats["train_updates"]
@@ -3087,7 +3318,7 @@ def main() -> None:
         # own local cache), so training data is untouched. Parallel path only —
         # the sequential evaluate() has no cache-free mode.
         if args.live_val and val_bmarks:
-            if args.num_workers > 1:
+            if parallel:
                 _val_assign = build_loop_assignments(val_bmarks, loop_records_map)
                 _lv = run_parallel_eval(
                     agent, _val_assign, normalizer, baseline_cache,
@@ -3125,6 +3356,7 @@ def main() -> None:
     # converged policy must be reported alongside it.
     # Always FRESH-measured (no reward cache): the cached path returns frozen
     # first-measurements, which measures cache lookup, not generalisation.
+    # --offline is the one exception by definition — it replays the cache.
     if test_bmarks:
         test_loop_assignments = build_loop_assignments(test_bmarks, loop_records_map)
         log.info("=== Test Evaluation: %d benchmarks, %d loops ===",
@@ -3159,12 +3391,16 @@ def main() -> None:
         for tag, ckpt_path in candidates:
             agent.load(str(ckpt_path))
             log.info("--- Test on %s (%s) ---", tag, ckpt_path.name)
-            if args.num_workers > 1:
+            if parallel:
                 tm = run_parallel_eval(
                     agent, test_loop_assignments, normalizer, baseline_cache,
                     args.num_workers, args, label="test",
-                    use_reward_cache=False,       # fresh measurement
+                    # fresh measurement — unless --offline, where the cache is
+                    # the only source (reward_cache is ignored otherwise)
+                    use_reward_cache=args.offline,
+                    reward_cache=reward_cache,
                     postf_cache=postf_cache,
+                    failure_keys=rc_failure_keys,
                 )
             else:
                 tm, _ = evaluate(agent, env, test_bmarks, device, label="test")
