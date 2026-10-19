@@ -352,9 +352,17 @@ def precheck_benchmarks(
     cache_file: Path,
     skip: bool,
     strict: bool = False,
+    accept_stale_eligibility: bool = False,
 ) -> tuple[list[Path], dict[str, int], dict[str, list[dict]], "FeatureNormalizer"]:
     """
     Return (eligible_benchmarks, loop_counts, loop_records_map, normalizer).
+
+    accept_stale_eligibility (train.py --offline): load a cache whose
+    eligibility_version differs instead of discarding it.  A replay reproduces
+    a COLLECTION, and the collection's loop population is the one its reward
+    cache was measured on — re-deriving it under a newer eligibility rule
+    would only create cells with no rewards.  features_version is still
+    enforced: it decides the feature vector the networks consume.
 
     loop_counts      — benchmark name → number of eligible loops (for logging)
     loop_records_map — benchmark name → list of per-loop dicts:
@@ -400,12 +408,20 @@ def precheck_benchmarks(
             # features_version check.  A mismatch means the cache holds a
             # different loop population — discard and re-run.
             if data.get("eligibility_version") != ELIGIBILITY_VERSION:
-                log.warning(
-                    "Precheck cache eligibility_version=%s != %s — eligible loop "
-                    "set changed; discarding cache and re-running the pre-flight check.",
-                    data.get("eligibility_version"), ELIGIBILITY_VERSION,
-                )
-                raise ValueError("stale eligibility_version")
+                if accept_stale_eligibility:
+                    log.warning(
+                        "Precheck cache eligibility_version=%s != %s — accepted "
+                        "as-is (offline replay: the collection's loop population "
+                        "is the one its rewards were measured on)",
+                        data.get("eligibility_version"), ELIGIBILITY_VERSION,
+                    )
+                else:
+                    log.warning(
+                        "Precheck cache eligibility_version=%s != %s — eligible loop "
+                        "set changed; discarding cache and re-running the pre-flight check.",
+                        data.get("eligibility_version"), ELIGIBILITY_VERSION,
+                    )
+                    raise ValueError("stale eligibility_version")
             eligible_names = set(data["eligible"])
             loop_counts: dict[str, int] = data.get("loop_counts", {})
             loop_records_map: dict[str, list[dict]] = data.get("loop_records", {})
@@ -2797,11 +2813,10 @@ def main() -> None:
                 if _pc.get("features_version") != FEATURES_VERSION:
                     _why = (f"features_version {_pc.get('features_version')} "
                             f"!= {FEATURES_VERSION}")
-                elif _pc.get("eligibility_version") != ELIGIBILITY_VERSION:
-                    _why = (f"eligibility_version {_pc.get('eligibility_version')} "
-                            f"!= {ELIGIBILITY_VERSION}")
                 elif "eligible" not in _pc or "loop_records" not in _pc:
                     _why = "no eligible/loop_records block"
+                # eligibility_version is NOT checked here: a replay uses the
+                # collection's population as-is (accept_stale_eligibility below).
         if _why is not None:
             log.error("--offline: %s is %s — the pre-flight check would have to "
                       "compile. Run the collection (or train.py without "
@@ -2809,7 +2824,8 @@ def main() -> None:
                       cache_file, _why)
             return
     all_benchmarks, loop_counts, loop_records_map, normalizer = precheck_benchmarks(
-        all_benchmarks, cache_file, skip=args.skip_precheck or args.offline
+        all_benchmarks, cache_file, skip=args.skip_precheck or args.offline,
+        accept_stale_eligibility=args.offline,
     )
 
     if not all_benchmarks:
