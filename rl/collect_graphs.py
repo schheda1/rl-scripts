@@ -118,6 +118,20 @@ def write_gz_text(path: Path, text: str) -> None:
 # Phase 1: stamp + dump + graph (parallel over benchmarks, compile-only)
 # ---------------------------------------------------------------------------
 
+def compile_diagnosis(stderr: str, maxlen: int = 240) -> str:
+    """The one line of compiler output that explains an empty dump: a LOOPCOUNT
+    WARNING first (e.g. a clang without the per-module mode cannot open '<dir>/'
+    as a file), else the first error line, else the last non-empty line."""
+    lines = [l.strip() for l in (stderr or "").splitlines() if l.strip()]
+    for l in lines:
+        if "LOOPCOUNT WARNING" in l:
+            return l[:maxlen]
+    for l in lines:
+        if "error" in l.lower():
+            return l[:maxlen]
+    return lines[-1][:maxlen] if lines else "no compiler output"
+
+
 def dump_benchmark(job: dict):
     """One benchmark: scratch copy -> _make with stamp+dump flags -> llvm2graph on
     each device module -> graphs/<bench>/.  Returns (name, status, [(base, triple)])."""
@@ -129,7 +143,10 @@ def dump_benchmark(job: dict):
     from hecbench import _build_extra_cflags, _make
     from store_common import bundle_paths, structural_copy
     broot, bdir = bundle_paths(job["scratch"], name, name)   # <scratch>/<bench>/<bench>:
-    irdir = broot / "ir"                                       # -hip sibling symlink works
+    # ABSOLUTE: the flag is consumed by clang running with cwd = the bundle dir,
+    # so a relative path (relative --scratch or checkpoint dir) would resolve
+    # inside the bundle and vanish with it.
+    irdir = (broot / "ir").resolve()                           # -hip sibling symlink works
     try:
         shutil.rmtree(broot, ignore_errors=True)
         structural_copy(Path(job["path"]), bdir, job["copy_threshold"])
@@ -139,14 +156,14 @@ def dump_benchmark(job: dict):
         # Return code deliberately not checked: the stamped dump and the CSV are
         # produced at the compile stage, valid even when the link fails — the
         # eligibility precheck treats them the same way.
-        _make(bdir, extra_cflags=cflags, arch=job["arch"], timeout=job["compile_timeout"])
+        r = _make(bdir, extra_cflags=cflags, arch=job["arch"], timeout=job["compile_timeout"])
         dumps = []
         for ll in sorted(irdir.glob("*.ll")):
             base, triple = parse_dump_name(ll.name)
             if is_device_triple(triple):
                 dumps.append((base, triple, ll))
         if not dumps:
-            return name, "no device module dumped (compile failed before LoopCount?)", []
+            return name, f"no device module dumped: {compile_diagnosis(r.stderr)}", []
         done = []
         for base, triple, ll in dumps:
             r = subprocess.run([job["llvm2graph"], "--stdout_fmt=json", str(ll)],
@@ -287,8 +304,9 @@ def main() -> int:
     data = json.loads(elig.read_text())
     loop_records_map = data["loop_records"]
     src = Path(a.hecbench_src) if a.hecbench_src else HECBENCH_SRC
-    out = a.out or (ckpt / "pgraph")
-    scratch = a.scratch or (ckpt / "pgraph_tmp")
+    # Absolute paths throughout: the compile runs with cwd = the bundle dir.
+    out = Path(a.out or (ckpt / "pgraph")).resolve()
+    scratch = Path(a.scratch or (ckpt / "pgraph_tmp")).resolve()
 
     names = sorted(a.benchmarks or loop_records_map)
     jobs = []

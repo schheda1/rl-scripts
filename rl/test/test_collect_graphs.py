@@ -115,6 +115,18 @@ with tempfile.TemporaryDirectory() as d:
           r0.get("key") == ["b", "sm_80", 0] and r0.get("loop", {}).get("num_nodes", 0) > 0
           and len(r0.get("kernels", [])) == 1, str(list(r0.keys())))
 
+# --- 3b. the empty-dump diagnosis picks the line that explains it ------------------------
+from collect_graphs import compile_diagnosis  # noqa: E402
+
+check("diagnosis: LOOPCOUNT WARNING wins over later noise",
+      compile_diagnosis("clang: note: x\nLOOPCOUNT WARNING: cannot open -loopcount-emit-ir file '/s/ir/'\nmake: *** [all] Error 1")
+      .startswith("LOOPCOUNT WARNING: cannot open"))
+check("diagnosis: first error line when there is no warning",
+      compile_diagnosis("note: a\nclang: error: unknown argument '-mllvm -foo'\nmake: *** Error 1")
+      == "clang: error: unknown argument '-mllvm -foo'")
+check("diagnosis: last line as a fallback", compile_diagnosis("a\nb\n\n") == "b")
+check("diagnosis: empty stderr", compile_diagnosis("") == "no compiler output")
+
 # --- 4. the pgraph package self-tests (its own, stdlib-only) ----------------------------
 import importlib  # noqa: E402
 
