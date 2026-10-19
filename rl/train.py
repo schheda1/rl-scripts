@@ -62,7 +62,7 @@ from agent import (
 )
 from environment import GpuLoopEnv
 from hecbench import (
-    ARCH, FEATURE_COLUMNS, STUDY_A_NUMPATHS_MIN, STUDY_A_NUMPATHS_MAX,
+    ARCH, FEATURE_COLUMNS, IS_HIP, STUDY_A_NUMPATHS_MIN, STUDY_A_NUMPATHS_MAX,
     discover_benchmarks,
 )
 
@@ -79,9 +79,13 @@ from features import FEATURES_VERSION, assert_matches            # noqa: E402
 ELIGIBILITY_VERSION = (
     f"studyA:numPaths>{STUDY_A_NUMPATHS_MIN},<={STUDY_A_NUMPATHS_MAX}"
     # +devlib-excl: drop AMD OCKL/OCML/OCLC/__assert_fail runtime loops that leak
-    # via kernelParents on amdgcn (no-op on NVIDIA).  Bumps the signature so any
-    # eligible_benchmarks.json built before the fix is treated as stale.
-    ";devlib-excl"
+    # via kernelParents on amdgcn.  The filter matches only those AMD device-
+    # library names (hecbench.get_loop_features), so on NVIDIA the eligible set
+    # is bit-identical with or without it — the signature therefore carries the
+    # suffix ONLY for a HIP target.  Tagging both targets made every NVIDIA cache
+    # extracted before the fix look stale and re-ran the hour-long pre-flight
+    # check on each directory it touched, for an identical result.
+    + (";devlib-excl" if IS_HIP else "")
 )
 
 # Placeholder factor log-prob for no-op (unmerge==0) rollout entries — never
