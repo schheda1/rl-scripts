@@ -19,7 +19,7 @@ from typing import Optional
 
 import torch
 
-from store_common import run_hard_timeout   # process-group-killing timeout (no nsys orphans)
+from store_common import run_hard_timeout, kill_process_tree   # process-group kill: no orphaned profilers OR compiles
 
 # Default per-user temp directory for all pipeline artifacts (nsys reports, etc.)
 DEFAULT_TMP_DIR: Path = Path(f"/tmp/rl_pipeline_{getpass.getuser()}")
@@ -447,15 +447,36 @@ def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300)
         flag_var = "CFLAGS"
         ldflags = f"-L{cuda_home}/lib64 -lcudart -lcuda"
     subprocess.run(["make", "clean"], cwd=benchmark_dir, capture_output=True, env=env)
-    return subprocess.run(
-        f'make CC="{cc}" {flag_var}="{flags}" LDFLAGS="{ldflags}"',
-        cwd=benchmark_dir,
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-    )
+    # HARD timeout.  A plain subprocess.run(timeout=) with shell=True kills only the
+    # /bin/sh it spawned; `make` and the clang++ under it (the CC wrapper execs
+    # clang++) are ORPHANED and keep running.  A UU compile that blew up at a high
+    # unroll/unmerge factor — the compile_timeout cells — then runs for DAYS while
+    # its IR grows without bound (observed on the MI210 run: clang++ alive 2+ days
+    # at ~2 TB RSS, one per timed-out cell).  The harness only ever bookkept the
+    # timeout; it never killed the compile.  start_new_session puts sh+make+clang++
+    # in one group so kill_process_tree's killpg reaches them all, and its
+    # descendant sweep (snapshotted before the kill) catches anything reparented.
+    # NO cwd sweep here: a compile tree never regroups or daemonizes, so the two
+    # sweeps above are complete — and three callers build in the ORIGINAL
+    # HeCBench dir (compile_baseline, compile_loopcount, compile_trajectory_ex),
+    # where a cwd sweep would SIGKILL any unrelated process parked there (an
+    # interactive shell, an editor, another harness on the same benchmark).
+    # The kill runs on EVERY abnormal exit, not only the timeout: in its own
+    # session the compile no longer hears the terminal's SIGINT, so a Ctrl-C
+    # (or SystemExit) that unwinds through here would otherwise orphan it.
+    # The contract is unchanged: a CompletedProcess on exit, and
+    # subprocess.TimeoutExpired RE-RAISED on timeout so callers still classify
+    # it as compile_timeout.
+    cmd = f'make CC="{cc}" {flag_var}="{flags}" LDFLAGS="{ldflags}"'
+    proc = subprocess.Popen(
+        cmd, cwd=benchmark_dir, shell=True, env=env, start_new_session=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except BaseException:                 # TimeoutExpired, KeyboardInterrupt, SystemExit
+        kill_process_tree(proc)
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def compile_baseline(benchmark_dir: Path, arch: str = ARCH) -> bool:

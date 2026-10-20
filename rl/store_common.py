@@ -182,24 +182,50 @@ def run_hard_timeout(cmd: str, cwd, timeout: int, env: dict,
         out, _ = proc.communicate(timeout=timeout)
         return True, (out or "")
     except subprocess.TimeoutExpired:
-        victims = set(_descendants(proc.pid, _proc_children_map()))   # snapshot tree first
-        if scope_dir:
-            victims.update(_pids_with_cwd(scope_dir))
-        victims.discard(os.getpid())                          # never signal ourselves
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # group sweep
-        except OSError:
-            pass                                              # already gone / no perms
-        for v in victims:                                     # tree + cwd sweeps
-            try:
-                os.kill(v, signal.SIGKILL)
-            except OSError:
-                pass
-        try:
-            proc.communicate(timeout=30)                      # reap our direct child
-        except Exception:
-            pass
+        kill_process_tree(proc, scope_dir)
         return False, ""
+    except BaseException:
+        # Ctrl-C / SystemExit: the new session shields the profiler and the
+        # benchmark from the terminal's SIGINT, so kill them before unwinding —
+        # otherwise an interrupted run leaves nsys/rocprof + ./main on the GPU.
+        kill_process_tree(proc, scope_dir)
+        raise
+
+
+def kill_process_tree(proc: "subprocess.Popen", scope_dir=None) -> None:
+    """SIGKILL *proc* and everything it spawned, then reap the direct child.
+
+    The three overlapping sweeps run_hard_timeout documents — (1) killpg of the
+    group, (2) ppid-descendants of the child, (3) processes whose cwd is
+    *scope_dir* — all snapshotted BEFORE killing so a reparented/regrouped child
+    is still discoverable.  *proc* must have been started with
+    start_new_session=True so the group sweep reaches the whole tree.
+
+    Shared by the MEASUREMENT path (run_hard_timeout) and the COMPILE path
+    (hecbench._make).  The compile path previously used a plain
+    subprocess.run(timeout=): on timeout that kills only the /bin/sh, orphaning
+    `make` -> `clang++`, and a UU compile that blew up at a high unroll/unmerge
+    factor then runs for DAYS with unbounded IR growth (observed on the MI210 run:
+    clang++ alive 2+ days at ~2 TB RSS, one per timed-out cell).  The harness had
+    only bookkept the timeout; it never killed the compile.
+    """
+    victims = set(_descendants(proc.pid, _proc_children_map()))   # snapshot tree first
+    if scope_dir:
+        victims.update(_pids_with_cwd(scope_dir))
+    victims.discard(os.getpid())                          # never signal ourselves
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # group sweep
+    except OSError:
+        pass                                              # already gone / no perms
+    for v in victims:                                     # tree + cwd sweeps
+        try:
+            os.kill(v, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.communicate(timeout=30)                      # reap our direct child
+    except Exception:
+        pass
 
 
 def dir_bytes(root: Path) -> int:
