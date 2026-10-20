@@ -59,6 +59,8 @@ from pathlib import Path
 
 import torch.multiprocessing as mp
 
+from store_common import set_post_features   # never wipes on-disk vectors on a sig mismatch
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from agent import FACTOR_VALUES, build_factor_mask, _IDX_TRIP_COUNT_KNOWN, _IDX_TRIP_COUNT
@@ -368,9 +370,8 @@ def save_cache(path: Path, rewards: dict, postf: dict, norm_sig: str,
             payload = json.loads(path.read_text())
         except Exception:
             payload = {}
-    payload["normalizer_sig"] = norm_sig
     payload["rewards"] = rewards
-    payload["post_features"] = postf
+    set_post_features(payload, postf, norm_sig)
     if failure_keys or payload.get("migration"):
         mig = payload.get("migration") or {}
         mig["failure_keys"] = sorted(

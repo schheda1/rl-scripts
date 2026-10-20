@@ -587,6 +587,23 @@ def _selftest() -> int:
             and m["benchmarks"]["b"] == "fp" and "b|0|1|2" in m["cells"])
         chk("load_manifest(missing) → None", load_manifest(str(Path(d) / "nope")) is None)
     chk("toolchain_stamp carries arch", toolchain_stamp("sm_z")["arch"] == "sm_z")
+    # set_post_features: a persist must never wipe on-disk post-feature vectors just
+    # because the in-memory dict is empty after a normalizer-signature mismatch.
+    from store_common import set_post_features
+    pl = {"normalizer_sig": "old", "post_features": {"b|0": [1.0]}, "rewards": {}}
+    set_post_features(pl, {}, "new")
+    chk("postf: empty in-memory keeps the file's vectors", pl["post_features"] == {"b|0": [1.0]})
+    chk("postf: ... and their own signature", pl["normalizer_sig"] == "old")
+    set_post_features(pl, {"b|0": [2.0]}, "new")
+    chk("postf: non-empty replaces under the new signature",
+        pl["post_features"] == {"b|0": [2.0]} and pl["normalizer_sig"] == "new")
+    pl2 = {"rewards": {}}
+    set_post_features(pl2, {}, "new")
+    chk("postf: empty + nothing on disk writes {} under the signature",
+        pl2["post_features"] == {} and pl2["normalizer_sig"] == "new")
+    pl3 = {"post_features": {"b|0": [1.0]}}
+    set_post_features(pl3, {}, "new")
+    chk("postf: unsigned vectors on disk stay unsigned", "normalizer_sig" not in pl3 and pl3["post_features"])
 
     print(f"\n  {'ALL PASS' if ok else 'FAILURES ABOVE'}")
     return 0 if ok else 1
@@ -621,6 +638,10 @@ def parse_args():
     p.add_argument("--save-every", type=int, default=100)
     p.add_argument("--no-post-features", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--baselines-only", action="store_true",
+                   help="measure the baseline of EVERY benchmark in --split that lacks one "
+                        "(not only those with missing cells), write baseline_cache.json, "
+                        "and exit without collecting cells — the recovery / bring-up path")
     p.add_argument("--read-only", action="store_true",
                    help="VALIDATION: run the real compile->nsys->parse pipeline but NEVER "
                         "write reward_cache.json or baseline_cache.json (baselines are not "
@@ -732,7 +753,10 @@ def main() -> int:
         baseline_cache = json.loads(bl_file.read_text()).get("baselines", {})
     todo_benches = {a["benchmark_name"] for a in assignments
                     if f"{a['benchmark_name']}|{a['loop_idx']}" in todo}
-    need_bl = [b for b in benches if b.name in todo_benches and b.name not in baseline_cache]
+    if args.baselines_only:
+        need_bl = [b for b in benches if b.name not in baseline_cache]
+    else:
+        need_bl = [b for b in benches if b.name in todo_benches and b.name not in baseline_cache]
     # READ-ONLY: never measure baselines (that path WRITES baseline_cache.json). Cells whose
     # benchmark has no baseline are dropped below (base_ms<=0) rather than measured.
     if ro and need_bl:
@@ -785,7 +809,7 @@ def main() -> int:
     if args.dry_run:
         log.info("dry run — nothing measured.")
         return 0
-    if not n_missing and not post_items:
+    if not n_missing and not post_items and not args.baselines_only:
         log.info("nothing to do.")
         return 0
 
@@ -797,6 +821,11 @@ def main() -> int:
             need_bl, loop_records_map=loop_records_map, arch=args.arch,
             n_runs=args.n_runs, nsys_timeout=args.nsys_timeout,
             tmp_dir=tmp_root, gpu_id=0, cache_file=bl_file, num_workers=G)
+    if args.baselines_only:
+        have = sum(1 for b in benches if b.name in baseline_cache)
+        log.info("--baselines-only: %d/%d benchmarks of %s have a baseline in %s — done",
+                 have, len(benches), args.split, bl_file)
+        return 0
 
     # Attach scope per LOOP (resolved once, now that baselines exist) and DROP cells
     # whose benchmark still has no baseline — they cannot be scored, so leave them

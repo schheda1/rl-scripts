@@ -61,6 +61,7 @@ from agent import (
     build_factor_mask, _IDX_TRIP_COUNT_KNOWN, _IDX_TRIP_COUNT,
 )
 from environment import GpuLoopEnv
+from store_common import set_post_features
 from hecbench import (
     ARCH, FEATURE_COLUMNS, IS_HIP, STUDY_A_NUMPATHS_MIN, STUDY_A_NUMPATHS_MAX,
     discover_benchmarks,
@@ -535,6 +536,13 @@ def precheck_benchmarks(
     # --- Save cache ---
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
+        if cache_file.exists():
+            # A re-run (stale version string, unreadable file) never overwrites
+            # the previous cache: it is kept beside the new one, timestamped.
+            _bak = cache_file.with_name(
+                f"{cache_file.name}.stale.{datetime.now():%Y%m%d-%H%M%S}")
+            cache_file.replace(_bak)
+            log.warning("Previous pre-flight cache kept as %s", _bak)
         cache_file.write_text(json.dumps({
             "checked_at": datetime.now().isoformat(),
             "features_version": FEATURES_VERSION,
@@ -770,10 +778,25 @@ def measure_baselines(
                     "Loaded %d baselines from cache (%s) — measuring only the rest",
                     len(cache), cache_file,
                 )
+            elif saved.get("baselines"):
+                # REFUSE, never discard.  The old behaviour started from an empty
+                # dict and the per-benchmark flush then rewrote the file with only
+                # the benchmarks THIS call measured.  Collectors pass only the
+                # benchmarks that lack a baseline, so a wrong --n-runs on a
+                # resume silently destroyed every other baseline on disk (MI210
+                # run, 2026-10-20: 160+ twenty-run baselines replaced by an empty
+                # ten-run file).  A mismatch is the caller's to resolve: pass the
+                # run's values, or move the file aside to re-measure from scratch.
+                raise SystemExit(
+                    f"baseline cache {cache_file} was measured with arch="
+                    f"{saved.get('arch')} n_runs={saved.get('n_runs')} "
+                    f"({len(saved['baselines'])} baselines) but this run asks for "
+                    f"arch={arch} n_runs={n_runs}. Refusing to re-measure over it: "
+                    f"use the cache's values, or move the file aside first.")
             else:
                 log.warning(
-                    "Baseline cache mismatch (arch %s vs %s, n_runs %s vs %s) — "
-                    "re-measuring all",
+                    "Baseline cache mismatch (arch %s vs %s, n_runs %s vs %s) on an "
+                    "EMPTY cache — nothing to keep, measuring",
                     saved.get("arch"), arch, saved.get("n_runs"), n_runs,
                 )
         except Exception as e:
@@ -2634,12 +2657,13 @@ def run_parallel_epoch(
         # indistinguishable from a genuine -0.15 measurement, so the key list is
         # the only record of which cells are failures.  Newly observed failures
         # from THIS run are unioned in, so the list stays complete.
-        _mig: dict = {}
+        _prev: dict = {}
         if cache_path.exists():
             try:
-                _mig = json.loads(cache_path.read_text()).get("migration") or {}
+                _prev = json.loads(cache_path.read_text()) or {}
             except Exception:
-                _mig = {}
+                _prev = {}
+        _mig: dict = dict(_prev.get("migration") or {})
         if epoch_failure_keys or _mig:
             _mig["failure_keys"] = sorted(
                 set(_mig.get("failure_keys", [])) | epoch_failure_keys
@@ -2649,11 +2673,13 @@ def run_parallel_epoch(
             _mig.setdefault("deadzoned_keys", [])
             _mig.setdefault("history", [])
 
-        _payload = {
-            "normalizer_sig": _sig,
-            "rewards":        reward_cache,
-            "post_features":  postf_cache,
-        }
+        # Start from what the file holds: an in-memory postf_cache emptied by a
+        # normalizer-signature mismatch must never wipe the vectors on disk
+        # (store_common.set_post_features).  reward_cache is the full dict
+        # loaded at startup plus this run's cells, never a subset.
+        _payload = {k: _prev[k] for k in ("normalizer_sig", "post_features") if k in _prev}
+        _payload["rewards"] = reward_cache
+        set_post_features(_payload, postf_cache, _sig)
         if _mig:
             _payload["migration"] = _mig
         if offline:
@@ -2662,7 +2688,9 @@ def run_parallel_epoch(
             log.info("--offline: caches are read-only — %s not rewritten",
                      cache_path)
         else:
-            cache_path.write_text(json.dumps(_payload))
+            _tmp = cache_path.with_suffix(".json.tmp")
+            _tmp.write_text(json.dumps(_payload))
+            _tmp.replace(cache_path)      # atomic: a kill mid-write cannot truncate the cache
             log.info(
                 "Caches saved: %d rewards, %d post-unmerge feature vectors, "
                 "%d known failure cells (%s)",

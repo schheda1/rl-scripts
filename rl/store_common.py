@@ -228,6 +228,32 @@ def kill_process_tree(proc: "subprocess.Popen", scope_dir=None) -> None:
         pass
 
 
+def set_post_features(payload: dict, postf: dict, norm_sig: str) -> None:
+    """Put the post-unmerge feature vectors into a reward-cache payload WITHOUT
+    destroying what the file already holds.
+
+    *postf* is the in-memory dict: the file's own vectors when its normalizer
+    signature matched at load, plus any new extractions — or EMPTY when the
+    signature did not match (collectors and trainer discard mismatched vectors
+    in memory).  Writing that empty dict back used to wipe the on-disk vectors
+    at the first persist, before any replacement existed.  Rule:
+      non-empty postf      -> written under norm_sig (a replacement, or the same set);
+      empty, file has some -> file's vectors AND their signature left untouched, so a
+                              later load still sees the old signature and ignores
+                              them in memory; nothing is lost on disk;
+      empty, file has none -> an empty dict under norm_sig.
+    Shared by collect_cells.save_cache (collectors) and train's per-epoch persist.
+    """
+    if postf:
+        payload["normalizer_sig"] = norm_sig
+        payload["post_features"] = postf
+    elif payload.get("post_features"):
+        return
+    else:
+        payload["normalizer_sig"] = norm_sig
+        payload["post_features"] = {}
+
+
 def dir_bytes(root: Path) -> int:
     """Real bytes under root (symlinks counted as 0 — their targets live elsewhere)."""
     total = 0
