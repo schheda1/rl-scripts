@@ -50,6 +50,7 @@ Usage:
 import argparse
 import json
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -159,21 +160,31 @@ def main() -> None:
               f"(previous penalty {mig.get('failure_penalty')}).")
 
     target = 0.0 if args.revert else args.failure_penalty
+    # Timeout cells share failure_keys (collect_pipeline) but hold the timeout
+    # penalty and keep it: named by migration.timeout_keys, or — caches written
+    # before that list existed — by value, the rule train --offline uses.
+    timeout_keys = set((mig or {}).get("timeout_keys", []))
+    t_pen = (mig or {}).get("timeout_penalty", -1.0)
+    if mig and t_pen != mig.get("failure_penalty"):
+        timeout_keys |= {k for k in failure_keys if rewards.get(k) == t_pen}
+    retuned = [k for k in failure_keys if k not in timeout_keys]
     total = len(rewards)
     print(f"cells                      : {total}")
-    print(f"  failure cells -> {target:<7}: {len(failure_keys)}"
-          f"  ({100*len(failure_keys)/total:.1f}%)")
+    print(f"  failure cells -> {target:<7}: {len(retuned)}"
+          f"  ({100*len(retuned)/total:.1f}%)"
+          + (f"  [{len(failure_keys) - len(retuned)} timeout cells kept]"
+             if len(retuned) != len(failure_keys) else ""))
     if first_time and args.deadzone > 0:
         print(f"  |r|<{args.deadzone} -> 0.0 (noise) : {len(deadzone_keys)}"
               f"  ({100*len(deadzone_keys)/total:.1f}%)")
     print(f"  untouched                : "
-          f"{total - len(failure_keys) - (len(deadzone_keys) if first_time else 0)}")
+          f"{total - len(retuned) - (len(deadzone_keys) if first_time else 0)}")
 
     if args.dry_run:
         print("\nDry run — nothing written.")
         return
 
-    for k in failure_keys:
+    for k in retuned:
         rewards[k] = target
     if first_time:
         for k in deadzone_keys:
@@ -188,6 +199,7 @@ def main() -> None:
                     "reverted": bool(args.revert)})
     data["rewards"] = rewards
     data["migration"] = {
+        **(mig or {}),                     # keep keys this script does not own
         "failure_penalty": target,
         "deadzone": args.deadzone,
         "failure_keys": failure_keys,      # kept so future re-migration works

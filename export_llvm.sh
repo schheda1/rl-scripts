@@ -1,6 +1,6 @@
 #!/bin/bash
 
-build_dir=../build/llvm-build/
+build_dir=${BUILD_DIR:-../build/llvm-build/}     # e.g. BUILD_DIR=../build/llvm-release
 cd ${build_dir}
 
 cwd=$(pwd)

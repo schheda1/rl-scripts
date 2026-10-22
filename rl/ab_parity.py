@@ -167,8 +167,12 @@ def main() -> int:
     cc = str(HERE / "collect_cells.py")
     cp = str(HERE / "collect_pipeline.py")
     cc_cmd = [sys.executable, "-u", cc, str(A), "--num-workers", str(args.gpus)] + common
+    # Like for like with collect_cells: baselines measured on demand, every cell
+    # compiled and run, no compile memory cap.
     cp_cmd = [sys.executable, "-u", cp, str(B), "--gpus", str(args.gpus),
-              "--exec", "1", "--compile", "2", "--parse", "3"] + common
+              "--exec", "1", "--compile", "2", "--parse", "3", "--baselines", "auto",
+              "--no-infer", "--no-skip-identical", "--compile-mem-gb", "0",
+              "--profiler", "nsys"] + common
 
     # --with-store: build a store for the target off copy B (where it is now the only
     # missing benchmark), then make the pipeline STAGE it.  This validates that a staged
@@ -198,6 +202,13 @@ def main() -> int:
     # --- 3-way compare on the target's cells ---
     a_rw, b_rw = _load_rewards(A), _load_rewards(B)
     a_fk, b_fk = _failure_keys(A), _failure_keys(B)   # o_fk already read once above
+    # Cells the pipeline leaves uncached by design (collect_cells caches them): a
+    # launch-count mismatch, a SIGKILLed compile, a loop whose kernel never launches.
+    sc = B / "cells.jsonl"
+    b_status = {c["key"]: c.get("status") for c in
+                (json.loads(l) for l in sc.read_text().splitlines() if l.strip())} \
+        if sc.exists() else {}
+    by_design = []
     print(f"\n{'cell':40s} {'orig':>9} {'cc(A)':>9} {'cp(B)':>9} {'|B-A|':>8}  class(A/B)")
     cls_mismatch, val_fail, max_d, noise = [], [], 0.0, 0.0
     for k in sorted(target_cells):
@@ -211,7 +222,10 @@ def main() -> int:
             max_d = max(max_d, d)
             if d > args.tol:
                 val_fail.append(k)
-        if ac != bc:
+        if ac != bc and bc == "absent" and b_status.get(k) in (
+                "launch_mismatch", "compile_killed", "never_launched"):
+            by_design.append(f"{k}[{b_status[k]}]")
+        elif ac != bc:
             cls_mismatch.append((k, ac, bc))
         fmt = lambda v: "-" if v is None else f"{v:+.4f}"
         print(f"{k:40s} {fmt(ov):>9} {fmt(av):>9} {fmt(bv):>9} "
@@ -220,6 +234,9 @@ def main() -> int:
     print(f"\ncells={len(target_cells)}  max|B-A|={max_d:.4f}  tol={args.tol}  "
           f"noise(orig-vs-cc)={noise:.4f}")
     ok = True
+    if by_design:
+        print(f"NOTE: {len(by_design)} cell(s) not cached by the pipeline by design: "
+              + ", ".join(by_design[:8]))
     if cls_mismatch:
         ok = False
         print(f"FAIL: {len(cls_mismatch)} classification mismatch(es): "

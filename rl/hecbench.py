@@ -20,6 +20,7 @@ from typing import Optional
 import torch
 
 from store_common import run_hard_timeout, kill_process_tree   # process-group kill: no orphaned profilers OR compiles
+from store_common import classify_compile_error, failure_cause
 
 # Default per-user temp directory for all pipeline artifacts (nsys reports, etc.)
 DEFAULT_TMP_DIR: Path = Path(f"/tmp/rl_pipeline_{getpass.getuser()}")
@@ -323,8 +324,9 @@ def _hip_cc_wrapper() -> str:
     return str(path)
 
 
-def _cuda_makefile_incdefs(benchmark_dir: Path, arch: str) -> str:
-    """Return the benchmark Makefile's own `-I` / `-D` flags, via a `make -n` dry run.
+def _cuda_makefile_flags(benchmark_dir: Path, arch: str) -> "tuple[str, str]":
+    """Return the benchmark Makefile's own (`-I` / `-D` flags, `-L` / `-l` flags), via a
+    `make -n -B` dry run.
 
     The CUDA branch of _make OVERRIDES CFLAGS (to drop nvcc-only flags like
     `-Xcompiler` / `-arch=` that clang++ can't parse), which also discards the
@@ -335,6 +337,12 @@ def _cuda_makefile_incdefs(benchmark_dir: Path, arch: str) -> str:
 
     `make -n` only PRINTS the recipe (no compile, no nvcc needed); it runs with the
     Makefile's own CFLAGS (no pipeline override), so the -I/-D are the benchmark's.
+    `-B` prints every recipe whatever the timestamps: without it a directory holding
+    up-to-date objects (an earlier build in place, or a copy, which copies small .o
+    files) printed nothing, and the -D a source needs (degrid PRECISION, frna INT,
+    warpsort WARP_SIZE, wsm5 MKX) were dropped depending on what was left behind.
+    The link line's -l / -L go to LDFLAGS, which _make also overrides (spmv's
+    -lcusparse was lost); nvcc's own `-lineinfo` / `-lib` are not libraries.
     Over-capturing is harmless — extra includes/defines don't break a compile — and
     an empty result (parse error / missing prereq) just reproduces the pre-fix
     behavior for that benchmark.  Handles both joined (`-I../include`) and split
@@ -342,28 +350,67 @@ def _cuda_makefile_incdefs(benchmark_dir: Path, arch: str) -> str:
     """
     try:
         r = subprocess.run(
-            ["make", "-n"], cwd=benchmark_dir, capture_output=True, text=True,
+            ["make", "-n", "-B"], cwd=benchmark_dir, capture_output=True, text=True,
             env={**os.environ, "ARCH": arch}, timeout=30)
     except Exception:
-        return ""
+        return "", ""
     seen: list[str] = []
     for line in (r.stdout + "\n" + r.stderr).splitlines():
         toks = line.split()
         i = 0
         while i < len(toks):
             t = toks[i]
-            if t in ("-I", "-D") and i + 1 < len(toks):
+            if t in ("-I", "-D", "-L") and i + 1 < len(toks):
                 flag = t + toks[i + 1]
                 i += 2
-            elif (t.startswith("-I") or t.startswith("-D")) and len(t) > 2:
+            elif t[:2] in ("-I", "-D", "-L", "-l") and len(t) > 2:
                 flag = t
                 i += 1
             else:
                 i += 1
                 continue
-            if flag not in seen:
+            if flag not in seen and flag not in ("-lineinfo", "-lib", "-link"):
                 seen.append(flag)
-    return " ".join(seen)
+    return (" ".join(f for f in seen if f[:2] in ("-I", "-D")),
+            " ".join(f for f in seen if f[:2] in ("-L", "-l")))
+
+
+def _link_parent_refs(benchmark_dir: Path) -> None:
+    """Make the `../<dir>` paths a CUDA Makefile names resolve next to a COPIED
+    benchmark dir: a sibling's headers as an include or make prerequisite
+    (boxfilter -> ../boxfilter-sycl, cc / gc -> ../mis-cuda, ../include, ...) and a
+    run target's input data (easyWave -> ../easyWave-omp/data, ...).  A bundle holds
+    only the benchmark itself, so those builds stopped at "No rule to make target"
+    and those runs found no input, while the in-place baseline worked.  Symlinks
+    <copy>/../<dir> to HECBENCH_SRC/<dir>, like _ensure_hip_sibling (a no-op in the
+    original tree, and the link lands in the bundle's private parent).  A sibling
+    the build writes into (diamond: `-o ../diamond-sycl/src/....o`, spelled through a
+    make variable, so it is read from the expanded `make -n -B` recipe) is unlinked
+    again: concurrent cells would write into, and `make clean` delete from, the
+    shared source tree."""
+    benchmark_dir = Path(benchmark_dir)
+    mk = benchmark_dir / "Makefile"
+    if IS_HIP or not mk.is_file():
+        return
+    made = []
+    for name in sorted(set(re.findall(r"\.\./([\w.+-]+)", mk.read_text(errors="replace")))):
+        link, src = benchmark_dir.parent / name, HECBENCH_SRC / name
+        if not link.exists() and src.exists():
+            try:
+                link.symlink_to(src)
+                made.append(link)
+            except OSError:
+                pass
+    if made:
+        try:
+            r = subprocess.run(["make", "-n", "-B"], cwd=benchmark_dir, capture_output=True,
+                               text=True, env={**os.environ, "ARCH": ARCH}, timeout=30)
+            written = set(re.findall(r"-o\s+\.\./([\w.+-]+)/", r.stdout))
+        except Exception:
+            written = {l.name for l in made}
+        for link in made:
+            if link.name in written:
+                link.unlink()
 
 
 def _ensure_hip_sibling(benchmark_dir: Path) -> None:
@@ -390,6 +437,12 @@ def _ensure_hip_sibling(benchmark_dir: Path) -> None:
             siblink.symlink_to(sibsrc)
         except OSError:
             pass
+
+
+# A crashing cc1 (an assertion in the UU pass or LLVM) otherwise makes the driver
+# re-preprocess the TU and write a reproducer into $TMPDIR for EVERY failing cell.
+# Failure handling only: codegen is unchanged.
+_NO_CRASH_DIAG = "-fno-crash-diagnostics"
 
 
 def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -424,7 +477,7 @@ def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300)
         flags = (
             f"--offload-arch={arch} --rocm-path={ROCM_PATH}{dl} "
             f"-D__HIP_PLATFORM_AMD__ -I{ROCM_PATH}/include {extra_cflags} "
-            f"-std=c++17 -O3"
+            f"-std=c++17 -O3 {_NO_CRASH_DIAG}"
         )
         flag_var = "EXTRA_CFLAGS"
         ldflags = f"--rocm-path={ROCM_PATH}{dl} -L{ROCM_PATH}/lib -lamdhip64"
@@ -439,13 +492,14 @@ def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300)
         # (this excluded ~16/29 -cuda benchmarks that build fine).
         cc = "clang++"
         cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-        mk_incdefs = _cuda_makefile_incdefs(benchmark_dir, arch)
+        _link_parent_refs(benchmark_dir)
+        mk_incdefs, mk_libs = _cuda_makefile_flags(benchmark_dir, arch)
         flags = (
             f"-I{cuda_home}/include {mk_incdefs} {extra_cflags} "
-            f"-std=c++17 -Wall -O3 --cuda-gpu-arch={arch}"
+            f"-std=c++17 -Wall -O3 --cuda-gpu-arch={arch} {_NO_CRASH_DIAG}"
         )
         flag_var = "CFLAGS"
-        ldflags = f"-L{cuda_home}/lib64 -lcudart -lcuda"
+        ldflags = f"-L{cuda_home}/lib64 -lcudart -lcuda {mk_libs}".rstrip()
     subprocess.run(["make", "clean"], cwd=benchmark_dir, capture_output=True, env=env)
     # HARD timeout.  A plain subprocess.run(timeout=) with shell=True kills only the
     # /bin/sh it spawned; `make` and the clang++ under it (the CC wrapper execs
@@ -467,7 +521,15 @@ def _make(benchmark_dir: Path, extra_cflags: str, arch: str, timeout: int = 300)
     # The contract is unchanged: a CompletedProcess on exit, and
     # subprocess.TimeoutExpired RE-RAISED on timeout so callers still classify
     # it as compile_timeout.
-    cmd = f'make CC="{cc}" {flag_var}="{flags}" LDFLAGS="{ldflags}"'
+    # Optional per-compile address-space cap, UU_COMPILE_MEM_GB (off here by default;
+    # collect_pipeline sets 16): a compile that outgrows it fails its allocation in
+    # seconds — clang "out of memory", ptxas "Memory allocation failure", classified
+    # compile_oom and scored like a timeout — instead of driving the node into the
+    # OOM killer next to the GPU stage.  It caps virtual memory, not RSS, so leave
+    # headroom for the mapped libraries of a shared-libs clang (16 is generous).
+    mem_gb = os.environ.get("UU_COMPILE_MEM_GB")
+    ulimit = f"ulimit -v {int(float(mem_gb) * 1048576)}; " if mem_gb else ""
+    cmd = f'{ulimit}make CC="{cc}" {flag_var}="{flags}" LDFLAGS="{ldflags}"'
     proc = subprocess.Popen(
         cmd, cwd=benchmark_dir, shell=True, env=env, start_new_session=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -512,7 +574,9 @@ def compile_single_loop_ex(
     grow with factor, so a doomed high-factor compile can otherwise sit at the
     full budget; the caller lowers it (e.g. collect_cells --compile-timeout) to
     bound wasted time.  A hit raises subprocess.TimeoutExpired, which callers
-    translate to a compile_timeout penalty.
+    translate to a compile_timeout penalty — and so does a compile that the UU
+    pass's size budget refused or that was OOM-killed (CompileResourceExceeded,
+    a TimeoutExpired subclass carrying .status and .signature).
     """
     cflags = _build_extra_cflags(
         enable_uu=True,
@@ -523,9 +587,37 @@ def compile_single_loop_ex(
         unroll_factors=[factor],
     )
     result = _make(benchmark_dir, extra_cflags=cflags, arch=arch, timeout=timeout)
+    return _compile_outcome(result)
+
+
+class CompileResourceExceeded(subprocess.TimeoutExpired):
+    """A compile that ran out of a resource rather than time: the UU pass refused
+    a transform over its size budget (status 'compile_budget', message "UU budget:
+    ..."), an allocation failed ('compile_oom') or the compiler was SIGKILLed
+    ('compile_killed').  All stand in for the timeout the compile would otherwise
+    have run into — the budget exists to make that blow-up fail in seconds — so
+    this subclasses TimeoutExpired: every caller
+    that scores a timeout with the compile-timeout penalty scores these the same
+    way, and collect_pipeline reads .status / .signature to tell them apart."""
+    def __init__(self, cmd, status: str, signature: str):
+        super().__init__(cmd, 0)
+        self.status, self.signature = status, signature
+
+    def __str__(self):
+        return f"{self.status}: {self.signature}"
+
+
+def _compile_outcome(result: subprocess.CompletedProcess) -> tuple[bool, str]:
+    """(ok, error_signature) of a finished compile, or CompileResourceExceeded."""
     if result.returncode == 0:
         return True, ""
-    return False, extract_error_signature(result.stderr)
+    # The cause line, when there is one, is the better signature: a ptxas OOM's
+    # first error line is clang's generic "ptxas command failed".
+    sig = failure_cause(result.stderr) or extract_error_signature(result.stderr)
+    status = classify_compile_error(sig)
+    if status in ("compile_budget", "compile_oom", "compile_killed"):
+        raise CompileResourceExceeded(result.args, status, sig)
+    return False, sig
 
 
 def extract_error_signature(stderr: str, maxlen: int = 200) -> str:
@@ -604,7 +696,8 @@ def compile_trajectory_ex(
 
     *timeout* caps the compile.  A hit raises subprocess.TimeoutExpired for the
     caller to translate into the compile_timeout penalty, exactly as
-    compile_single_loop_ex does.
+    compile_single_loop_ex does (also for a size-budget refusal or an OOM kill,
+    see CompileResourceExceeded).
     """
     actions = {int(i): (int(u), int(f)) for i, (u, f) in loop_actions.items()
                if (int(u), int(f)) != (0, 1)}
@@ -621,9 +714,7 @@ def compile_trajectory_ex(
     else:
         cflags = ""   # baseline: see the docstring
     result = _make(benchmark_dir, extra_cflags=cflags, arch=arch, timeout=timeout)
-    if result.returncode == 0:
-        return True, ""
-    return False, extract_error_signature(result.stderr)
+    return _compile_outcome(result)
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +991,7 @@ def _get_run_command(benchmark_dir: Path, arch: str) -> str:
     # _make, so create it here too (idempotent).
     if IS_HIP:
         _ensure_hip_sibling(Path(benchmark_dir))
+    _link_parent_refs(benchmark_dir)              # (the same for CUDA's ../<dir>)
     env = {**os.environ, "ARCH": arch}
     result = subprocess.run(
         ["make", "-n", "run"],
@@ -962,6 +1054,60 @@ def demangled_to_filter(demangled: str) -> str:
     return demangled                   # no parens (plain C / truncated) — use as-is
 
 
+def _nsys_csv_frame(csv_output: str):
+    """The cuda_gpu_kern_sum CSV block of `nsys stats` output as a DataFrame (the
+    preamble before the 'Time (%)' header skipped), or None."""
+    csv_lines = []
+    in_csv = False
+    for line in csv_output.splitlines():
+        if not in_csv and line.startswith("Time (%)"):
+            in_csv = True
+        if in_csv and line.strip():
+            csv_lines.append(line)
+    if not csv_lines:
+        return None
+    try:
+        return pd.read_csv(StringIO("\n".join(csv_lines)))
+    except Exception:
+        return None
+
+
+def _parse_nsys_kernel_instances(csv_output: str) -> dict[str, int]:
+    """{kernel_name: launches} from the 'Instances' column of the same
+    cuda_gpu_kern_sum CSV _parse_nsys_kernel_times reads.  {} when absent."""
+    df = _nsys_csv_frame(csv_output)
+    if df is None or df.empty:
+        return {}
+    inst_col = next((c for c in df.columns if c.strip().lower() == "instances"), None)
+    name_col = next((c for c in df.columns if c.strip().lower() == "name"), None)
+    if inst_col is None or name_col is None:
+        return {}
+    try:
+        return {str(r[name_col]).strip(): int(r[inst_col]) for _, r in df.iterrows()
+                if pd.notna(r[name_col]) and pd.notna(r[inst_col])}
+    except Exception:
+        return {}
+
+
+def _sum_kernel_instances(instances: dict[str, int],
+                          kernel_filter: Optional[str] = None) -> int:
+    """Launch count over the same kernel scope _sum_kernel_times sums."""
+    return sum(n for name, n in instances.items()
+               if kernel_filter is None or kernel_filter in name)
+
+
+class KernelTimes(dict):
+    """{kernel_name: total_ms} for one profiled run — a plain dict to every
+    existing consumer — carrying that run's per-kernel launch counts in
+    .instances (empty when the profiler output had none) and, when asked for,
+    the launch counts keyed by MANGLED name in .mangled (exact, unlike the
+    demangled substring filter)."""
+    def __init__(self, times=(), instances=None, mangled=None):
+        super().__init__(times)
+        self.instances = dict(instances or {})
+        self.mangled = dict(mangled or {})
+
+
 def _parse_nsys_kernel_times(csv_output: str) -> dict[str, float]:
     """
     Parse `nsys stats --report=cuda_gpu_kern_sum --format=csv` output.
@@ -972,19 +1118,10 @@ def _parse_nsys_kernel_times(csv_output: str) -> dict[str, float]:
     Total Time values are converted from nanoseconds to milliseconds.
     Returns an empty dict if parsing fails.
     """
-    csv_lines = []
-    in_csv = False
-    for line in csv_output.splitlines():
-        if not in_csv and line.startswith("Time (%)"):
-            in_csv = True
-        if in_csv and line.strip():
-            csv_lines.append(line)
-
-    if not csv_lines:
+    df = _nsys_csv_frame(csv_output)
+    if df is None:
         return {}
-
     try:
-        df = pd.read_csv(StringIO("\n".join(csv_lines)))
         time_col = next(
             (c for c in df.columns if "time" in c.lower() and "total" in c.lower()),
             None,
@@ -1072,26 +1209,52 @@ def _sum_kernel_times(
 
 def _profile_once_nsys(
     run_cmd: str, benchmark_dir, env: dict, timeout: int, report_path: str,
+    mangled: bool = False,
 ) -> "dict[str, float] | None":
-    """One nsys profile+stats pass -> {kernel_name: ms}, or None on a failed run.
+    """One nsys profile+stats pass -> KernelTimes, or None on a failed run.
 
     HARD (process-group) timeout: a plain subprocess.run(timeout=) with shell=True
     kills only /bin/sh, orphaning nsys + the benchmark on the GPU where they
     contend with the next run and corrupt its kernel time; run_hard_timeout
-    SIGKILLs the whole group.  *report_path* is reused across runs (one name,
-    --force-overwrite), exactly as the original code did."""
-    ok, _out = run_hard_timeout(
-        f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
-        f"--output={report_path} --force-overwrite=true {run_cmd}",
-        cwd=benchmark_dir, timeout=timeout, env=env, scope_dir=str(benchmark_dir))
-    if not ok:
-        return None
-    ok2, stats_out = run_hard_timeout(
-        f"nsys stats --report=cuda_gpu_kern_sum --format=csv {report_path}.nsys-rep",
-        cwd=".", timeout=30, env=env, capture=True)
-    if not ok2:
-        return None
-    return _parse_nsys_kernel_times(stats_out)
+    SIGKILLs the whole group.
+
+    *report_path* must be UNIQUE PER RUN.  `nsys stats` will not re-export over an
+    older .sqlite next to the report (it prints "Existing SQLite export found ...
+    Use --force-export=true" and emits no table), so the old single reused name
+    made every run after the first unparseable: n_runs runs on the GPU, one
+    measurement in the median.  --force-export is kept as a second guard, and the
+    report and its export are deleted once parsed (they used to pile up in tmp).
+    *mangled* also reads the launch counts by mangled name (one more `nsys stats`,
+    baselines only; it needs --force-export too: nsys 2025.1.3 judged the fresh
+    export older than the report and printed no table, GPU node 2026-10-22)."""
+    rep, sql = f"{report_path}.nsys-rep", f"{report_path}.sqlite"
+    try:
+        ok, _out = run_hard_timeout(
+            f"nsys profile --trace=cuda --sample=none --cpuctxsw=none "
+            f"--output={report_path} --force-overwrite=true {run_cmd}",
+            cwd=benchmark_dir, timeout=timeout, env=env, scope_dir=str(benchmark_dir))
+        if not ok:
+            return None
+        ok2, stats_out = run_hard_timeout(
+            f"nsys stats --report=cuda_gpu_kern_sum --format=csv --force-export=true {rep}",
+            cwd=".", timeout=30, env=env, capture=True)
+        if not ok2:
+            return None
+        by_mangled = {}
+        if mangled:
+            ok3, m_out = run_hard_timeout(
+                f"nsys stats --report=cuda_gpu_kern_sum:mangled --format=csv "
+                f"--force-export=true {rep}",
+                cwd=".", timeout=30, env=env, capture=True)
+            by_mangled = _parse_nsys_kernel_instances(m_out) if ok3 else {}
+        return KernelTimes(_parse_nsys_kernel_times(stats_out),
+                           _parse_nsys_kernel_instances(stats_out), by_mangled)
+    finally:
+        for p in (rep, sql):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 def _profile_once_rocprof(
@@ -1138,7 +1301,7 @@ def _profile_once_rocprof(
 
 def _profile_kernel_times_once(
     run_cmd: str, benchmark_dir, env: dict, tmp_dir: Path, timeout: int,
-    nsys_report_path: str,
+    nsys_report_path: str, mangled: bool = False,
 ) -> "dict[str, float] | None":
     """One profiling pass -> {kernel_name: total_ms}, or None on a failed run.
 
@@ -1146,10 +1309,25 @@ def _profile_kernel_times_once(
     share ONE profiler: the measurement must be bit-identical between the run that
     BUILDS the reward cache and the one that READS it.  AMD uses legacy
     `rocprof --stats` (nsys_report_path ignored); NVIDIA uses the nsys two-step
-    into nsys_report_path (reused across runs with --force-overwrite)."""
+    into nsys_report_path, which must be unique per run (see _profile_once_nsys)."""
     if IS_HIP:
         return _profile_once_rocprof(run_cmd, benchmark_dir, env, tmp_dir, timeout)
-    return _profile_once_nsys(run_cmd, benchmark_dir, env, timeout, nsys_report_path)
+    return _profile_once_nsys(run_cmd, benchmark_dir, env, timeout, nsys_report_path,
+                              mangled)
+
+
+def profiler_version(tool: Optional[str] = None) -> str:
+    """'nsys <version line>' / 'rocprof <version line>' (or *tool*'s, e.g. ncu) —
+    recorded with the baselines so a collection can be checked for a mid-run
+    profiler change.  The line naming the version, else the first one."""
+    tool = tool or ("rocprof" if IS_HIP else "nsys")
+    try:
+        r = subprocess.run([tool, "--version"], capture_output=True, text=True, timeout=30)
+        lines = [l.strip() for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+        line = next((l for l in lines if "version" in l.lower()), lines[0] if lines else "?")
+    except Exception:
+        line = "?"
+    return f"{tool} {line}"
 
 
 def measure_kernel_time(
@@ -1186,12 +1364,12 @@ def measure_kernel_time(
     env = {**os.environ, "ARCH": arch,
            "CUDA_VISIBLE_DEVICES": str(gpu_id), "HIP_VISIBLE_DEVICES": str(gpu_id)}
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    # nsys reuses this one report file across runs (--force-overwrite); rocprof
-    # makes and cleans its own per-run dir, so this name is unused on AMD.
+    # nsys: one report per run, <stem>_run<i> (see _profile_once_nsys); rocprof
+    # makes and cleans its own per-run dir, so the stem is unused on AMD.
     report_path = tempfile.mktemp(prefix="nsys_rl_", dir=str(tmp_dir))
 
     times: list[float] = []
-    for _ in range(n_runs):
+    for i in range(n_runs):
         # A per-run timeout/failure is treated as a skipped run, not propagated:
         # call sites guard this with `except RuntimeError` (worker: modified_ms =
         # baseline_ms fallback).  If every run fails, the empty `times` list
@@ -1200,7 +1378,7 @@ def measure_kernel_time(
         # timeout would orphan the profiler + benchmark on the GPU, contending
         # with the next run and corrupting its kernel time.
         kernel_times = _profile_kernel_times_once(
-            run_cmd, benchmark_dir, env, tmp_dir, nsys_timeout, report_path)
+            run_cmd, benchmark_dir, env, tmp_dir, nsys_timeout, f"{report_path}_run{i}")
         if not kernel_times:
             continue
         t = _sum_kernel_times(kernel_times, kernel_filter)

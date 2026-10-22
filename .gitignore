@@ -3,3 +3,4 @@
 *.o
 *.pyc
 */**/__pycache__
+*/**/checkpoints

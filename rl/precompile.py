@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from store_common import (cellkey, sanitize, bundle_paths, structural_copy, is_cell_done, write_cell,
                           run_target_rel, benchmark_fingerprint, toolchain_stamp,
-                          write_manifest, cell_dir)
+                          write_manifest, cell_dir, device_code_hash)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
@@ -79,6 +79,22 @@ def build_one(cell: dict, store: str, arch: str, threshold: int, scratch: str) -
         return ("error", key)
     finally:
         shutil.rmtree(broot, ignore_errors=True)
+
+
+def build_row(cells: list, store: str, arch: str, threshold: int, scratch: str) -> list:
+    """One (loop, unmerge) row in ascending factor order, stopping at the first cell
+    that fails or times out: the higher factors would too (collect_pipeline.build_chains
+    has the evidence), and the in-job pipeline infers them from its own compile of
+    the failing cell.  Returns [(status, key)]; cells after the stop are 'skipped'."""
+    out, stopped = [], False
+    for cell in sorted(cells, key=lambda c: c["f"]):
+        if stopped:
+            out.append(("skipped", cellkey(cell["bench"], cell["li"], cell["u"], cell["f"])))
+            continue
+        status, key = build_one(cell, store, arch, threshold, scratch)
+        out.append((status, key))
+        stopped = status in ("fail", "timeout")
+    return out
 
 
 def _select_benchmarks(by_bench: dict, frac: float, max_frac: float,
@@ -122,14 +138,6 @@ def verify_store(store: str, arch: str, threshold: int, scratch: str, n: int, sr
                     "fingerprint guards still protect the store. SKIPPED.")
         return 0
 
-    def _sass(binpath):
-        try:
-            r = subprocess.run(["cuobjdump", "--dump-sass", str(binpath)],
-                               capture_output=True, text=True, timeout=180)
-            return r.stdout
-        except Exception:
-            return None
-
     from hecbench import compile_single_loop_ex, _get_run_command, discover_benchmarks
     benches = discover_benchmarks(src)
     ok = bad = 0
@@ -144,14 +152,18 @@ def verify_store(store: str, arch: str, threshold: int, scratch: str, n: int, sr
         try:
             shutil.rmtree(broot, ignore_errors=True)
             structural_copy(bpath, bdir, threshold)
-            built, _ = compile_single_loop_ex(
-                bdir, loop_idx=int(li), unmerge=int(u), factor=int(f),
-                filename=meta.get("filename", ""), triple=meta.get("triple", "-"),
-                arch=arch)
+            try:
+                built, _ = compile_single_loop_ex(
+                    bdir, loop_idx=int(li), unmerge=int(u), factor=int(f),
+                    filename=meta.get("filename", ""), triple=meta.get("triple", "-"),
+                    arch=arch)
+            except subprocess.TimeoutExpired as e:       # incl. a size-budget refusal
+                log.error("verify %s: rebuild did not finish (%s)", key, e); bad += 1
+                continue
             if not built:
                 log.error("verify %s: rebuild failed", key); bad += 1; continue
             fresh_bin = bdir / run_target_rel(_get_run_command(bdir, arch))
-            a, b = _sass(stored_bin), _sass(fresh_bin)
+            a, b = device_code_hash(stored_bin), device_code_hash(fresh_bin)
             if a is not None and a == b:
                 ok += 1
             else:
@@ -174,6 +186,10 @@ def main() -> int:
     p.add_argument("--procs", type=int, default=max(1, (os.cpu_count() or 4) // 2))
     p.add_argument("--arch", default=None, help="MUST match the GPU job (fatbin sm_XX)")
     p.add_argument("--copy-threshold", type=int, default=1_000_000)
+    p.add_argument("--compile-mem-gb", type=float, default=24,
+                   help="per-compile address-space cap, GB (0 = none); MIRROR: "
+                        "collect_pipeline --compile-mem-gb, so the store holds no binary "
+                        "the job could not have built itself")
     p.add_argument("--scratch", default=None, help="build scratch (default STORE/_build)")
     p.add_argument("--val-ratio", type=float, default=0.15)
     p.add_argument("--test-ratio", type=float, default=0.15)
@@ -182,6 +198,10 @@ def main() -> int:
     p.add_argument("--verify-store", action="store_true")
     p.add_argument("--verify-n", type=int, default=5)
     args = p.parse_args()
+    if args.compile_mem_gb:
+        os.environ["UU_COMPILE_MEM_GB"] = str(args.compile_mem_gb)   # read by hecbench._make
+    else:
+        os.environ.pop("UU_COMPILE_MEM_GB", None)
 
     from hecbench import ARCH, HECBENCH_SRC, IS_HIP, discover_benchmarks, IR2VEC_VOCAB
     from train import precheck_benchmarks, split_benchmarks, build_loop_assignments
@@ -200,6 +220,15 @@ def main() -> int:
     if args.verify_store:
         return verify_store(str(args.store), args.arch, args.copy_threshold, scratch,
                             args.verify_n, src)
+
+    # Existing cells are kept ('skip') and the manifest is re-stamped with the LIVE
+    # toolchain at the end, so a store from another compiler build would come out
+    # certified as current.  Refuse instead.
+    from store_common import load_manifest
+    old = load_manifest(str(args.store))
+    if old is not None and old.get("cells") and old.get("stamps") != toolchain_stamp(args.arch):
+        sys.exit(f"--store {args.store} holds cells built with another toolchain "
+                 f"({old.get('stamps')} vs {toolchain_stamp(args.arch)}); use a fresh dir")
 
     if not IR2VEC_VOCAB or not Path(IR2VEC_VOCAB).exists():
         sys.exit(f"IR2VEC_VOCAB unset/missing ({IR2VEC_VOCAB!r}) — needed for loopcount "
@@ -277,18 +306,23 @@ def main() -> int:
                           "filename": a["filename"], "triple": a["triple"],
                           "u": u, "f": f, "fp": fps[b]})
 
-    log.info("building %d cells with %d procs → %s", len(tasks), args.procs, args.store)
-    counts, done_keys = {}, []
+    rows: dict = {}
+    for t in tasks:
+        rows.setdefault((t["bench"], t["li"], t["u"]), []).append(t)
+    log.info("building %d cells (%d rows, each stops at its first failure) with %d procs "
+             "→ %s", len(tasks), len(rows), args.procs, args.store)
+    counts, done_keys, i = {}, [], 0
     with ThreadPoolExecutor(max_workers=args.procs) as ex:
-        futs = [ex.submit(build_one, t, str(args.store), args.arch, args.copy_threshold,
-                          scratch) for t in tasks]
-        for i, fut in enumerate(as_completed(futs), 1):
-            status, key = fut.result()
-            counts[status] = counts.get(status, 0) + 1
-            if status in ("ok", "skip"):
-                done_keys.append(key)
-            if i % 100 == 0:
-                log.info("  %d/%d  %s", i, len(tasks), counts)
+        futs = [ex.submit(build_row, r, str(args.store), args.arch, args.copy_threshold,
+                          scratch) for r in rows.values()]
+        for fut in as_completed(futs):
+            for status, key in fut.result():
+                i += 1
+                counts[status] = counts.get(status, 0) + 1
+                if status in ("ok", "skip"):
+                    done_keys.append(key)
+                if i % 100 == 0:
+                    log.info("  %d/%d  %s", i, len(tasks), counts)
 
     # manifest = stamps + per-benchmark fp + all cells that are now .done
     from store_common import is_cell_done as _done

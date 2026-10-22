@@ -352,7 +352,10 @@ def _collect_worker(rank: int, gpu_id: int, work_q, hp: dict, result_q) -> None:
 # ---------------------------------------------------------------------------
 
 def save_cache(path: Path, rewards: dict, postf: dict, norm_sig: str,
-               failure_keys: set, penalty: float, deadzone: float) -> None:
+               failure_keys: set, penalty: float, deadzone: float,
+               timeout_keys: set = frozenset(), inferred_keys: set = frozenset(),
+               timeout_penalty: "float | None" = None,
+               measure_failed: "dict | None" = None, timer: "dict | None" = None) -> None:
     """
     Write the cache, preserving every key this script does not own and adding
     the failure cells it discovered.
@@ -363,6 +366,13 @@ def save_cache(path: Path, rewards: dict, postf: dict, norm_sig: str,
     and a partial list is worse than none, because a re-tune would move
     training's failure cells while silently leaving the collector's behind at
     the old value.
+
+    *timeout_keys* (a subset of failure_keys holding the TIMEOUT penalty, as in
+    trajectory.save_trajectory_cache) and *inferred_keys* (penalties assigned
+    without a compile, collect_pipeline's stop-at-first-failure) are recorded
+    the same way when given.  *measure_failed* ({key: {"attempts", "status"}},
+    cells with no reward because their runs failed) replaces the stored one.
+    *timer* (collect_pipeline --profiler ncu) is stored as "timer"; absent = nsys.
     """
     payload: dict = {}
     if path.exists():
@@ -372,7 +382,7 @@ def save_cache(path: Path, rewards: dict, postf: dict, norm_sig: str,
             payload = {}
     payload["rewards"] = rewards
     set_post_features(payload, postf, norm_sig)
-    if failure_keys or payload.get("migration"):
+    if failure_keys or measure_failed or payload.get("migration"):
         mig = payload.get("migration") or {}
         mig["failure_keys"] = sorted(
             set(mig.get("failure_keys", [])) | failure_keys)
@@ -380,7 +390,16 @@ def save_cache(path: Path, rewards: dict, postf: dict, norm_sig: str,
         mig.setdefault("deadzone", deadzone)
         mig.setdefault("deadzoned_keys", [])
         mig.setdefault("history", [])
+        for name, keys in (("timeout_keys", timeout_keys), ("inferred_keys", inferred_keys)):
+            if keys or name in mig:
+                mig[name] = sorted(set(mig.get(name, [])) | set(keys))
+        if timeout_keys and timeout_penalty is not None:
+            mig.setdefault("timeout_penalty", timeout_penalty)
+        if measure_failed is not None and (measure_failed or "measure_failed" in mig):
+            mig["measure_failed"] = measure_failed
         payload["migration"] = mig
+    if timer is not None:
+        payload["timer"] = timer
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload))
     tmp.replace(path)          # atomic: a kill mid-write cannot truncate the cache

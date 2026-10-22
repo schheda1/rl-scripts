@@ -10,6 +10,7 @@ the pre-compiled-binary store (write/stage/verify) with its fail-safe stamps.
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -46,6 +47,65 @@ def bundle_paths(root, name: str, bench: str) -> "tuple[Path, Path]":
     rmtree `bundle_root`."""
     bundle_root = Path(root) / name
     return bundle_root, bundle_root / bench
+
+
+# Signatures (hecbench.extract_error_signature) of a compile that did not hit a
+# deterministic compiler error: the UU pass's own size budgets
+# (-uu-max-estimated-size / -uu-max-cloned-insts report "UU budget: ..."), an
+# allocation failure (clang "LLVM ERROR: out of memory", ptxas "Memory allocation
+# failure" under the per-compile address-space cap), a SIGKILL (the OOM killer), or
+# the node / the bundle itself (full disk, fork failure, a missing tool or header;
+# the UU transform never changes includes) — the last says nothing about the cell.
+_BUDGET_PAT = "UU budget"
+_OOM_PATS = ("out of memory", "bad_alloc", "memory allocation failure",
+             "allocation failed")                                            # lower-case
+_KILLED_PATS = ("signal 9", "killed by signal", "error 137")                 # lower-case
+_ENV_PATS = ("No space left on device", "Cannot allocate memory",
+             "Resource temporarily unavailable", "posix_spawn failed", "Text file busy",
+             "file not found", "No rule to make target")
+# Lines a tool prints about the failure, as opposed to source excerpts under a
+# diagnostic: the first error line alone misses e.g. ptxas running out of memory,
+# which ends in clang's generic "ptxas command failed with exit code 255".
+_TOOL_LINE = re.compile(r"^(LLVM ERROR|ptxas|terminate called|Allocation failed|"
+                        r"(fatal )?error:|make(\[\d+\])?: \*\*\*|"
+                        r"(\S*/)?(clang|clang\+\+|nvlink|fatbinary|ld|ld\.lld)(-\d+)?: )")
+_CLASS_ORDER = ("compile_budget", "compile_env", "compile_oom", "compile_killed")
+
+
+def classify_compile_error(signature: str) -> str:
+    """'compile_budget' (the pass refused a blow-up), 'compile_oom' (an allocation
+    failed: under the address-space cap that is the cell's own size), 'compile_killed'
+    (SIGKILL: the OOM killer, chosen by node load), 'compile_env' (the node or the
+    bundle failed, not the cell: never cached as a penalty) or 'compile_failed'.
+    Budget, OOM and kill failures stand in for the timeout the compile would
+    otherwise have run into, so the collectors score them with the compile-timeout
+    penalty."""
+    sig = signature or ""
+    if _BUDGET_PAT in sig:
+        return "compile_budget"
+    if any(p in sig for p in _ENV_PATS):
+        return "compile_env"
+    low = sig.lower()
+    if any(p in low for p in _OOM_PATS):
+        return "compile_oom"
+    s = sig.rstrip()
+    if any(p in low for p in _KILLED_PATS) or s.endswith(": Killed") or s.endswith("] Killed"):
+        return "compile_killed"
+    return "compile_failed"
+
+
+def failure_cause(stderr: str) -> str:
+    """The tool line of a failed compile's stderr that makes it a budget / node /
+    OOM / kill failure (in that order of precedence), or '' when none does."""
+    best, rank = "", len(_CLASS_ORDER)
+    for line in (stderr or "").splitlines():
+        s = line.strip()
+        if not _TOOL_LINE.match(s):
+            continue
+        c = classify_compile_error(s)
+        if c in _CLASS_ORDER and _CLASS_ORDER.index(c) < rank:
+            best, rank = s[:200], _CLASS_ORDER.index(c)
+    return best
 
 
 def _is_source(path: Path) -> bool:
@@ -275,7 +335,13 @@ def dir_bytes(root: Path) -> int:
 def toolchain_stamp(arch: str) -> dict:
     """Identity the store must match to be trusted: arch (fatbin) + clang build (codegen).
     A store built under a different clang/arch would give plausible-but-wrong rewards, so
-    the consumer refuses a mismatched stamp and rebuilds instead."""
+    the consumer refuses a mismatched stamp and rebuilds instead.
+
+    'clang' (the --version line) names the source commit only, so two builds of one
+    commit stamp alike: an assertions and a release build, or a shared-libs build after
+    a pass rebuild (the pass lives in lib/libLLVMTransformUtils.so; bin/clang is not
+    relinked).  'clang_build' adds the resolved clang++ path and the newest mtime over
+    it and the build's lib/*.so*, so any rebuild of the compiler changes the stamp."""
     def _first_line(cmd):
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
@@ -285,9 +351,32 @@ def toolchain_stamp(arch: str) -> dict:
         except Exception:
             pass
         return "?"
+    build = "?"
+    clang = shutil.which("clang++")
+    if clang:
+        real = os.path.realpath(clang)
+        libdir = Path(real).parent.parent / "lib"
+        files = [Path(real), *libdir.glob("*.so*")]
+        build = f"{real}@{max(int(f.stat().st_mtime) for f in files if f.exists())}"
     return {"arch": arch,
             "clang": _first_line(["clang++", "--version"]),
+            "clang_build": build,
             "cuda_home": os.environ.get("CUDA_HOME", "/usr/local/cuda")}
+
+
+def device_code_hash(binary) -> "str | None":
+    """sha256 (16 hex) of a binary's device SASS (`cuobjdump --dump-sass`), or None
+    when cuobjdump is missing (AMD) or the binary holds no device code.  Path- and
+    timestamp-independent.  Host code is left out on purpose: the UU pass also
+    canonicalises host loops, which does not change kernel time."""
+    try:
+        r = subprocess.run(["cuobjdump", "--dump-sass", str(binary)],
+                           capture_output=True, text=True, timeout=300)
+    except Exception:
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    return hashlib.sha256(r.stdout.encode()).hexdigest()[:16]
 
 
 def benchmark_fingerprint(bench_dir: Path) -> str:
